@@ -33,6 +33,25 @@ fn host_lang(details: &BookingDetails) -> &str {
     details.host_language.as_deref().unwrap_or("en")
 }
 
+/// The language the guest booked in, as stored on the booking row
+/// (`bookings.language`, captured from the booking page).
+///
+/// Every guest email sent after the booking request itself (host approval,
+/// decline, cancellation by the host or by a calendar sync) is triggered by
+/// someone other than the guest, so the language has to come from here
+/// rather than from the current request's `Accept-Language` (#209).
+pub async fn stored_booking_language(pool: &SqlitePool, booking_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT language FROM bookings WHERE id = ?")
+        .bind(booking_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .filter(|l| !l.trim().is_empty())
+}
+
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub host: String,
     pub port: u16,
@@ -148,6 +167,9 @@ pub struct BookingDetails {
     pub host_email: String,
     pub uid: String,
     pub notes: Option<String>,
+    /// Guest phone in E.164, only when the event type collects one. Shown in
+    /// the host approval request so the host can call before deciding (#231).
+    pub guest_phone: Option<String>,
     pub location: Option<String>,
     pub reminder_minutes: Option<i32>,
     pub additional_attendees: Vec<String>,
@@ -168,7 +190,7 @@ pub struct BookingDetails {
     pub resource_name: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CancellationDetails {
     /// Exact UTC endpoints for new bookings; legacy records use wall-clock fields.
     pub utc_times: Option<(String, String)>,
@@ -228,6 +250,23 @@ fn render_html_email_with_actions(
     footer_note: Option<&str>,
     actions: &[EmailAction],
 ) -> String {
+    render_html_email_in("en", greeting, message, accent, rows, footer_note, actions)
+}
+
+/// Render the HTML body for an email written in `lang`. The tag ends up in
+/// `<html lang>`, so mail clients pick the right spell checker and screen
+/// readers the right voice (#209). Emails whose copy is still English-only
+/// go through the wrappers above, which pass "en".
+fn render_html_email_in(
+    lang: &str,
+    greeting: &str,
+    message: &str,
+    accent: &str,
+    rows: &[EmailRow],
+    footer_note: Option<&str>,
+    actions: &[EmailAction],
+) -> String {
+    let lang = h(crate::i18n::html_lang(lang));
     let mut detail_rows = String::new();
     for (i, row) in rows.iter().enumerate() {
         let bg = if i % 2 == 0 { "#f8f9fa" } else { "#ffffff" };
@@ -266,7 +305,7 @@ fn render_html_email_with_actions(
 
     format!(
         r##"<!DOCTYPE html>
-<html lang="en">
+<html lang="{lang}">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
 <body style="margin:0;padding:0;background:#f4f4f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f7;">
@@ -858,7 +897,8 @@ pub async fn send_guest_confirmation_ex(
         footer_note_html.push('\n');
         footer_note_html.push_str(line);
     }
-    let html = render_html_email_with_actions(
+    let html = render_html_email_in(
+        lang,
         &h(&greeting),
         &headline,
         "#16a34a",
@@ -1366,8 +1406,15 @@ pub async fn send_guest_reminder(
         })
         .unwrap_or_default();
 
-    let html =
-        render_html_email_with_actions(&h(&greeting), &headline, "#3b82f6", &rows, None, &actions);
+    let html = render_html_email_in(
+        lang,
+        &h(&greeting),
+        &headline,
+        "#3b82f6",
+        &rows,
+        None,
+        &actions,
+    );
 
     let body = build_multipart_body(&plain, &html);
 
@@ -1569,12 +1616,14 @@ pub async fn send_guest_cancellation(
         });
     }
 
-    let html = render_html_email(
+    let html = render_html_email_in(
+        lang,
         &h(&greeting),
         &headline,
         "#dc2626",
         &rows,
         Some(&ics_attached_html),
+        &[],
     );
 
     let body = build_multipart_body(&plain, &html);
@@ -1718,60 +1767,125 @@ pub async fn send_guest_pending_notice_ex(
     reschedule_url: Option<&str>,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let composed = compose_guest_pending_notice(details, cancel_url, reschedule_url);
+    let body = build_multipart_body(&composed.plain, &composed.html);
+
+    let email = Message::builder()
+        .from(config.mailbox_from()?)
+        .to(to)
+        .subject(composed.subject)
+        .multipart(body)?;
+
+    send_email(config, email).await
+}
+
+/// Subject and bodies of an email, built apart from sending so tests can
+/// read exactly what the recipient would get.
+struct ComposedEmail {
+    subject: String,
+    plain: String,
+    html: String,
+}
+
+/// "[status] event, date" subject for guest emails that report a state
+/// rather than carry an invite, built from the translated status label and
+/// the same neutral "event, date" pair the confirmation uses.
+fn status_subject(lang: &str, status_key: &str, event: &str, date: &str) -> String {
+    format!(
+        "[{}] {}",
+        t(lang, status_key),
+        ta(
+            lang,
+            "email-confirm-subject",
+            [("event", event), ("date", date)]
+        )
+    )
+}
+
+/// The guest's "request received, awaiting the host" email, in the language
+/// stored with the booking. It reuses the booking page's own pending wording
+/// (`confirmed-heading-pending`, `confirmed-subtitle-pending`), which says
+/// exactly what this email has to say, so every locale gets it today.
+fn compose_guest_pending_notice(
+    details: &BookingDetails,
+    cancel_url: Option<&str>,
+    reschedule_url: Option<&str>,
+) -> ComposedEmail {
+    let lang = guest_lang(details);
 
     let time_display = format!(
         "{} \u{2013} {} ({})",
         details.start_time, details.end_time, details.guest_timezone
     );
 
-    // Don't include location in pending emails — it should only be revealed
-    // after the booking is confirmed (prevents meeting link leaking).
-    let plain = format!(
-        "Hi {},\n\n\
-         Your booking request has been received and is awaiting confirmation from {}.\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         {}\
-         You'll receive another email once it's confirmed.\n\
-         {}\n\
-         \u{2014} calrs",
-        details.guest_name,
-        details.host_name,
-        details.event_title,
-        details.date,
-        time_display,
-        details
-            .notes
-            .as_ref()
-            .map(|n| format!("Notes: {}\n", n))
-            .unwrap_or_default(),
-        cancel_url
-            .map(|u| format!("\nNeed to cancel? {}\n", u))
-            .unwrap_or_default(),
+    let greeting = ta(
+        lang,
+        "email-confirm-greeting",
+        [("name", &details.guest_name)],
     );
+    let headline = ta(
+        lang,
+        "confirmed-subtitle-pending",
+        [
+            ("host", &details.host_name),
+            ("email", &details.guest_email),
+        ],
+    );
+    let label_event = t(lang, "confirmed-detail-event");
+    let label_date = t(lang, "confirmed-detail-date");
+    let label_time = t(lang, "confirmed-detail-time");
+    let label_with = t(lang, "confirmed-detail-with");
+    let label_notes = t(lang, "confirmed-detail-notes");
+    let signature = t(lang, "email-signature");
+
+    // Don't include location in pending emails: it should only be revealed
+    // after the booking is confirmed (prevents meeting link leaking).
+    let mut plain = format!(
+        "{}\n\n{}\n\n{} {}\n{} {}\n{} {}\n{} {}\n",
+        greeting,
+        headline,
+        label_event,
+        details.event_title,
+        label_date,
+        details.date,
+        label_time,
+        time_display,
+        label_with,
+        details.host_name,
+    );
+    if let Some(n) = &details.notes {
+        plain.push_str(&format!("{} {}\n", label_notes, n));
+    }
+    if let Some(u) = cancel_url {
+        plain.push_str(&format!(
+            "\n{}\n",
+            ta(lang, "email-confirm-need-to-cancel", [("url", u)])
+        ));
+    }
+    plain.push('\n');
+    plain.push_str(&signature);
 
     let mut rows = vec![
         EmailRow {
-            label: "Event".to_string(),
+            label: label_event,
             value: details.event_title.clone(),
         },
         EmailRow {
-            label: "Date".to_string(),
+            label: label_date,
             value: details.date.clone(),
         },
         EmailRow {
-            label: "Time".to_string(),
+            label: label_time,
             value: time_display,
         },
         EmailRow {
-            label: "Host".to_string(),
+            label: label_with,
             value: details.host_name.clone(),
         },
     ];
     if let Some(notes) = &details.notes {
         rows.push(EmailRow {
-            label: "Notes".to_string(),
+            label: label_notes,
             value: notes.clone(),
         });
     }
@@ -1779,43 +1893,39 @@ pub async fn send_guest_pending_notice_ex(
     let mut actions: Vec<EmailAction> = Vec::new();
     if let Some(u) = reschedule_url {
         actions.push(EmailAction {
-            label: "Reschedule".to_string(),
+            label: t(lang, "email-action-reschedule"),
             url: u.to_string(),
             color: "#3b82f6".to_string(),
         });
     }
     if let Some(u) = cancel_url {
         actions.push(EmailAction {
-            label: "Cancel booking".to_string(),
+            label: t(lang, "email-action-cancel-booking"),
             url: u.to_string(),
             color: "#dc2626".to_string(),
         });
     }
 
-    let html = render_html_email_with_actions(
-        &format!("Hi {},", h(&details.guest_name)),
-        &format!(
-            "Your booking request is awaiting confirmation from {}.",
-            h(&details.host_name)
-        ),
+    let html = render_html_email_in(
+        lang,
+        &h(&greeting),
+        &h(&headline),
         "#f59e0b",
         &rows,
-        Some("You\u{2019}ll receive another email once it\u{2019}s confirmed."),
+        None,
         &actions,
     );
 
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Pending: {} \u{2014} {}",
-            details.event_title, details.date
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    ComposedEmail {
+        subject: status_subject(
+            lang,
+            "confirmed-heading-pending",
+            &details.event_title,
+            &details.date,
+        ),
+        plain,
+        html,
+    }
 }
 
 /// Send approval request to host with approve/decline buttons
@@ -1864,7 +1974,7 @@ pub async fn send_host_approval_request(
          Date: {}\n\
          Time: {}\n\
          Guest: {} <{}>\n\
-         {}{}\n\
+         {}{}{}\n\
          {}\n\n\
          \u{2014} calrs",
         details.event_title,
@@ -1872,6 +1982,11 @@ pub async fn send_host_approval_request(
         time_display,
         details.guest_name,
         details.guest_email,
+        details
+            .guest_phone
+            .as_ref()
+            .map(|p| format!("Phone: {}\n", p))
+            .unwrap_or_default(),
         details
             .location
             .as_ref()
@@ -1903,6 +2018,12 @@ pub async fn send_host_approval_request(
             value: format!("{} <{}>", details.guest_name, details.guest_email),
         },
     ];
+    if let Some(phone) = &details.guest_phone {
+        rows.push(EmailRow {
+            label: "Phone".to_string(),
+            value: phone.clone(),
+        });
+    }
     if let Some(loc) = &details.location {
         rows.push(EmailRow {
             label: "Location".to_string(),
@@ -1967,6 +2088,23 @@ pub async fn send_guest_decline_notice(
     details: &CancellationDetails,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let composed = compose_guest_decline_notice(details);
+    let body = build_multipart_body(&composed.plain, &composed.html);
+
+    let email = Message::builder()
+        .from(config.mailbox_from()?)
+        .to(to)
+        .subject(composed.subject)
+        .multipart(body)?;
+
+    send_email(config, email).await
+}
+
+/// The guest's "your request was declined" email, in the language stored
+/// with the booking. Reuses the decline page's wording
+/// (`bae-title-booking-declined`, `bae-body-declined-by-host`).
+fn compose_guest_decline_notice(details: &CancellationDetails) -> ComposedEmail {
+    let lang = details.guest_language.as_deref().unwrap_or("en");
 
     let time_display = if details.guest_timezone.is_empty() {
         format!("{} \u{2013} {}", details.start_time, details.end_time)
@@ -1976,74 +2114,83 @@ pub async fn send_guest_decline_notice(
             details.start_time, details.end_time, details.guest_timezone
         )
     };
-    let reason_text = details
-        .reason
-        .as_ref()
-        .map(|r| format!("Reason: {}\n\n", r))
-        .unwrap_or_default();
 
-    let plain = format!(
-        "Hi {},\n\n\
-         Your booking request has been declined.\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         With: {}\n\n\
-         {}\
-         \u{2014} calrs",
-        details.guest_name,
-        details.event_title,
-        details.date,
-        time_display,
-        details.host_name,
-        reason_text,
+    let greeting = ta(
+        lang,
+        "email-confirm-greeting",
+        [("name", &details.guest_name)],
     );
+    let headline = t(lang, "bae-body-declined-by-host");
+    let label_event = t(lang, "confirmed-detail-event");
+    let label_date = t(lang, "confirmed-detail-date");
+    let label_time = t(lang, "confirmed-detail-time");
+    let label_with = t(lang, "confirmed-detail-with");
+    let label_reason = t(lang, "common-detail-reason");
+    let signature = t(lang, "email-signature");
+
+    let mut plain = format!(
+        "{}\n\n{}\n\n{} {}\n{} {}\n{} {}\n{} {}\n\n",
+        greeting,
+        headline,
+        label_event,
+        details.event_title,
+        label_date,
+        details.date,
+        label_time,
+        time_display,
+        label_with,
+        details.host_name,
+    );
+    if let Some(r) = &details.reason {
+        plain.push_str(&format!("{} {}\n\n", label_reason, r));
+    }
+    plain.push_str(&signature);
 
     let mut rows = vec![
         EmailRow {
-            label: "Event".to_string(),
+            label: label_event,
             value: details.event_title.clone(),
         },
         EmailRow {
-            label: "Date".to_string(),
+            label: label_date,
             value: details.date.clone(),
         },
         EmailRow {
-            label: "Time".to_string(),
+            label: label_time,
             value: time_display,
         },
         EmailRow {
-            label: "With".to_string(),
+            label: label_with,
             value: details.host_name.clone(),
         },
     ];
     if let Some(reason) = &details.reason {
         rows.push(EmailRow {
-            label: "Reason".to_string(),
+            label: label_reason,
             value: reason.clone(),
         });
     }
 
-    let html = render_html_email(
-        &format!("Hi {},", h(&details.guest_name)),
-        "Your booking request has been declined.",
+    let html = render_html_email_in(
+        lang,
+        &h(&greeting),
+        &h(&headline),
         "#dc2626",
         &rows,
         None,
+        &[],
     );
 
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Declined: {} \u{2014} {}",
-            details.event_title, details.date
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    ComposedEmail {
+        subject: status_subject(
+            lang,
+            "bae-title-booking-declined",
+            &details.event_title,
+            &details.date,
+        ),
+        plain,
+        html,
+    }
 }
 
 // --- Utility ---
@@ -2398,7 +2545,27 @@ pub async fn send_invite_email(
     send_email(config, email).await
 }
 
+/// How long to wait for the TCP (and implicit TLS) connection to the SMTP
+/// server. lettre's async transport only applies its timeout to the connect
+/// step, so this alone cannot bound a server that accepts and then stalls.
+pub const SMTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Hard ceiling on one whole delivery: connect, greeting, EHLO, STARTTLS,
+/// AUTH, envelope and DATA. A relay that accepts the connection and then goes
+/// quiet would otherwise hold the caller forever (#236), which on the booking
+/// path meant the reverse proxy answering 504 for a booking that existed.
+pub const SMTP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
+    send_email_with_timeouts(config, email, SMTP_CONNECT_TIMEOUT, SMTP_SEND_TIMEOUT).await
+}
+
+async fn send_email_with_timeouts(
+    config: &SmtpConfig,
+    email: Message,
+    connect_timeout: std::time::Duration,
+    send_timeout: std::time::Duration,
+) -> Result<()> {
     let builder = match config.tls_mode {
         SmtpTlsMode::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.host)?,
         SmtpTlsMode::StartTls => {
@@ -2421,7 +2588,8 @@ async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
             AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.host)
         }
     }
-    .port(config.port);
+    .port(config.port)
+    .timeout(Some(connect_timeout));
 
     // An empty username means "no SMTP AUTH". lettre only skips authentication
     // when the transport carries no credentials at all: given empty ones it
@@ -2447,21 +2615,36 @@ async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
         .map(|a| a.to_string())
         .collect();
     let to_display = to_addrs.join(", ");
-    match mailer.send(email).await {
-        Ok(_) => {
+    match tokio::time::timeout(send_timeout, mailer.send(email)).await {
+        Ok(Ok(_)) => {
             tracing::debug!(to = %to_display, "email delivered");
             Ok(())
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(to = %to_display, error = %e, "email delivery failed");
             Err(e.into())
+        }
+        Err(_) => {
+            tracing::error!(
+                to = %to_display,
+                host = %config.host,
+                port = config.port,
+                timeout_secs = send_timeout.as_secs(),
+                "email delivery timed out"
+            );
+            anyhow::bail!(
+                "SMTP server {}:{} did not complete the delivery within {}s",
+                config.host,
+                config.port,
+                send_timeout.as_secs_f32()
+            )
         }
     }
 }
 
 // --- Reschedule emails ---
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RescheduleDetails {
     pub old_utc_times: Option<(String, String)>,
     /// Exact UTC endpoints for new bookings; legacy records use wall-clock fields.
@@ -3029,18 +3212,18 @@ mod tests {
     use lettre::Address;
 
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
-    static SMTP_ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // The crate-wide lock, not a module-local one: web tests that send real
+    // mail through `load_smtp_config` must not see a half-set
+    // `CALRS_SMTP_*` block from these tests running on another thread.
     struct SmtpEnvGuard {
-        _lock: MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         old_values: Vec<(&'static str, Option<String>)>,
     }
 
     impl SmtpEnvGuard {
         fn new() -> Self {
-            let lock = SMTP_ENV_LOCK.lock().unwrap();
+            let lock = crate::test_support::ENV_LOCK.blocking_lock();
             let old_values = SMTP_ENV_VARS
                 .iter()
                 .map(|name| (*name, std::env::var(name).ok()))
@@ -3335,6 +3518,50 @@ mod tests {
             .expect("server timed out")
             .unwrap();
         assert!(!seen.iter().any(|c| c.starts_with("MAIL FROM")), "{seen:?}");
+    }
+
+    /// #236: a relay that accepts the TCP connection and then never speaks
+    /// must not hold the caller. lettre's own timeout only covers connect, so
+    /// this exercises the outer deadline around the whole delivery.
+    #[tokio::test]
+    async fn stalled_relay_times_out_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept, hold the socket open, and never send the 220 greeting.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(sock);
+        });
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_email_with_timeouts(
+                &plaintext_config(port, ""),
+                test_message(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("send_email ignored its deadline")
+        .expect_err("a silent relay cannot deliver");
+        assert!(
+            err.to_string().contains("within"),
+            "unexpected error: {err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
+
+    #[test]
+    fn smtp_timeouts_fit_under_a_reverse_proxy() {
+        // nginx and most proxies give up on an upstream after 60s. The admin
+        // "send test email" call is still synchronous, so a dead relay must
+        // fail well before that.
+        assert!(SMTP_CONNECT_TIMEOUT <= SMTP_SEND_TIMEOUT);
+        assert!(SMTP_SEND_TIMEOUT < std::time::Duration::from_secs(60));
     }
 
     #[test]
@@ -6548,5 +6775,151 @@ mod tests {
         // Sanity: the Subject line itself must exist exactly once.
         let subject_count = lines.iter().filter(|l| l.starts_with("Subject:")).count();
         assert_eq!(subject_count, 1, "exactly one Subject header expected");
+    }
+
+    // --- #209: guest pending-flow emails follow the booking's language ---
+
+    fn cancellation_from(details: &BookingDetails) -> CancellationDetails {
+        CancellationDetails {
+            event_title: details.event_title.clone(),
+            date: details.date.clone(),
+            start_time: details.start_time.clone(),
+            end_time: details.end_time.clone(),
+            guest_name: details.guest_name.clone(),
+            guest_email: details.guest_email.clone(),
+            guest_timezone: details.guest_timezone.clone(),
+            host_name: details.host_name.clone(),
+            host_email: details.host_email.clone(),
+            reason: Some("Conflit".to_string()),
+            cancelled_by_host: true,
+            guest_language: details.guest_language.clone(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pending_notice_is_written_in_the_guest_language() {
+        let details = BookingDetails {
+            guest_language: Some("fr".to_string()),
+            ..sample_booking_details()
+        };
+        let mail = compose_guest_pending_notice(
+            &details,
+            Some("https://cal.rs/booking/cancel/tok1"),
+            Some("https://cal.rs/booking/reschedule/tok2"),
+        );
+
+        assert_eq!(
+            mail.subject,
+            "[En attente de confirmation] 30min Intro \u{2014} 2026-04-10"
+        );
+        assert!(
+            mail.plain.starts_with("Bonjour Jane Doe,"),
+            "{}",
+            mail.plain
+        );
+        assert!(mail
+            .plain
+            .contains("Votre demande de réservation a été envoyée à Alice Smith"));
+        assert!(mail.plain.contains("Événement : 30min Intro"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        for english in [
+            "Hi Jane",
+            "awaiting",
+            "Pending:",
+            "Cancel booking",
+            "Event:",
+        ] {
+            assert!(
+                !mail.plain.contains(english),
+                "{english} leaked into: {}",
+                mail.plain
+            );
+            assert!(
+                !mail.html.contains(english),
+                "{english} leaked into the HTML"
+            );
+        }
+        // The meeting link is only revealed once the booking is confirmed.
+        assert!(!mail.plain.contains("meet.example.com"));
+        assert!(!mail.html.contains("meet.example.com"));
+    }
+
+    #[test]
+    fn pending_notice_without_a_stored_language_is_english() {
+        let mail = compose_guest_pending_notice(&sample_booking_details(), None, None);
+        assert_eq!(
+            mail.subject,
+            "[Pending confirmation] 30min Intro \u{2014} 2026-04-10"
+        );
+        assert!(mail.plain.starts_with("Hi Jane Doe,"));
+        assert!(mail
+            .plain
+            .contains("Your booking request has been sent to Alice Smith."));
+        assert!(mail.html.contains("<html lang=\"en\">"));
+    }
+
+    #[test]
+    fn pending_notice_escapes_names_in_the_html_headline() {
+        let details = BookingDetails {
+            host_name: "<b>Mallory</b>".to_string(),
+            ..sample_booking_details()
+        };
+        let mail = compose_guest_pending_notice(&details, None, None);
+        assert!(!mail.html.contains("<b>Mallory</b>"));
+        assert!(mail.html.contains("&lt;b&gt;Mallory&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn decline_notice_is_written_in_the_guest_language() {
+        let details = BookingDetails {
+            guest_language: Some("fr".to_string()),
+            ..sample_booking_details()
+        };
+        let mail = compose_guest_decline_notice(&cancellation_from(&details));
+
+        assert_eq!(
+            mail.subject,
+            "[Réservation refusée] 30min Intro \u{2014} 2026-04-10"
+        );
+        assert!(mail.plain.starts_with("Bonjour Jane Doe,"));
+        assert!(mail
+            .plain
+            .contains("Cette réservation a été refusée par l'hôte."));
+        assert!(mail.plain.contains("Motif : Conflit"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        for english in ["Hi Jane", "has been declined", "Declined:", "Reason:"] {
+            assert!(
+                !mail.plain.contains(english),
+                "{english} leaked into: {}",
+                mail.plain
+            );
+            assert!(
+                !mail.html.contains(english),
+                "{english} leaked into the HTML"
+            );
+        }
+    }
+
+    #[test]
+    fn decline_notice_without_a_stored_language_is_english() {
+        let mail = compose_guest_decline_notice(&cancellation_from(&sample_booking_details()));
+        assert_eq!(
+            mail.subject,
+            "[Booking declined] 30min Intro \u{2014} 2026-04-10"
+        );
+        assert!(mail
+            .plain
+            .contains("This booking has been declined by the host."));
+        assert!(mail.html.contains("<html lang=\"en\">"));
+    }
+
+    #[test]
+    fn html_email_lang_attribute_is_escaped() {
+        let html = render_html_email_in("fr\"><script>", "Hi,", "Body", "#000", &[], None, &[]);
+        assert!(html.contains("<html lang=\"fr&quot;&gt;&lt;script&gt;\">"));
+        // Untranslated emails keep declaring English.
+        let html = render_html_email("Hi,", "Body", "#000", &[], None);
+        assert!(html.contains("<html lang=\"en\">"));
     }
 }

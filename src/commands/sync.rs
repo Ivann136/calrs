@@ -1134,6 +1134,7 @@ async fn cancel_orphaned_booking(
         uid: booking_uid,
         reason: Some("The calendar event was deleted by the host.".to_string()),
         cancelled_by_host: true,
+        guest_language: crate::email::stored_booking_language(pool, &booking_id).await,
         host_timezone: host_timezone.unwrap_or_default(),
         ..Default::default()
     };

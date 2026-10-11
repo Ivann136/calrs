@@ -83,6 +83,7 @@
       <div>{{ t("overview-booking-with", title='<strong>' ~ (b.event_title | escape) ~ '</strong>', guest=b.guest_name | escape) | safe }} <span class="badge badge-pending">{{ t("overview-badge-pending") }}</span></div>
       <div style="color: var(--text-muted); font-size: 0.85rem;">{{ b.start_at }}</div>
       {% if b.start_at_guest %}<div style="color: var(--text-muted); font-size: 0.75rem;">{{ t("overview-guest-booked") }} {{ b.start_at_guest }}</div>{% endif %}
+      {% if b.notes %}<div class="booking-notes" tabindex="0"><strong>{{ t("confirmed-detail-notes") }}</strong> {{ b.notes }}</div>{% endif %}
     </div>
     <div class="booking-actions">
       <form method="post" action="/dashboard/bookings/{{ b.id }}/confirm" style="margin: 0;">

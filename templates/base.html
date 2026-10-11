@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ (lang or 'en') | html_lang }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -407,14 +407,33 @@
     }
 
     /* Interactive card hover lift */
-    a.card {
+    a.card, .card.card-link {
       transition: border-color 0.15s ease, box-shadow 0.2s ease, transform 0.2s ease;
     }
-    a.card:hover {
+    a.card:hover, .card.card-link:hover {
       border-color: var(--accent-border);
       box-shadow: var(--shadow-lg);
       transform: translateY(-2px);
     }
+
+    /* Clickable card that may contain its own links (e.g. a markdown
+       description). A link cannot be nested in another link, so the card is a
+       <div> and the title link stretches over it with ::after. Inner links
+       are lifted above that overlay so they keep their own target. */
+    .card.card-link { position: relative; }
+    .card-link-title { color: inherit; text-decoration: none; }
+    .card-link-title::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: var(--radius-lg);
+    }
+    .card-link-title:focus-visible { outline: none; }
+    .card-link-title:focus-visible::after {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .card.card-link a:not(.card-link-title) { position: relative; z-index: 1; }
 
     /* Status badges */
     .badge {

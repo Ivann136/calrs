@@ -37,18 +37,18 @@
 
 {% if event_types %}
   {% for et in event_types %}
-  <a href="/u/{{ username }}/{{ et.slug }}" data-calrs-sync class="card" style="display: block; text-decoration: none; color: inherit; border-left: 3px solid var(--accent); padding-left: 1.75rem;">
+  <div class="card card-link" style="border-left: 3px solid var(--accent); padding-left: 1.75rem;">
     <div style="display: flex; justify-content: space-between; align-items: center;">
       <div>
-        <strong>{{ et.title }}</strong>
+        <a href="/u/{{ username }}/{{ et.slug }}" data-calrs-sync class="card-link-title"><strong>{{ et.title }}</strong></a>
         <span style="color: var(--text-muted); font-size: 0.85rem;">&middot; {{ et.duration_min }}min</span>
         {% if et.description %}
         <p class="description-clamp" style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.25rem; margin-bottom: 0;">{{ et.description|safe }}</p>
         {% endif %}
       </div>
-      <span style="color: var(--accent); font-size: 1.25rem; transition: transform 0.15s ease;">&rarr;</span>
+      <span aria-hidden="true" style="color: var(--accent); font-size: 1.25rem; transition: transform 0.15s ease;">&rarr;</span>
     </div>
-  </a>
+  </div>
   {% endfor %}
 {% else %}
   <div class="card">

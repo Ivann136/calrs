@@ -196,10 +196,23 @@ pub fn format_long_date(date: NaiveDate, lang: &str) -> String {
     translate(lang, "common-format-long-date", Some(&args))
 }
 
-/// Register the `t(key, **kwargs)` function on a minijinja environment.
-/// Templates pull the active language from the rendering context's `lang` var.
+/// The BCP-47 tag for a locale code, for `<html lang>`. The codes are the
+/// bundle directory names, and `pt` is Brazilian Portuguese: declared as
+/// plain `pt`, browsers and screen readers would assume European Portuguese.
+pub fn html_lang(code: &str) -> &str {
+    match code {
+        "pt" => "pt-BR",
+        "" => "en",
+        other => other,
+    }
+}
+
+/// Register the `t(key, **kwargs)` function and the `html_lang` filter on a
+/// minijinja environment. Templates pull the active language from the
+/// rendering context's `lang` var.
 pub fn register(env: &mut Environment<'static>) {
     env.add_function("t", t_function);
+    env.add_filter("html_lang", |code: String| html_lang(&code).to_string());
 }
 
 /// A template argument on its way into Fluent.
@@ -480,6 +493,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn html_lang_tags_brazilian_portuguese() {
+        assert_eq!(super::html_lang("pt"), "pt-BR");
+        assert_eq!(super::html_lang("fr"), "fr");
+        assert_eq!(super::html_lang(""), "en");
+    }
+
     /// A message id: kebab-case ASCII, which no template name, CSS class or
     /// SQL fragment in this codebase looks like.
     fn looks_like_key(key: &str) -> bool {
@@ -498,7 +518,8 @@ mod tests {
         let mut keys = Vec::new();
         // Helpers that take message ids as arguments instead of resolving them
         // inline. Add one here when you add one to the code.
-        const KEY_TAKING_HELPERS: &[&str] = &["render_booking_action_error_keys("];
+        const KEY_TAKING_HELPERS: &[&str] =
+            &["render_booking_action_error_keys(", "status_subject("];
         for call in KEY_TAKING_HELPERS {
             let mut i = 0;
             while let Some(pos) = src[i..].find(call) {

@@ -191,6 +191,9 @@ async fn main() -> Result<()> {
             axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
                 .await?;
+            // Booking emails are sent in the background after the response;
+            // let the ones still in flight finish before the runtime stops.
+            web::drain_emails(std::time::Duration::from_secs(30)).await;
         }
     }
 

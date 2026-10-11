@@ -492,6 +492,193 @@ async fn due_reminders(pool: &SqlitePool, now: chrono::DateTime<Utc>) -> Vec<Due
                AND datetime(b.start_at) > datetime(?1)",).bind(now.to_rfc3339()).fetch_all(pool).await.unwrap_or_default()
 }
 
+/// Log a failed email send with enough context to find the booking again.
+/// Email is best-effort everywhere in the booking flow, but a failure that
+/// leaves no trace is how #236 went unnoticed: `send_email` logs the SMTP
+/// error, this adds which message it was and for which booking. `booking` is
+/// the booking's iCal uid, or its row id where the uid is not at hand.
+fn log_email_result(result: anyhow::Result<()>, email: &'static str, booking: &str) {
+    if let Err(e) = result {
+        tracing::warn!(email, booking = %booking, error = %e, "email send failed");
+    }
+}
+
+/// Send booking-flow emails after the HTTP response instead of before it.
+/// The booking (or its cancellation, approval, ...) is already committed when
+/// this is called, so the guest must not wait on SMTP to see the result: a
+/// slow or dead relay used to stall the request until the reverse proxy gave
+/// up with a 504, and guests retried a booking that existed (#236). The
+/// future owns everything it needs; failures are logged via
+/// `log_email_result` inside it.
+fn spawn_emails<F>(task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    EMAIL_TASKS.spawn(task);
+}
+
+/// Background email sends still in flight, so a graceful shutdown can wait
+/// for them instead of dropping them with the runtime (see `drain_emails`).
+static EMAIL_TASKS: TaskTracker = TaskTracker::new();
+
+/// Counts spawned tasks and wakes waiters when the count drops to zero.
+struct TaskTracker {
+    pending: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl TaskTracker {
+    const fn new() -> Self {
+        Self {
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::const_new(),
+        }
+    }
+
+    fn spawn<F>(&'static self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        // Decrement on drop, so a task that panics still counts as done.
+        struct Done(&'static TaskTracker);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if self.0.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.0.drained.notify_waiters();
+                }
+            }
+        }
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let done = Done(self);
+        tokio::spawn(async move {
+            let _done = done;
+            task.await;
+        });
+    }
+
+    /// Wait until every spawned task has finished, or `timeout` passes.
+    /// Returns how many were still running.
+    async fn drain(&self, timeout: std::time::Duration) -> usize {
+        use std::sync::atomic::Ordering;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let left = self.pending.load(Ordering::Acquire);
+            if left == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.pending.load(Ordering::Acquire);
+            }
+        }
+    }
+}
+
+/// Called once the HTTP server has stopped: give queued booking emails time
+/// to go out. Each send is bounded by the SMTP deadline, so this cannot hang
+/// past `timeout`.
+pub async fn drain_emails(timeout: std::time::Duration) {
+    if EMAIL_TASKS
+        .pending
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        return;
+    }
+    tracing::info!("waiting for queued emails before exiting");
+    let left = EMAIL_TASKS.drain(timeout).await;
+    if left > 0 {
+        tracing::warn!(left, "shutdown: queued emails still sending were dropped");
+    }
+}
+
+/// Everything the new-booking emails need, owned so it can outlive the
+/// request. Shared by the four guest booking handlers (personal, user-scoped,
+/// dynamic group, team), which used to repeat the same send sequence inline.
+struct NewBookingEmails {
+    smtp_config: crate::email::SmtpConfig,
+    details: crate::email::BookingDetails,
+    /// Host-side recipients as (name, email). Collective team bookings list
+    /// every member; everything else lists the single host from `details`.
+    host_recipients: Vec<(String, String)>,
+    booking_id: String,
+    needs_approval: bool,
+    confirm_token: Option<String>,
+    base_url: Option<String>,
+    guest_cancel_url: Option<String>,
+    guest_reschedule_url: Option<String>,
+    cancel_notice_min: Option<i32>,
+    reschedule_notice_min: Option<i32>,
+}
+
+/// Send the guest and host emails for a just-committed booking in the
+/// background (see `spawn_emails`).
+fn send_new_booking_emails(m: NewBookingEmails) {
+    spawn_emails(async move {
+        let uid = m.details.uid.as_str();
+        let host_details = |name: &str, email: &str| crate::email::BookingDetails {
+            host_name: name.to_string(),
+            host_email: email.to_string(),
+            ..m.details.clone()
+        };
+        if m.needs_approval {
+            for (name, email) in &m.host_recipients {
+                log_email_result(
+                    crate::email::send_host_approval_request(
+                        &m.smtp_config,
+                        &host_details(name, email),
+                        &m.booking_id,
+                        m.confirm_token.as_deref(),
+                        m.base_url.as_deref(),
+                    )
+                    .await,
+                    "host_approval_request",
+                    uid,
+                );
+            }
+            log_email_result(
+                crate::email::send_guest_pending_notice_ex(
+                    &m.smtp_config,
+                    &m.details,
+                    m.guest_cancel_url.as_deref(),
+                    m.guest_reschedule_url.as_deref(),
+                )
+                .await,
+                "guest_pending_notice",
+                uid,
+            );
+        } else {
+            log_email_result(
+                crate::email::send_guest_confirmation_ex(
+                    &m.smtp_config,
+                    &m.details,
+                    m.guest_cancel_url.as_deref(),
+                    m.guest_reschedule_url.as_deref(),
+                    m.cancel_notice_min,
+                    m.reschedule_notice_min,
+                )
+                .await,
+                "guest_confirmation",
+                uid,
+            );
+            for (name, email) in &m.host_recipients {
+                log_email_result(
+                    crate::email::send_host_notification(
+                        &m.smtp_config,
+                        &host_details(name, email),
+                    )
+                    .await,
+                    "host_notification",
+                    uid,
+                );
+            }
+        }
+    });
+}
+
 /// Background task that sends booking reminders on a 60-second tick. Also
 /// piggybacks an hourly sweep of expired sessions so the `sessions` table
 /// doesn't accumulate dead rows indefinitely.
@@ -589,6 +776,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 host_email: host_email.clone(),
                 uid: uid.clone(),
                 notes: None,
+                guest_phone: None,
                 location,
                 reminder_minutes: None,
                 additional_attendees: vec![],
@@ -611,13 +799,23 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             let mut notified = false;
 
             if let Some(smtp_config) = &smtp_config {
-                let _ = crate::email::send_guest_reminder(
-                    smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                )
-                .await;
-                let _ = crate::email::send_host_reminder(smtp_config, &details).await;
+                // Inline on purpose: this loop is already off the request
+                // path, and `send_email` bounds each attempt.
+                log_email_result(
+                    crate::email::send_guest_reminder(
+                        smtp_config,
+                        &details,
+                        guest_cancel_url.as_deref(),
+                    )
+                    .await,
+                    "guest_reminder",
+                    uid,
+                );
+                log_email_result(
+                    crate::email::send_host_reminder(smtp_config, &details).await,
+                    "host_reminder",
+                    uid,
+                );
                 notified = true;
             }
 
@@ -1816,10 +2014,12 @@ async fn dashboard(
         String,
         String,
         String,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title,
                 COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
-                COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz
+                COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
+                COALESCE(b.notes, '') AS notes
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -1868,7 +2068,7 @@ async fn dashboard(
     let pending_ctx: Vec<minijinja::Value> = pending_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, stored_tz, guest_tz)| {
+            |(id, name, email, start, end, title, stored_tz, guest_tz, notes)| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
@@ -1878,6 +2078,7 @@ async fn dashboard(
                     start_at => primary,
                     start_at_guest => secondary,
                     event_title => title,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -2115,11 +2316,16 @@ async fn dashboard_bookings(
         String,
         String,
         String,
+        String,
+        Option<String>,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title,
                 COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                 COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
-                COALESCE(r.name, '') AS resource_name
+                COALESCE(r.name, '') AS resource_name,
+                COALESCE(b.notes, '') AS notes,
+                b.guest_phone, et.sms_phone_mode
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2133,13 +2339,14 @@ async fn dashboard_bookings(
     .await
     .unwrap_or_default();
 
-    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String)> =
+    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, b.guest_phone, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, b.reschedule_by_host,
                     COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                     COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                     COALESCE(r.name, '') AS resource_name,
-                    et.sms_phone_mode
+                    et.sms_phone_mode,
+                    COALESCE(b.notes, '') AS notes
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2157,11 +2364,12 @@ async fn dashboard_bookings(
     // Claimable bookings: unclaimed bookings on event types watched by the user's teams.
     // For team event types et.account_id may be null, so the timezone falls back to the
     // event type's own tz column (always set since migration 046's backfill).
-    let claimable_bookings: Vec<(String, String, String, String, String, String, String, String, String, String)> =
+    let claimable_bookings: Vec<(String, String, String, String, String, String, String, String, String, String, String)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, t.name, bct.token, \
                     COALESCE(NULLIF(et.timezone, ''), 'UTC') AS stored_tz, \
-                    COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz \
+                    COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz, \
+                    COALESCE(b.notes, '') AS notes \
              FROM bookings b \
              JOIN event_types et ON et.id = b.event_type_id \
              JOIN event_type_watchers ew ON ew.event_type_id = et.id \
@@ -2187,7 +2395,7 @@ async fn dashboard_bookings(
     let claimable_ctx: Vec<minijinja::Value> = claimable_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, team_name, token, stored_tz, guest_tz)| {
+            |(id, name, email, start, end, title, team_name, token, stored_tz, guest_tz, notes)| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
@@ -2199,6 +2407,7 @@ async fn dashboard_bookings(
                     event_title => title,
                     team_name => team_name,
                     claim_token => token,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -2207,17 +2416,34 @@ async fn dashboard_bookings(
     let pending_ctx: Vec<minijinja::Value> = pending_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, stored_tz, guest_tz, resource_name)| {
+            |(
+                id,
+                name,
+                email,
+                start,
+                end,
+                title,
+                stored_tz,
+                guest_tz,
+                resource_name,
+                notes,
+                phone,
+                sms_phone_mode,
+            )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
                     id => id,
                     guest_name => name,
                     guest_email => email,
+                    // Shown while pending too: the host may need to call the
+                    // guest before deciding (#231).
+                    guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },
                     start_at => primary,
                     start_at_guest => secondary,
                     event_title => title,
                     resource_name => resource_name,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -2239,6 +2465,7 @@ async fn dashboard_bookings(
                 guest_tz,
                 resource_name,
                 sms_phone_mode,
+                notes,
             )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
@@ -2252,6 +2479,7 @@ async fn dashboard_bookings(
                     event_title => title,
                     awaiting_reschedule => *resched != 0,
                     resource_name => resource_name,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -4535,12 +4763,27 @@ async fn cancel_booking(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        if was_pending {
-            let _ = crate::email::send_guest_decline_notice(&smtp_config, &details).await;
-        } else {
-            let _ = crate::email::send_guest_cancellation(&smtp_config, &details).await;
-            let _ = crate::email::send_host_cancellation(&smtp_config, &details).await;
-        }
+        let details = details.clone();
+        spawn_emails(async move {
+            if was_pending {
+                log_email_result(
+                    crate::email::send_guest_decline_notice(&smtp_config, &details).await,
+                    "guest_decline_notice",
+                    &details.uid,
+                );
+            } else {
+                log_email_result(
+                    crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                    "guest_cancellation",
+                    &details.uid,
+                );
+                log_email_result(
+                    crate::email::send_host_cancellation(&smtp_config, &details).await,
+                    "host_cancellation",
+                    &details.uid,
+                );
+            }
+        });
     }
 
     // Cancellation SMS to the guest, independent of SMTP. Declines
@@ -4666,12 +4909,20 @@ async fn confirm_booking(
         }
     }
 
-    // Confirm the booking
-    let _ = sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ?")
-        .bind(&bid)
-        .execute(&state.pool)
-        .await;
+    // Confirm the booking. Guarded on 'pending' so that of two concurrent
+    // approvals (double click, or dashboard and email link together) only
+    // one goes on to send the emails and the paid SMS.
+    let flipped =
+        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+            .bind(&bid)
+            .execute(&state.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
     drop(resource_guard);
+    if flipped == 0 {
+        return Redirect::to("/dashboard/bookings").into_response();
+    }
 
     tracing::info!(booking_id = %bid, "booking confirmed by host");
 
@@ -4735,6 +4986,9 @@ async fn confirm_booking(
         location: location_display,
         reminder_minutes: None,
         additional_attendees: vec![],
+        // The host clicked approve, so the request carries the host's
+        // language; the guest's is the one stored with the booking (#209).
+        guest_language: crate::email::stored_booking_language(&state.pool, &bid).await,
         host_timezone: stored_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
         ..Default::default()
@@ -4743,6 +4997,43 @@ async fn confirm_booking(
     // Push to CalDAV calendar
     caldav_push_booking(&state.pool, &state.secret_key, &user.id, &uid, &details).await;
     resource_push_booking(&state.pool, &state.secret_key, &uid, &details).await;
+
+    // Notify watcher teams, as the token approve path does: a booking that
+    // needed approval only becomes claimable once it is confirmed.
+    notify_watchers(
+        &state.pool,
+        &state.secret_key,
+        &bid,
+        &et_id,
+        &details.host_name,
+        &details,
+    )
+    .await;
+
+    // Confirmation SMS to the guest, the same deferred send as the token
+    // approve path: a pending booking stays silent until the host approves.
+    let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
+    )
+    .bind(&bid)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    if let Some((guest_phone, sms_phone_mode)) = sms_target {
+        if let Some(ctx) = crate::sms::SmsContext::for_booking(
+            &details,
+            guest_phone.as_deref(),
+            crate::sms::collects_phone(&sms_phone_mode),
+        ) {
+            crate::sms::notify_guest(
+                &state.pool,
+                &state.secret_key,
+                crate::sms::SmsEvent::Confirmed,
+                ctx,
+            )
+            .await;
+        }
+    }
 
     // Send confirmation emails
     if let Ok(Some(smtp_config)) =
@@ -4761,20 +5052,28 @@ async fn confirm_booking(
         });
         let (cancel_notice_min, reschedule_notice_min) =
             fetch_event_type_notice_minutes(&state.pool, &et_id).await;
-        let _ = crate::email::send_guest_confirmation_ex(
-            &smtp_config,
-            &details,
-            guest_cancel_url.as_deref(),
-            guest_reschedule_url.as_deref(),
-            cancel_notice_min,
-            reschedule_notice_min,
-        )
-        .await;
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_confirmation_ex(
+                    &smtp_config,
+                    &details,
+                    guest_cancel_url.as_deref(),
+                    guest_reschedule_url.as_deref(),
+                    cancel_notice_min,
+                    reschedule_notice_min,
+                )
+                .await,
+                "guest_confirmation",
+                &details.uid,
+            );
 
-        // Also send host a confirmation email (no ICS, event pushed via CalDAV)
-        if let Err(e) = crate::email::send_host_booking_confirmed(&smtp_config, &details).await {
-            tracing::error!(error = %e, host_email = %details.host_email, "host confirmation email failed");
-        }
+            // Also send host a confirmation email (no ICS, event pushed via CalDAV)
+            log_email_result(
+                crate::email::send_host_booking_confirmed(&smtp_config, &details).await,
+                "host_booking_confirmed",
+                &details.uid,
+            );
+        });
     }
 
     Redirect::to("/dashboard/bookings").into_response()
@@ -7915,8 +8214,8 @@ async fn send_invite_bulk(
                     expires_at.as_deref(),
                 )
                 .await;
-                if send_res.is_err() {
-                    tracing::warn!(email = %email, "bulk invite SMTP send failed");
+                if let Err(e) = send_res {
+                    tracing::warn!(email = %email, error = %e, "bulk invite SMTP send failed");
                     result.failed.push(email);
                     continue;
                 }
@@ -10796,6 +11095,7 @@ async fn handle_group_booking(
         host_email: host_email.clone(),
         uid: uid.clone(),
         notes: form.notes.clone(),
+        guest_phone: phone_to_store.clone(),
         location: location_display.clone(),
         reminder_minutes: reminder_min,
         additional_attendees: additional_attendees.clone(),
@@ -10867,48 +11167,19 @@ async fn handle_group_booking(
             vec![(details.host_name.clone(), details.host_email.clone())]
         };
 
-        if needs_approval {
-            for (name, email) in &host_recipients {
-                let member_details = crate::email::BookingDetails {
-                    host_name: name.clone(),
-                    host_email: email.clone(),
-                    ..details.clone()
-                };
-                let _ = crate::email::send_host_approval_request(
-                    &smtp_config,
-                    &member_details,
-                    &id,
-                    confirm_token.as_deref(),
-                    base_url.as_deref(),
-                )
-                .await;
-            }
-            let _ = crate::email::send_guest_pending_notice_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
-        } else {
-            let _ = crate::email::send_guest_confirmation_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-                cancel_notice_min,
-                reschedule_notice_min,
-            )
-            .await;
-            for (name, email) in &host_recipients {
-                let member_details = crate::email::BookingDetails {
-                    host_name: name.clone(),
-                    host_email: email.clone(),
-                    ..details.clone()
-                };
-                let _ = crate::email::send_host_notification(&smtp_config, &member_details).await;
-            }
-        }
+        send_new_booking_emails(NewBookingEmails {
+            smtp_config,
+            details,
+            host_recipients,
+            booking_id: id.clone(),
+            needs_approval,
+            confirm_token: confirm_token.clone(),
+            base_url,
+            guest_cancel_url,
+            guest_reschedule_url,
+            cancel_notice_min,
+            reschedule_notice_min,
+        });
     }
 
     // Send booking SMS independently of the email/host notification path.
@@ -11868,6 +12139,7 @@ async fn handle_dynamic_group_booking(
         host_email: owner_email,
         uid: uid.clone(),
         notes: form.notes.clone(),
+        guest_phone: phone_to_store.clone(),
         location: location_display.clone(),
         reminder_minutes: reminder_min,
         additional_attendees: all_additional.clone(),
@@ -11914,34 +12186,20 @@ async fn handle_dynamic_group_booking(
             )
         });
 
-        if needs_approval {
-            let _ = crate::email::send_host_approval_request(
-                &smtp_config,
-                &details,
-                &id,
-                confirm_token.as_deref(),
-                base_url.as_deref(),
-            )
-            .await;
-            let _ = crate::email::send_guest_pending_notice_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
-        } else {
-            let _ = crate::email::send_guest_confirmation_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-                cancel_notice_min,
-                reschedule_notice_min,
-            )
-            .await;
-            let _ = crate::email::send_host_notification(&smtp_config, &details).await;
-        }
+        let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+        send_new_booking_emails(NewBookingEmails {
+            smtp_config,
+            details,
+            host_recipients,
+            booking_id: id.clone(),
+            needs_approval,
+            confirm_token: confirm_token.clone(),
+            base_url,
+            guest_cancel_url,
+            guest_reschedule_url,
+            cancel_notice_min,
+            reschedule_notice_min,
+        });
     }
 
     let host_display = dg_users
@@ -12840,6 +13098,7 @@ async fn handle_booking_for_user(
             host_email,
             uid: uid.clone(),
             notes: form.notes.clone(),
+            guest_phone: phone_to_store.clone(),
             location: location_display.clone(),
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
@@ -12880,34 +13139,20 @@ async fn handle_booking_for_user(
                 )
             });
 
-            if needs_approval {
-                let _ = crate::email::send_host_approval_request(
-                    &smtp_config,
-                    &details,
-                    &id,
-                    confirm_token.as_deref(),
-                    base_url.as_deref(),
-                )
-                .await;
-                let _ = crate::email::send_guest_pending_notice_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                )
-                .await;
-            } else {
-                let _ = crate::email::send_guest_confirmation_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                    cancel_notice_min,
-                    reschedule_notice_min,
-                )
-                .await;
-                let _ = crate::email::send_host_notification(&smtp_config, &details).await;
-            }
+            let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+            send_new_booking_emails(NewBookingEmails {
+                smtp_config,
+                details,
+                host_recipients,
+                booking_id: id.clone(),
+                needs_approval,
+                confirm_token: confirm_token.clone(),
+                base_url,
+                guest_cancel_url,
+                guest_reschedule_url,
+                cancel_notice_min,
+                reschedule_notice_min,
+            });
         }
     }
 
@@ -13980,6 +14225,32 @@ fn parse_month_param(param: Option<&str>, guest_tz: Tz) -> (i32, u32) {
     (now.date().year(), now.date().month())
 }
 
+/// Day window (start_offset, days_ahead), relative to the host's today, for
+/// which slots are computed when a month is rendered.
+///
+/// The window spans the whole Monday-to-Sunday grid around the month, not
+/// just the month itself: the week view opens on the week containing today
+/// (or the 1st), and that week can run into the next or previous month. It
+/// reads its slots from the same payload, so a month-only window left the
+/// trailing days of the last week empty until the guest navigated away and
+/// back, which loaded the neighbouring month (#228). One extra day on each
+/// side absorbs the host/guest timezone offset.
+fn month_slot_window(
+    month_start: NaiveDate,
+    month_end: NaiveDate,
+    host_today: NaiveDate,
+) -> (i32, i32) {
+    let grid_start =
+        month_start - Duration::days(month_start.weekday().num_days_from_monday() as i64);
+    let grid_end =
+        month_end + Duration::days(6 - month_end.weekday().num_days_from_monday() as i64);
+    let start_offset = ((grid_start - host_today).num_days() - 1).max(0) as i32;
+    // Exclusive upper bound, so +2 keeps the last grid day plus one buffer day.
+    let end_offset = (grid_end - host_today).num_days() as i32 + 2;
+    let days_ahead = (end_offset - start_offset).max(1);
+    (start_offset, days_ahead)
+}
+
 /// Build month-based slot computation parameters and context variables.
 /// Returns (start_offset, days_ahead, month_label, prev_month, next_month, first_weekday, days_in_month, today_date, month_year)
 fn build_month_params(
@@ -14013,11 +14284,7 @@ fn build_month_params(
 
     let days_in_month = (month_end - month_start).num_days() as u32 + 1;
 
-    // Compute start_offset and days_ahead relative to host's today
-    let host_today = now_host.date();
-    let start_offset = (month_start - host_today).num_days().max(0) as i32;
-    let end_offset = (month_end - host_today).num_days() as i32 + 2; // +2 buffer for TZ edge cases
-    let days_ahead = (end_offset - start_offset).max(1);
+    let (start_offset, days_ahead) = month_slot_window(month_start, month_end, now_host.date());
 
     let month_label = crate::i18n::format_month_year(month_start, lang);
     let month_year = format!("{}-{:02}", year, month);
@@ -15477,6 +15744,7 @@ async fn handle_booking(
             host_email,
             uid: uid.clone(),
             notes: form.notes.clone(),
+            guest_phone: phone_to_store.clone(),
             location: location_display,
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
@@ -15517,34 +15785,20 @@ async fn handle_booking(
                 )
             });
 
-            if needs_approval {
-                let _ = crate::email::send_host_approval_request(
-                    &smtp_config,
-                    &details,
-                    &id,
-                    confirm_token.as_deref(),
-                    base_url.as_deref(),
-                )
-                .await;
-                let _ = crate::email::send_guest_pending_notice_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                )
-                .await;
-            } else {
-                let _ = crate::email::send_guest_confirmation_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                    cancel_notice_min,
-                    reschedule_notice_min,
-                )
-                .await;
-                let _ = crate::email::send_host_notification(&smtp_config, &details).await;
-            }
+            let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+            send_new_booking_emails(NewBookingEmails {
+                smtp_config,
+                details,
+                host_recipients,
+                booking_id: id.clone(),
+                needs_approval,
+                confirm_token: confirm_token.clone(),
+                base_url,
+                guest_cancel_url,
+                guest_reschedule_url,
+                cancel_notice_min,
+                reschedule_notice_min,
+            });
         }
     }
 
@@ -19193,12 +19447,24 @@ async fn approve_booking_by_token(
         }
     }
 
-    // Confirm the booking
-    let _ = sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ?")
-        .bind(&bid)
-        .execute(&state.pool)
-        .await;
+    // Confirm the booking, guarded like the dashboard path: a concurrent
+    // approval that already flipped it lands on the "already handled" page.
+    let flipped =
+        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+            .bind(&bid)
+            .execute(&state.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
     drop(resource_guard);
+    if flipped == 0 {
+        let already: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
+            .bind(&bid)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+        return render_token_error(&state, &headers, &token, already);
+    }
 
     tracing::info!(booking_id = %bid, "booking approved via token");
 
@@ -19253,13 +19519,7 @@ async fn approve_booking_by_token(
     )
     .await;
 
-    let guest_language: Option<String> =
-        sqlx::query_scalar("SELECT language FROM bookings WHERE id = ?")
-            .bind(&bid)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None)
-            .flatten();
+    let guest_language = crate::email::stored_booking_language(&state.pool, &bid).await;
 
     let details = crate::email::BookingDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
@@ -19318,20 +19578,29 @@ async fn approve_booking_by_token(
         });
         let (cancel_notice_min, reschedule_notice_min) =
             fetch_event_type_notice_minutes(&state.pool, &event_type_id).await;
-        let _ = crate::email::send_guest_confirmation_ex(
-            &smtp_config,
-            &details,
-            guest_cancel_url.as_deref(),
-            guest_reschedule_url.as_deref(),
-            cancel_notice_min,
-            reschedule_notice_min,
-        )
-        .await;
+        let details = details.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_confirmation_ex(
+                    &smtp_config,
+                    &details,
+                    guest_cancel_url.as_deref(),
+                    guest_reschedule_url.as_deref(),
+                    cancel_notice_min,
+                    reschedule_notice_min,
+                )
+                .await,
+                "guest_confirmation",
+                &details.uid,
+            );
 
-        // Also send host a confirmation email (no ICS, event pushed via CalDAV)
-        if let Err(e) = crate::email::send_host_booking_confirmed(&smtp_config, &details).await {
-            tracing::error!(error = %e, host_email = %details.host_email, "host confirmation email failed");
-        }
+            // Also send host a confirmation email (no ICS, event pushed via CalDAV)
+            log_email_result(
+                crate::email::send_host_booking_confirmed(&smtp_config, &details).await,
+                "host_booking_confirmed",
+                &details.uid,
+            );
+        });
     }
 
     // Confirmation SMS to the guest, now that the booking is confirmed. This
@@ -19519,10 +19788,20 @@ async fn decline_booking_by_token(
             uid: String::new(),
             reason: reason.clone(),
             cancelled_by_host: true,
+            // `lang` above is the host's (they clicked the link); the guest
+            // reads this email in the language they booked in (#209).
+            guest_language: crate::email::stored_booking_language(&state.pool, &bid).await,
             host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
-        let _ = crate::email::send_guest_decline_notice(&smtp_config, &details).await;
+        let bid = bid.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_decline_notice(&smtp_config, &details).await,
+                "guest_decline_notice",
+                &bid,
+            );
+        });
     }
 
     let tmpl = match state.templates.get_template("booking_declined.html") {
@@ -19966,8 +20245,19 @@ async fn guest_cancel_booking(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        let _ = crate::email::send_guest_cancellation(&smtp_config, &details).await;
-        let _ = crate::email::send_host_cancellation(&smtp_config, &details).await;
+        let details = details.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                "guest_cancellation",
+                &details.uid,
+            );
+            log_email_result(
+                crate::email::send_host_cancellation(&smtp_config, &details).await,
+                "host_cancellation",
+                &details.uid,
+            );
+        });
     }
 
     // Cancellation SMS to the guest, independent of SMTP.
@@ -20767,13 +21057,6 @@ async fn guest_reschedule_booking(
                 location: loc_value.clone(),
                 host_timezone: host_tz.name().to_string(),
             };
-            let _ = crate::email::send_host_reschedule_request(
-                &smtp_config,
-                &reschedule_details,
-                Some(&new_confirm_token),
-                base_url.as_deref(),
-            )
-            .await;
 
             // Send guest pending notice with new tokens
             let guest_cancel_url = base_url.as_ref().map(|base| {
@@ -20806,17 +21089,39 @@ async fn guest_reschedule_booking(
                 location: loc_value,
                 reminder_minutes: None,
                 additional_attendees: vec![],
+                guest_language: crate::email::stored_booking_language(&state.pool, &booking_id)
+                    .await
+                    .or_else(|| Some(lang.to_string())),
                 host_timezone: host_tz.name().to_string(),
                 resource_name: booking_resource_label(&state.pool, &uid).await,
                 ..Default::default()
             };
-            let _ = crate::email::send_guest_pending_notice_ex(
-                &smtp_config,
-                &pending_details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
+            let new_confirm_token = new_confirm_token.clone();
+            spawn_emails(async move {
+                let uid = reschedule_details.uid.as_str();
+                log_email_result(
+                    crate::email::send_host_reschedule_request(
+                        &smtp_config,
+                        &reschedule_details,
+                        Some(&new_confirm_token),
+                        base_url.as_deref(),
+                    )
+                    .await,
+                    "host_reschedule_request",
+                    uid,
+                );
+                log_email_result(
+                    crate::email::send_guest_pending_notice_ex(
+                        &smtp_config,
+                        &pending_details,
+                        guest_cancel_url.as_deref(),
+                        guest_reschedule_url.as_deref(),
+                    )
+                    .await,
+                    "guest_pending_notice",
+                    uid,
+                );
+            });
         }
     } else {
         // Confirmed reschedule (host-initiated or guest on non-confirmation event)
@@ -20869,35 +21174,47 @@ async fn guest_reschedule_booking(
                 )
             });
 
-            // Notify guest with confirmation + ICS
-            let _ = crate::email::send_guest_reschedule_notification(
-                &smtp_config,
-                &crate::email::RescheduleDetails {
-                    old_utc_times: crate::booking_time::ics_times(&old_start_at, &old_end_at),
-                    utc_times: crate::booking_time::ics_times(&new_start_at, &new_end_at),
-                    event_title: et_title.clone(),
-                    old_date,
-                    old_start_time,
-                    old_end_time,
-                    new_date: form.date.clone(),
-                    new_start_time: form.time.clone(),
-                    new_end_time: guest_end_time.clone(),
-                    guest_name: guest_name.clone(),
-                    guest_email: guest_email.clone(),
-                    guest_timezone: new_guest_timezone,
-                    host_name: host_name.clone(),
-                    host_email: host_email.clone(),
+            let reschedule_details = crate::email::RescheduleDetails {
+                old_utc_times: crate::booking_time::ics_times(&old_start_at, &old_end_at),
+                utc_times: crate::booking_time::ics_times(&new_start_at, &new_end_at),
+                event_title: et_title.clone(),
+                old_date,
+                old_start_time,
+                old_end_time,
+                new_date: form.date.clone(),
+                new_start_time: form.time.clone(),
+                new_end_time: guest_end_time.clone(),
+                guest_name: guest_name.clone(),
+                guest_email: guest_email.clone(),
+                guest_timezone: new_guest_timezone,
+                host_name: host_name.clone(),
+                host_email: host_email.clone(),
+                uid,
+                location: loc_value,
+                host_timezone: host_tz.name().to_string(),
+            };
+            spawn_emails(async move {
+                let uid = reschedule_details.uid.as_str();
+                // Notify guest with confirmation + ICS
+                log_email_result(
+                    crate::email::send_guest_reschedule_notification(
+                        &smtp_config,
+                        &reschedule_details,
+                        guest_cancel_url.as_deref(),
+                        guest_reschedule_url.as_deref(),
+                    )
+                    .await,
+                    "guest_reschedule_notification",
                     uid,
-                    location: loc_value,
-                    host_timezone: host_tz.name().to_string(),
-                },
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
+                );
 
-            // Notify host
-            let _ = crate::email::send_host_booking_confirmed(&smtp_config, &push_details).await;
+                // Notify host
+                log_email_result(
+                    crate::email::send_host_booking_confirmed(&smtp_config, &push_details).await,
+                    "host_booking_confirmed",
+                    uid,
+                );
+            });
         }
     }
 
@@ -21138,14 +21455,21 @@ async fn host_reschedule_booking(
             ..Default::default()
         };
 
-        if let Some(url) = &reschedule_url {
-            let _ = crate::email::send_guest_pick_new_time(
-                &smtp_config,
-                &details,
-                url,
-                cancel_url.as_deref(),
-            )
-            .await;
+        if let Some(url) = reschedule_url {
+            let bid = bid.clone();
+            spawn_emails(async move {
+                log_email_result(
+                    crate::email::send_guest_pick_new_time(
+                        &smtp_config,
+                        &details,
+                        &url,
+                        cancel_url.as_deref(),
+                    )
+                    .await,
+                    "guest_pick_new_time",
+                    &bid,
+                );
+            });
         }
     }
 
@@ -22406,6 +22730,10 @@ async fn notify_watchers(
         }
     };
 
+    // Claim tokens are written here, in the request; the emails carrying them
+    // go out in the background so a slow relay cannot stall the booking.
+    let mut outgoing: Vec<(String, String, String)> = Vec::new();
+
     for (team_id,) in &watcher_team_ids {
         // Get all members of the watcher team
         let members: Vec<(String, String, String)> = sqlx::query_as(
@@ -22441,19 +22769,36 @@ async fn notify_watchers(
                 token
             );
 
-            let _ = crate::email::send_watcher_claim_notification(
-                &smtp_config,
-                details,
-                user_name,
-                user_email,
-                assigned_to_name,
-                &claim_url,
-            )
-            .await;
+            outgoing.push((user_name.clone(), user_email.clone(), claim_url));
         }
     }
 
-    tracing::info!(booking_id = %booking_id, event_type_id = %event_type_id, "watcher claim notifications sent");
+    tracing::info!(
+        booking_id = %booking_id,
+        event_type_id = %event_type_id,
+        recipients = outgoing.len(),
+        "watcher claim notifications queued"
+    );
+
+    let details = details.clone();
+    let assigned_to_name = assigned_to_name.to_string();
+    spawn_emails(async move {
+        for (user_name, user_email, claim_url) in &outgoing {
+            log_email_result(
+                crate::email::send_watcher_claim_notification(
+                    &smtp_config,
+                    &details,
+                    user_name,
+                    user_email,
+                    &assigned_to_name,
+                    claim_url,
+                )
+                .await,
+                "watcher_claim_notification",
+                &details.uid,
+            );
+        }
+    });
 }
 
 // --- Claim endpoints ---
@@ -22850,13 +23195,22 @@ async fn claim_booking(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        let _ = crate::email::send_claim_confirmation(
-            &smtp_config,
-            &details,
-            &claimant_name,
-            &claimant_email,
-        )
-        .await;
+        let details = details.clone();
+        let claimant_name = claimant_name.clone();
+        let claimant_email = claimant_email.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_claim_confirmation(
+                    &smtp_config,
+                    &details,
+                    &claimant_name,
+                    &claimant_email,
+                )
+                .await,
+                "claim_confirmation",
+                &details.uid,
+            );
+        });
     }
 
     // Render success page
@@ -28294,6 +28648,84 @@ mod tests {
 
     // --- Template rendering regression tests ---
 
+    /// Maximum `<a>` nesting depth in rendered HTML. HTML parsers close an
+    /// open anchor when they meet another `<a>`, so anything above 1 means the
+    /// browser will tear the outer element apart.
+    fn max_anchor_depth(html: &str) -> usize {
+        let lower = html.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"</a>") {
+                depth = depth.saturating_sub(1);
+                i += 4;
+            } else if bytes[i..].starts_with(b"<a") && matches!(bytes.get(i + 2), Some(b' ' | b'>'))
+            {
+                depth += 1;
+                max = max.max(depth);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        max
+    }
+
+    /// Regression test for #239: an event-type description containing a
+    /// markdown link must not produce an `<a>` nested inside the card link on
+    /// the user and team profile pages, and the description link must survive.
+    #[test]
+    fn profile_cards_do_not_nest_description_links() {
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        env.set_loader(minijinja::path_loader("templates"));
+        crate::i18n::register(&mut env);
+
+        let description =
+            crate::utils::render_inline_markdown("See [the agenda](https://example.com/agenda)");
+        assert!(description.contains("<a "), "markdown should render a link");
+        let event_types = vec![context! {
+            slug => "intro",
+            title => "Intro Call",
+            duration_min => 30,
+            description => description,
+            visibility => "public",
+        }];
+
+        let profile = env
+            .get_template("profile.html")
+            .expect("profile.html should load")
+            .render(context! {
+                host_name => "Alice",
+                username => "alice",
+                event_types => event_types.clone(),
+                lang => "en",
+            })
+            .expect("profile.html should render");
+        let team = env
+            .get_template("team_profile.html")
+            .expect("team_profile.html should load")
+            .render(context! {
+                team_name => "Sales",
+                team_slug => "sales",
+                event_types => event_types,
+                lang => "en",
+            })
+            .expect("team_profile.html should render");
+
+        for (name, html, href) in [
+            ("profile.html", &profile, "href=\"/u/alice/intro\""),
+            ("team_profile.html", &team, "href=\"/team/sales/intro\""),
+        ] {
+            assert_eq!(max_anchor_depth(html), 1, "{name} nests an <a> in an <a>");
+            assert!(
+                html.contains("https://example.com/agenda"),
+                "{name} must keep the description link"
+            );
+            assert!(html.contains(href), "{name} must keep the card link");
+        }
+    }
+
     /// Render slots.html WITHOUT reschedule context and verify slot links
     /// point to /book and not to a JSON object.
     /// Regression test for: default(value='') rendering as {"value": ""}
@@ -29753,6 +30185,81 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 1, "Booking should be created in DB");
+    }
+
+    /// #236: an SMTP relay that accepts the connection and then never answers
+    /// used to hold the booking request until the reverse proxy gave up with
+    /// a 504, although the booking was already committed. The confirmation
+    /// page must come back without waiting on SMTP at all.
+    #[tokio::test]
+    async fn booking_does_not_wait_on_a_stalled_smtp_relay() {
+        // The SMTP config comes from the DB row; a CALRS_SMTP_* block set by a
+        // concurrent env test would override it.
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        let csrf = "test-csrf-stalled-smtp";
+
+        // A relay that accepts and then stays silent: no 220 greeting ever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = connected_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(sock);
+        });
+
+        sqlx::query(
+            "INSERT INTO smtp_config (id, host, port, username, password_enc, from_email, tls_mode, enabled) \
+             VALUES (?, '127.0.0.1', ?, '', ?, 'noreply@test.com', 'none', 1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(port as i64)
+        .bind(crate::crypto::encrypt_password(&[0u8; 32], "").unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let date_str = next_monday.format("%Y-%m-%d").to_string();
+        let body = format!(
+            "_csrf={}&date={}&time=10%3A00&name=Jane+Doe&email=jane%40example.com&notes=",
+            csrf, date_str
+        );
+
+        // Well under SMTP_SEND_TIMEOUT: only a non-blocking send passes this.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &body,
+            )),
+        )
+        .await
+        .expect("booking response waited on the stalled SMTP relay")
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM bookings WHERE guest_email = 'jane@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "Booking should be created in DB");
+
+        // The email path did run (in the background), so the test is not
+        // passing merely because SMTP was never reached.
+        tokio::time::timeout(std::time::Duration::from_secs(5), connected_rx)
+            .await
+            .expect("the background email task never reached the relay")
+            .unwrap();
+        relay.abort();
     }
 
     #[tokio::test]
@@ -33105,6 +33612,63 @@ mod tests {
         );
     }
 
+    // --- The guest's note shows on the host dashboard (#230) ---
+
+    #[tokio::test]
+    async fn dashboard_shows_the_guests_note_escaped() {
+        let (app, pool, session, et_id) = setup_test_app().await;
+
+        for (uid, email, status, notes) in [
+            (
+                "uid-note-pending",
+                "note-pending@test.com",
+                "pending",
+                "Pending note line 1\n<script>alert(1)</script>",
+            ),
+            (
+                "uid-note-confirmed",
+                "note-confirmed@test.com",
+                "confirmed",
+                "Confirmed note & agenda",
+            ),
+        ] {
+            sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token, notes) VALUES (?, ?, ?, 'Note Guest', ?, 'UTC', ?, ?, ?, ?, ?, ?, ?)")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&et_id)
+                .bind(uid)
+                .bind(email)
+                .bind(if status == "pending" { "2030-06-15T10:00:00" } else { "2030-06-16T10:00:00" })
+                .bind(if status == "pending" { "2030-06-15T10:30:00" } else { "2030-06-16T10:30:00" })
+                .bind(status)
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(notes)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/dashboard/bookings", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Pending note line 1\n&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+        assert!(body.contains("Confirmed note &amp; agenda"));
+        assert!(!body.contains("<script>alert(1)"));
+        assert!(body.contains("booking-notes"));
+
+        let response = app
+            .oneshot(get_authed("/dashboard", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Pending note line 1"));
+        assert!(!body.contains("<script>alert(1)"));
+    }
+
     // --- Booking form only asks for a phone number when SMS is enabled ---
 
     #[tokio::test]
@@ -33566,6 +34130,114 @@ mod tests {
             body.contains("Phone Guest") && body.contains("+15550000001"),
             "Upcoming booking should display the guest phone number when SMS is enabled"
         );
+    }
+
+    #[tokio::test]
+    async fn task_tracker_drains_spawned_tasks() {
+        static TRACKER: TaskTracker = TaskTracker::new();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        TRACKER.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let left = TRACKER.drain(std::time::Duration::from_secs(5)).await;
+        assert_eq!(left, 0);
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A panicking task still counts as finished.
+        TRACKER.spawn(async { panic!("send blew up") });
+        assert_eq!(TRACKER.drain(std::time::Duration::from_secs(5)).await, 0);
+
+        // A task that outlives the timeout is reported, not waited on.
+        TRACKER.spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        let left = TRACKER.drain(std::time::Duration::from_millis(50)).await;
+        assert_eq!(left, 1);
+    }
+
+    /// The phone shows on pending requests too: the host may need to call
+    /// the guest before approving (#231).
+    #[tokio::test]
+    async fn dashboard_bookings_shows_guest_phone_while_pending() {
+        let (app, pool, session, et_id) = setup_test_app().await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token, guest_phone) VALUES (?, ?, 'uid-phone-pending', 'Pending Guest', 'pending-phone@test.com', 'UTC', '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'pending', ?, ?, 'confirm-phone-pending', '+15550000002')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/dashboard/bookings", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(
+            body.contains("Pending Guest") && body.contains("+15550000002"),
+            "a pending request should display the guest phone"
+        );
+
+        // Not collected any more: the stored number is not shown.
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'off' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(get_authed("/dashboard/bookings", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Pending Guest") && !body.contains("+15550000002"));
+    }
+
+    /// The host's approval-request email carries the guest phone (#231).
+    #[tokio::test]
+    async fn approval_request_email_includes_the_guest_phone() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional', requires_confirmation = 1 WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sms_config (id, provider, api_secret_enc, sender, default_country_code) \
+             VALUES ('cfg', 'sevenio', 'x', 'calrs', '+33')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let base = chrono::Utc::now() + chrono::Duration::days(3);
+        let csrf = "test-csrf-231-email";
+        let form = format!(
+            "_csrf={}&date={}&time=10%3A00&name=Phone+Guest&email=phone-guest%40test.com&notes=&phone=06+12+34+56+78",
+            csrf,
+            base.format("%Y-%m-%d")
+        );
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &form,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+
+        let mail = mail_to(&mails, "test@example.com").await;
+        assert!(mail.contains("+33612345678"), "{mail}");
     }
 
     // --- Invalid date in booking ---
@@ -34420,6 +35092,36 @@ mod tests {
     }
 
     #[test]
+    fn month_slot_window_covers_the_trailing_week() {
+        // #228: on Monday 2026-09-28 the week view shows Sep 28 to Oct 4.
+        // The September payload must carry Friday Oct 2 and Sunday Oct 4,
+        // not stop one day past the month end.
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        let today = d(9, 28);
+        let (start, ahead) = month_slot_window(d(9, 1), d(9, 30), today);
+        assert_eq!(start, 0, "a month already under way starts today");
+        let last = today + Duration::days((start + ahead - 1) as i64);
+        assert!(
+            last >= d(10, 4),
+            "window must reach the grid's Sunday, got {last}"
+        );
+
+        // A future month whose 1st falls mid-week also covers the leading
+        // Monday, so the week view opened on that month is complete.
+        let (start, ahead) = month_slot_window(d(10, 1), d(10, 31), today);
+        let first = today + Duration::days(start as i64);
+        let last = today + Duration::days((start + ahead - 1) as i64);
+        assert!(
+            first <= d(9, 28),
+            "window must start on the grid's Monday, got {first}"
+        );
+        assert!(
+            last >= d(11, 1),
+            "window must reach the grid's Sunday, got {last}"
+        );
+    }
+
+    #[test]
     fn build_month_params_hides_next_month_past_horizon() {
         let today = host_today();
         let (_, _, _, _, next_month, _, _, _, _) =
@@ -34935,4 +35637,315 @@ mod tests {
         assert_eq!(parse_optional_day_count("abc"), None);
     }
     include!("booking_time_tests.rs");
+
+    // --- #209: guest emails sent on someone else's request keep the guest's language ---
+
+    /// One message as an anonymous loopback MTA received it.
+    struct CapturedMail {
+        rcpt: Vec<String>,
+        data: String,
+    }
+
+    /// Anonymous loopback MTA (no AUTH, no STARTTLS) that accepts any number
+    /// of connections and keeps every message, so a handler test can read
+    /// the emails it sent. calrs opens one connection per email.
+    async fn spawn_capturing_mta() -> (u16, Arc<std::sync::Mutex<Vec<CapturedMail>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mails = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = mails.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let (read_half, mut write) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    let _ = write.write_all(b"220 fake.local ESMTP\r\n").await;
+                    let mut rcpt = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let upper = line.trim_end().to_ascii_uppercase();
+                        let reply: &[u8] = if upper.starts_with("EHLO") {
+                            b"250-fake.local\r\n250 8BITMIME\r\n"
+                        } else if upper.starts_with("RCPT TO") {
+                            rcpt.push(line.trim_end().to_string());
+                            b"250 OK\r\n"
+                        } else if upper == "DATA" {
+                            let _ = write.write_all(b"354 go ahead\r\n").await;
+                            let mut data = String::new();
+                            loop {
+                                let mut body = String::new();
+                                match reader.read_line(&mut body).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                                if body.trim_end() == "." {
+                                    break;
+                                }
+                                data.push_str(&body);
+                            }
+                            sink.lock().unwrap().push(CapturedMail {
+                                rcpt: std::mem::take(&mut rcpt),
+                                data,
+                            });
+                            b"250 queued\r\n"
+                        } else if upper == "QUIT" {
+                            let _ = write.write_all(b"221 bye\r\n").await;
+                            break;
+                        } else {
+                            b"250 OK\r\n"
+                        };
+                        let _ = write.write_all(reply).await;
+                    }
+                });
+            }
+        });
+        (port, mails)
+    }
+
+    /// Point the instance's SMTP config at the capturing MTA.
+    async fn use_capturing_mta(pool: &SqlitePool, port: u16) {
+        let password_enc = crate::crypto::encrypt_password(&[0u8; 32], "").unwrap();
+        sqlx::query(
+            "INSERT INTO smtp_config (id, host, port, username, password_enc, from_email, tls_mode, enabled) \
+             VALUES (?, '127.0.0.1', ?, '', ?, 'noreply@test.com', 'none', 1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(port as i64)
+        .bind(&password_enc)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Undo quoted-printable transfer encoding so assertions can match the
+    /// text the recipient reads, accents included.
+    fn decode_quoted_printable(raw: &str) -> String {
+        let joined = raw.replace("=\r\n", "").replace("=\n", "");
+        let bytes = joined.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'=' && i + 2 < bytes.len() {
+                if let Ok(b) = u8::from_str_radix(&joined[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The decoded body of the one email addressed to `email`. Booking emails
+    /// are sent from a background task (#236), so wait for it to arrive.
+    async fn mail_to(mails: &std::sync::Mutex<Vec<CapturedMail>>, email: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mails = mails.lock().unwrap();
+                let found: Vec<&CapturedMail> = mails
+                    .iter()
+                    .filter(|m| m.rcpt.iter().any(|r| r.contains(email)))
+                    .collect();
+                if !found.is_empty() || std::time::Instant::now() >= deadline {
+                    assert_eq!(found.len(), 1, "expected one email to {email}");
+                    return decode_quoted_printable(&found[0].data);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn insert_pending_french_booking(pool: &SqlitePool, et_id: &str, uid: &str) -> String {
+        let booking_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token, language) VALUES (?, ?, ?, 'Guest', 'guest@test.com', 'UTC', '2026-06-15T10:00:00', '2026-06-15T10:30:00', 'pending', ?, ?, ?, 'fr')")
+            .bind(&booking_id)
+            .bind(et_id)
+            .bind(uid)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(format!("confirm-{uid}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        booking_id
+    }
+
+    /// The host approving from the dashboard browses in their own language;
+    /// the guest still gets the confirmation in the language they booked in.
+    /// Before #209 this path never read `bookings.language` and fell back to
+    /// English.
+    #[tokio::test]
+    async fn dashboard_approval_emails_the_guest_in_the_booking_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-209-approve").await;
+
+        let csrf = "test-csrf-209-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert!(mail.contains("Bonjour Guest,"), "{mail}");
+        assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
+        assert!(!mail.contains("Hi Guest,"), "{mail}");
+    }
+
+    /// Approving from the dashboard sends the guest the confirmation SMS, like
+    /// the approve link in the host's email always did.
+    #[tokio::test]
+    async fn dashboard_approval_texts_the_guest() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+
+        // A webhook gateway that records each request body and accepts it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = received.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+
+        sqlx::query(
+            "INSERT INTO sms_config (id, provider, sender, base_url, default_country_code) \
+             VALUES ('cfg', 'webhook', 'calrs', ?, '+33')",
+        )
+        .bind(format!("http://127.0.0.1:{port}/sms"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-sms-approve").await;
+        sqlx::query("UPDATE bookings SET guest_phone = '+33612345678' WHERE id = ?")
+            .bind(&booking_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "test-csrf-sms-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "expected one SMS: {requests:?}");
+        assert!(requests[0].contains("+33612345678"), "{}", requests[0]);
+        let usage: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sms_usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(usage.0, 1, "the accepted SMS should be recorded");
+    }
+
+    /// Same for the decline link in the host's approval email.
+    #[tokio::test]
+    async fn token_decline_emails_the_guest_in_the_booking_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        insert_pending_french_booking(&pool, &et_id, "uid-209-decline").await;
+
+        let csrf = "test-csrf-209-decline";
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/booking/decline/confirm-uid-209-decline",
+                csrf,
+                &format!("_csrf={}&reason=Conflit", csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert!(mail.contains("Bonjour Guest,"), "{mail}");
+        assert!(
+            mail.contains("Cette réservation a été refusée par l'hôte."),
+            "{mail}"
+        );
+        assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
+        assert!(!mail.contains("has been declined"), "{mail}");
+    }
+
+    /// Pages declare the language they are rendered in, so browsers pick the
+    /// right spell-check dictionary (#209).
+    #[tokio::test]
+    async fn pages_declare_their_language_on_the_html_element() {
+        let (app, _, _, _) = setup_test_app().await;
+        let french = axum::http::Request::builder()
+            .uri("/auth/login")
+            .header("accept-language", "fr-FR,fr;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        let body = body_string(app.clone().oneshot(french).await.unwrap()).await;
+        assert!(body.contains("<html lang=\"fr\">"), "{body}");
+
+        let body = body_string(app.oneshot(get("/auth/login")).await.unwrap()).await;
+        assert!(body.contains("<html lang=\"en\">"), "{body}");
+    }
 }
