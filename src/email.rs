@@ -42,6 +42,13 @@ fn host_lang(details: &BookingDetails) -> &str {
     lang_or_en(details.host_language.as_deref())
 }
 
+/// A stored language value (`users.language`, `bookings.language`) when it
+/// names a shipped locale, trimmed; `None` otherwise, which means English.
+pub fn supported_language(lang: Option<String>) -> Option<String> {
+    lang.map(|l| l.trim().to_string())
+        .filter(|l| crate::i18n::is_supported(l))
+}
+
 /// A user's saved UI language (`users.language`), when it names a shipped
 /// locale. Host, team member and watcher emails are written in it (#209).
 ///
@@ -55,9 +62,7 @@ pub async fn user_language(pool: &SqlitePool, user_id: &str) -> Option<String> {
         .await
         .ok()
         .flatten()
-        .flatten()
-        .map(|l| l.trim().to_string())
-        .filter(|l| crate::i18n::is_supported(l))
+        .and_then(supported_language)
 }
 
 /// Cancellation reason recorded when the host deleted the booking's event
@@ -80,8 +85,7 @@ pub async fn stored_booking_language(pool: &SqlitePool, booking_id: &str) -> Opt
         .await
         .ok()
         .flatten()
-        .flatten()
-        .filter(|l| !l.trim().is_empty())
+        .and_then(supported_language)
 }
 
 #[derive(Clone)]
@@ -1585,7 +1589,7 @@ pub async fn send_guest_cancellation(
     details: &CancellationDetails,
 ) -> Result<()> {
     let ics = generate_cancel_ics(details);
-    let lang = details.guest_language.as_deref().unwrap_or("en");
+    let lang = lang_or_en(details.guest_language.as_deref());
 
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
 
@@ -2132,7 +2136,7 @@ pub async fn send_guest_decline_notice(
 /// with the booking. Reuses the decline page's wording
 /// (`bae-title-booking-declined`, `bae-body-declined-by-host`).
 fn compose_guest_decline_notice(details: &CancellationDetails) -> ComposedEmail {
-    let lang = details.guest_language.as_deref().unwrap_or("en");
+    let lang = lang_or_en(details.guest_language.as_deref());
 
     let time_display = if details.guest_timezone.is_empty() {
         format!("{} \u{2013} {}", details.start_time, details.end_time)
@@ -2247,7 +2251,7 @@ fn compose_guest_pending_expired(
     details: &CancellationDetails,
     rebook_url: Option<&str>,
 ) -> ComposedEmail {
-    let lang = details.guest_language.as_deref().unwrap_or("en");
+    let lang = lang_or_en(details.guest_language.as_deref());
 
     let time_display = if details.guest_timezone.is_empty() {
         format!("{} \u{2013} {}", details.start_time, details.end_time)

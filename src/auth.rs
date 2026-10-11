@@ -434,16 +434,6 @@ async fn resolve_session_user(
     Some((real_user, None))
 }
 
-/// The language a public page visitor reads in: their own saved preference
-/// when they are logged in, otherwise their browser's `Accept-Language`.
-/// Never the host's: this is what a booking stores as `bookings.language`,
-/// and every guest email and SMS for that booking is written in it.
-pub async fn visitor_lang(pool: &SqlitePool, headers: &HeaderMap) -> &'static str {
-    let jar = CookieJar::from_headers(headers);
-    let user = resolve_session_user(pool, &jar).await.map(|(u, _)| u);
-    crate::i18n::resolve(user.as_ref().and_then(|u| u.language.as_deref()), headers)
-}
-
 /// Extractor that requires an authenticated user. Redirects to /auth/login if not authenticated.
 /// Supports admin impersonation: if the `__Host-calrs_impersonate` cookie is set and the real user is
 /// an admin, returns the impersonated user instead.
