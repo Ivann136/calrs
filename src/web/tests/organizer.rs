@@ -1,5 +1,7 @@
 // A multi-host booking keeps the organizer it was created with (#161).
-// Included into `web::tests`, so it shares that module's helpers.
+// A child of `web::tests`, so it shares that module's helpers.
+
+use super::*;
 
 /// A CalDAV collection on loopback that keeps every PUT body, so a test can
 /// read the ORGANIZER each push carried. HEAD answers for stored paths, as
@@ -7,7 +9,9 @@
 async fn spawn_recording_dav() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use axum::http::{Method, StatusCode, Uri};
     let puts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let stored = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
+    let stored = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
     let (puts_state, stored_state) = (puts.clone(), stored.clone());
     let app = Router::new().fallback(move |method: Method, uri: Uri, body: String| {
         let puts = puts_state.clone();
@@ -62,14 +66,16 @@ async fn add_named_member(pool: &SqlitePool, team_id: &str, name: &str, email: &
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, ?, ?, 'UTC', ?)")
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(name)
-        .bind(email)
-        .bind(&id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, ?, ?, 'UTC', ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(name)
+    .bind(email)
+    .bind(&id)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
         .bind(team_id)
         .bind(&id)
@@ -139,10 +145,10 @@ async fn collective_booking_keeps_its_organizer_when_the_roster_changes() {
         sqlx::query_as(
             "SELECT id, uid, confirm_token, reschedule_token FROM bookings WHERE event_type_id = ?",
         )
-    .bind(&team_et)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+        .bind(&team_et)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         stored_organizer(&pool, &booking_id).await,
         (
@@ -208,7 +214,10 @@ async fn collective_booking_keeps_its_organizer_when_the_roster_changes() {
         .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(booking_status(&pool, &booking_id).await, "confirmed");
-    assert!(puts.lock().unwrap().len() > pushes_before, "reschedule pushed nothing");
+    assert!(
+        puts.lock().unwrap().len() > pushes_before,
+        "reschedule pushed nothing"
+    );
     assert_eq!(
         last_pushed_organizer(&puts),
         "ORGANIZER;CN=Bob & Test User:mailto:bob@test.com"
@@ -436,7 +445,9 @@ async fn dynamic_group_booking_stores_its_organizer() {
         )
     );
     assert_eq!(
-        booking_host_identity(&pool, &uid).await.map(|(n, e, _)| (n, e)),
+        booking_host_identity(&pool, &uid)
+            .await
+            .map(|(n, e, _)| (n, e)),
         Some((
             "Test User & Second User".to_string(),
             "test@example.com".to_string()
@@ -544,19 +555,15 @@ async fn dashboard_cancel_by_another_member_keeps_the_original_organizer() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let booking_id: String =
-        sqlx::query_scalar("SELECT id FROM bookings WHERE event_type_id = ?")
-            .bind(&team_et)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let booking_id: String = sqlx::query_scalar("SELECT id FROM bookings WHERE event_type_id = ?")
+        .bind(&team_et)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let confirmation = take_guest_mail(&mails).await;
     let original = ics_organizer_in_mail(&confirmation)
         .unwrap_or_else(|| panic!("no ORGANIZER in the confirmation: {confirmation}"));
-    assert_eq!(
-        original,
-        "ORGANIZER;CN=Bob & Test User:mailto:bob@test.com"
-    );
+    assert_eq!(original, "ORGANIZER;CN=Bob & Test User:mailto:bob@test.com");
 
     // Ann joins and sorts first, so even a fresh resolution would differ.
     add_named_member(&pool, &team_id, "Ann", "ann@test.com").await;
