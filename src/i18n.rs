@@ -560,7 +560,7 @@ mod tests {
                 let at = i + pos;
                 let start = at + call.len();
                 i = start;
-                // The guard test in web/mod.rs names this helper in a string
+                // The guard test in web/tests/guards.rs names this helper in a string
                 // literal; scanning from there would run past the call site.
                 if src[..at].ends_with('"') {
                     continue;

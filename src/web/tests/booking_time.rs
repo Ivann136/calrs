@@ -1,4 +1,7 @@
-// Included in web::tests so these use the same real router and fixtures.
+// A child of web::tests so these use the same real router and fixtures.
+
+use super::*;
+
 #[tokio::test]
 async fn utc_booking_http_create_display_calendar_and_cancel() {
     let (app, pool, session, et) = setup_test_app().await;

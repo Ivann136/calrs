@@ -1,61 +1,10 @@
 // Pending requests hold their slot, expire, and are re-checked on approval
-// (#234). Included into `web::tests`, so it shares that module's helpers.
+// (#234). A child of `web::tests`, so it shares that module's helpers.
 
-/// A UTC instant as stored on a version 1 booking.
-fn utc_stamp(t: chrono::DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
+use super::*;
 
 fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
-}
-
-/// Insert a version 1 (UTC) booking and return its id. `extra` is a list of
-/// (column, value) pairs set right after the insert.
-async fn insert_v1_booking(
-    pool: &SqlitePool,
-    et_id: &str,
-    email: &str,
-    start: chrono::DateTime<Utc>,
-    minutes: i64,
-    status: &str,
-    extra: &[(&str, Option<String>)],
-) -> String {
-    let id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO bookings (time_version, id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token)
-         VALUES (1, ?, ?, ?, 'Guest', ?, 'UTC', ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(et_id)
-    .bind(format!("uid-{id}"))
-    .bind(email)
-    .bind(utc_stamp(start))
-    .bind(utc_stamp(start + Duration::minutes(minutes)))
-    .bind(status)
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(format!("confirm-{id}"))
-    .execute(pool)
-    .await
-    .unwrap();
-    for (col, value) in extra {
-        sqlx::query(&format!("UPDATE bookings SET {col} = ? WHERE id = ?"))
-            .bind(value)
-            .bind(&id)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-    id
-}
-
-async fn booking_status(pool: &SqlitePool, id: &str) -> String {
-    sqlx::query_scalar("SELECT status FROM bookings WHERE id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
 }
 
 async fn second_event_type(pool: &SqlitePool, account_id: &str) -> String {
@@ -1306,7 +1255,10 @@ async fn expired_collective_request_comes_from_the_roster() {
         now + Duration::days(3),
         30,
         "pending",
-        &[("pending_expires_at", Some(utc_stamp(now - Duration::minutes(1))))],
+        &[(
+            "pending_expires_at",
+            Some(utc_stamp(now - Duration::minutes(1))),
+        )],
     )
     .await;
 
