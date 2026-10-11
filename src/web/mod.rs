@@ -729,17 +729,23 @@ async fn pending_host_recipients(
 
 /// Public booking page of an event type, for the "pick another time" link in
 /// the expiry email. Only for enabled public event types: internal and
-/// private ones need an invite token the guest no longer has.
+/// private ones need a per-guest invite the guest no longer has. A public
+/// event type on a private team is only reachable with the team's invite
+/// token (`?invite=`, as checked by the team slot page), so the link carries
+/// it, and there is no link when the team has none.
 async fn event_type_rebook_url(pool: &SqlitePool, et_id: &str) -> Option<String> {
     let base = crate::settings::base_url()?;
-    let (slug, visibility, enabled, team_slug, username): (
+    #[allow(clippy::type_complexity)]
+    let (slug, visibility, enabled, team_slug, team_visibility, team_invite, username): (
         String,
         String,
         i32,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
     ) = sqlx::query_as(
-        "SELECT et.slug, et.visibility, et.enabled, t.slug, u.username
+        "SELECT et.slug, et.visibility, et.enabled, t.slug, t.visibility, t.invite_token, u.username
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          LEFT JOIN users u ON u.id = a.user_id
@@ -756,7 +762,15 @@ async fn event_type_rebook_url(pool: &SqlitePool, et_id: &str) -> Option<String>
     }
     let base = base.trim_end_matches('/');
     match (team_slug, username) {
-        (Some(team), _) => Some(format!("{}/team/{}/{}", base, team, slug)),
+        (Some(team), _) => {
+            let url = format!("{}/team/{}/{}", base, team, slug);
+            if team_visibility.as_deref() == Some("private") {
+                let token = team_invite.filter(|t| !t.is_empty())?;
+                Some(format!("{}?invite={}", url, urlencoding::encode(&token)))
+            } else {
+                Some(url)
+            }
+        }
         (None, Some(user)) => Some(format!("{}/u/{}/{}", base, user, slug)),
         (None, None) => None,
     }

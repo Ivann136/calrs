@@ -1132,3 +1132,42 @@ async fn troubleshoot_counts_the_same_bookings_as_the_slot_pages() {
     assert!(body.contains("Assigned Guest"), "{body}");
     assert!(!body.contains("Bobs Guest"), "{body}");
 }
+
+/// Review finding on #234: a public event type on a private team linked to
+/// /team/{team}/{slug} without the team invite, which lands the guest on
+/// "event type not found".
+#[tokio::test]
+async fn rebook_link_carries_the_private_team_invite() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let _guard = crate::test_support::EnvGuard::new();
+    std::env::set_var("CALRS_BASE_URL", "https://cal.example.com");
+    let pool = setup_test_db().await;
+    seed_test_data(&pool).await;
+    let (team_id, team_et) = seed_team_event_type(&pool).await;
+    let set_team = |visibility: &'static str, token: Option<&'static str>| {
+        let pool = pool.clone();
+        let team_id = team_id.clone();
+        async move {
+            sqlx::query("UPDATE teams SET visibility = ?, invite_token = ? WHERE id = ?")
+                .bind(visibility)
+                .bind(token)
+                .bind(&team_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    set_team("public", None).await;
+    assert_eq!(
+        event_type_rebook_url(&pool, &team_et).await.as_deref(),
+        Some("https://cal.example.com/team/horizon-team/team-sync")
+    );
+    set_team("private", Some("tok-123")).await;
+    assert_eq!(
+        event_type_rebook_url(&pool, &team_et).await.as_deref(),
+        Some("https://cal.example.com/team/horizon-team/team-sync?invite=tok-123")
+    );
+    set_team("private", None).await;
+    assert_eq!(event_type_rebook_url(&pool, &team_et).await, None);
+}
