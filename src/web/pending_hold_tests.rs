@@ -390,7 +390,9 @@ async fn sweep_declines_expired_requests_once_and_emails_the_guest_in_their_lang
         "the guest gets a link to pick another time: {guest}"
     );
     let host = mail_to(&mails, "test@example.com").await;
-    assert!(host.contains("Booking request expired."), "{host}");
+    // The host has no saved language, so their notice is English.
+    assert!(host.contains("Booking request expired"), "{host}");
+    assert!(host.contains("<html lang=\"en\">"), "{host}");
 
     // Idempotent: a second pass finds nothing and sends nothing.
     let sent = mails.lock().unwrap().len();

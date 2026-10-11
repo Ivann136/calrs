@@ -23,14 +23,69 @@ fn ta<const N: usize>(lang: &str, key: &str, args: [(&str, &str); N]) -> String 
     crate::i18n::translate(lang, key, Some(&fa))
 }
 
-/// Resolve guest language from booking details, falling back to English.
-fn guest_lang(details: &BookingDetails) -> &str {
-    details.guest_language.as_deref().unwrap_or("en")
+/// A stored language code if calrs ships that locale, English otherwise.
+/// Stored values can be NULL, empty, or a locale since removed.
+fn lang_or_en(lang: Option<&str>) -> &str {
+    match lang.map(str::trim) {
+        Some(code) if crate::i18n::is_supported(code) => code,
+        _ => "en",
+    }
 }
 
-#[allow(dead_code)]
+/// Resolve guest language from booking details, falling back to English.
+fn guest_lang(details: &BookingDetails) -> &str {
+    lang_or_en(details.guest_language.as_deref())
+}
+
+/// The host recipient's language (`users.language`), falling back to English.
 fn host_lang(details: &BookingDetails) -> &str {
-    details.host_language.as_deref().unwrap_or("en")
+    lang_or_en(details.host_language.as_deref())
+}
+
+/// A user's saved UI language (`users.language`), when it names a shipped
+/// locale. Host, team member and watcher emails are written in it (#209).
+///
+/// This is the stored half of what the `AuthUser` extractor does on a
+/// request: there is no request behind a background email, so there is no
+/// `Accept-Language` to fall back on, and `None` means English at send time.
+pub async fn user_language(pool: &SqlitePool, user_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT language FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .map(|l| l.trim().to_string())
+        .filter(|l| crate::i18n::is_supported(l))
+}
+
+/// Cancellation reason recorded when the host deleted the booking's event
+/// from their calendar and a sync noticed, in `lang` (English when `None`).
+pub fn calendar_deleted_reason(lang: Option<&str>) -> String {
+    t(lang_or_en(lang), "email-cancel-reason-calendar-deleted")
+}
+
+/// The saved language of the user an email is addressed to, found by the
+/// address calrs sends host emails to (`booking_email`, else `email`). For
+/// the paths that only know the host as the (name, email) pair they write
+/// into `BookingDetails`, such as `booking_host_identity`, where the
+/// recipient can be a team member other than the user acting.
+pub async fn user_language_by_email(pool: &SqlitePool, address: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT language FROM users
+         WHERE COALESCE(booking_email, email) = ?1 OR email = ?1
+         ORDER BY COALESCE(booking_email, email) = ?1 DESC
+         LIMIT 1",
+    )
+    .bind(address)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .map(|l| l.trim().to_string())
+    .filter(|l| crate::i18n::is_supported(l))
 }
 
 /// The language the guest booked in, as stored on the booking row
@@ -239,9 +294,10 @@ fn render_html_email(
     rows: &[EmailRow],
     footer_note: Option<&str>,
 ) -> String {
-    render_html_email_with_actions(greeting, message, accent, rows, footer_note, &[])
+    render_html_email_in("en", greeting, message, accent, rows, footer_note, &[])
 }
 
+#[cfg(test)]
 fn render_html_email_with_actions(
     greeting: &str,
     message: &str,
@@ -255,8 +311,8 @@ fn render_html_email_with_actions(
 
 /// Render the HTML body for an email written in `lang`. The tag ends up in
 /// `<html lang>`, so mail clients pick the right spell checker and screen
-/// readers the right voice (#209). Emails whose copy is still English-only
-/// go through the wrappers above, which pass "en".
+/// readers the right voice (#209). Only the admin SMTP test email still goes
+/// through the English wrapper above.
 fn render_html_email_in(
     lang: &str,
     greeting: &str,
@@ -266,6 +322,7 @@ fn render_html_email_in(
     footer_note: Option<&str>,
     actions: &[EmailAction],
 ) -> String {
+    let sent_by = h(&t(lang, "email-footer-sent-by"));
     let lang = h(crate::i18n::html_lang(lang));
     let mut detail_rows = String::new();
     for (i, row) in rows.iter().enumerate() {
@@ -275,7 +332,7 @@ fn render_html_email_in(
                <td style=\"padding:8px 12px;color:#6b7280;font-size:13px;white-space:nowrap;vertical-align:top;\">{}</td>\
                <td style=\"padding:8px 12px;color:#111827;font-size:14px;background:{bg};\">{}</td>\
              </tr>",
-            row.label, h(&row.value),
+            h(&row.label), h(&row.value),
         ));
     }
 
@@ -326,7 +383,7 @@ fn render_html_email_in(
     </td></tr>
     <!-- Footer -->
     <tr><td style="padding:16px 28px;border-top:1px solid #f0f0f3;text-align:center;">
-      <span style="font-size:12px;color:#9ca3af;">Sent by </span>
+      <span style="font-size:12px;color:#9ca3af;">{sent_by} </span>
       <a href="https://cal.rs" style="font-size:12px;color:#6b7280;font-weight:600;text-decoration:none;">calrs</a>
     </td></tr>
   </table>
@@ -936,72 +993,16 @@ pub async fn send_guest_confirmation_ex(
 
     // Send confirmation to additional attendees
     for attendee_email in &details.additional_attendees {
+        let to2: Mailbox = attendee_email.parse()?;
         let ics2 = generate_ics(details, "REQUEST");
-        let to2: lettre::message::Mailbox = attendee_email.parse()?;
-        let plain2 = format!(
-            "Hi,\n\n\
-             You've been added as an attendee to a booking.\n\n\
-             Event: {}\n\
-             Date: {}\n\
-             Time: {} \u{2013} {} ({})\n\
-             Organizer: {}\n\
-             Booked by: {} <{}>\n\n\
-             A calendar invite is attached.\n\n\
-             \u{2014} calrs",
-            details.event_title,
-            details.date,
-            details.start_time,
-            details.end_time,
-            details.guest_timezone,
-            details.host_name,
-            details.guest_name,
-            details.guest_email,
-        );
-        let html2 = render_html_email(
-            "Hi,",
-            "You've been added as an attendee to a booking.",
-            "#16a34a",
-            &[
-                EmailRow {
-                    label: "Event".to_string(),
-                    value: details.event_title.clone(),
-                },
-                EmailRow {
-                    label: "Date".to_string(),
-                    value: details.date.clone(),
-                },
-                EmailRow {
-                    label: "Time".to_string(),
-                    value: format!(
-                        "{} \u{2013} {} ({})",
-                        details.start_time, details.end_time, details.guest_timezone
-                    ),
-                },
-                EmailRow {
-                    label: "Organizer".to_string(),
-                    value: details.host_name.clone(),
-                },
-                EmailRow {
-                    label: "Booked by".to_string(),
-                    value: format!("{} <{}>", details.guest_name, details.guest_email),
-                },
-            ],
-            Some("A calendar invite is attached to this email."),
-        );
-        let body2 = build_multipart_body(&plain2, &html2);
-        let att2 = Attachment::new("invite.ics".to_string()).body(
-            ics2,
-            ContentType::parse("text/calendar; method=REQUEST; charset=UTF-8")?,
-        );
-        let email2 = Message::builder()
-            .from(from.clone())
-            .to(to2)
-            // Exchange titles the guest's appointment after the Subject
-            // header, not the ICS SUMMARY, so REQUEST emails keep a neutral
-            // "event, date" subject (#157).
-            .subject(format!("{} \u{2014} {}", details.event_title, details.date))
-            .multipart(MultiPart::mixed().multipart(body2).singlepart(att2))?;
-        if let Err(e) = send_email(config, email2).await {
+        if let Err(e) = send_composed(
+            config,
+            to2,
+            compose_attendee_confirmation(details),
+            Some(("invite.ics", ics2, "REQUEST")),
+        )
+        .await
+        {
             tracing::warn!(attendee = %attendee_email, error = format!("{e:#}"), "failed to send attendee confirmation");
         }
     }
@@ -1009,12 +1010,216 @@ pub async fn send_guest_confirmation_ex(
     Ok(())
 }
 
+// --- Composition shared by the translated emails ---
+
+fn row(label: String, value: impl Into<String>) -> EmailRow {
+    EmailRow {
+        label,
+        value: value.into(),
+    }
+}
+
+/// Append a row only when the value is there.
+fn push_row(rows: &mut Vec<EmailRow>, lang: &str, key: &str, value: Option<&String>) {
+    if let Some(v) = value {
+        rows.push(row(t(lang, key), v.clone()));
+    }
+}
+
+/// Event, date, time and guest: the rows every host-facing email opens with.
+fn host_rows(
+    lang: &str,
+    event: &str,
+    date: &str,
+    time: &str,
+    guest_name: &str,
+    guest_email: &str,
+) -> Vec<EmailRow> {
+    vec![
+        row(t(lang, "confirmed-detail-event"), event),
+        row(t(lang, "confirmed-detail-date"), date),
+        row(t(lang, "confirmed-detail-time"), time),
+        row(
+            t(lang, "common-detail-guest"),
+            format!("{} <{}>", guest_name, guest_email),
+        ),
+    ]
+}
+
+/// "date at time", for rows that carry both in one value.
+fn date_at_time(lang: &str, date: &str, time: &str) -> String {
+    ta(lang, "email-date-at-time", [("date", date), ("time", time)])
+}
+
+/// Approve and decline links for a pending booking, when a token and a
+/// public base URL are both known.
+fn approval_urls(confirm_token: Option<&str>, base_url: Option<&str>) -> Option<(String, String)> {
+    let (token, url) = (confirm_token?, base_url?);
+    let base = url.trim_end_matches('/');
+    Some((
+        format!("{}/booking/approve/{}", base, token),
+        format!("{}/booking/decline/{}", base, token),
+    ))
+}
+
+/// Plain-text lines and HTML buttons for approve/decline, or the dashboard
+/// hint when the email cannot carry links.
+fn approval_actions(lang: &str, urls: Option<(String, String)>) -> (Vec<String>, Vec<EmailAction>) {
+    match urls {
+        Some((approve, decline)) => (
+            vec![
+                ta(lang, "email-host-approve-line", [("url", &approve)]),
+                ta(lang, "email-host-decline-line", [("url", &decline)]),
+            ],
+            vec![
+                EmailAction {
+                    label: t(lang, "email-action-approve"),
+                    url: approve,
+                    color: "#16a34a".to_string(),
+                },
+                EmailAction {
+                    label: t(lang, "email-action-decline"),
+                    url: decline,
+                    color: "#dc2626".to_string(),
+                },
+            ],
+        ),
+        None => (vec![t(lang, "email-host-approval-dashboard")], vec![]),
+    }
+}
+
+/// An email made of a heading, one message, a details table, optional
+/// buttons and a closing note, all in `lang`. The plain-text body carries the
+/// same content, with `plain_lines` (the URLs the HTML shows as buttons)
+/// after the details.
+struct EmailParts<'a> {
+    lang: &'a str,
+    subject: String,
+    heading: String,
+    message: String,
+    accent: &'a str,
+    rows: Vec<EmailRow>,
+    plain_lines: Vec<String>,
+    footer_plain: Option<String>,
+    footer_html: Option<String>,
+    actions: Vec<EmailAction>,
+}
+
+impl EmailParts<'_> {
+    fn compose(self) -> ComposedEmail {
+        let mut plain = format!("{}\n\n{}\n\n", self.heading, self.message);
+        for r in &self.rows {
+            plain.push_str(&format!("{} {}\n", r.label, r.value));
+        }
+        plain.push('\n');
+        if !self.plain_lines.is_empty() {
+            plain.push_str(&self.plain_lines.join("\n"));
+            plain.push_str("\n\n");
+        }
+        if let Some(note) = &self.footer_plain {
+            plain.push_str(note);
+            plain.push_str("\n\n");
+        }
+        plain.push_str(&t(self.lang, "email-signature"));
+        let html = render_html_email_in(
+            self.lang,
+            &h(&self.heading),
+            &h(&self.message),
+            self.accent,
+            &self.rows,
+            self.footer_html.as_deref(),
+            &self.actions,
+        );
+        ComposedEmail {
+            subject: self.subject,
+            plain,
+            html,
+        }
+    }
+}
+
+/// Send a composed email, with an optional `(filename, ics, method)`
+/// calendar attachment.
+async fn send_composed(
+    config: &SmtpConfig,
+    to: Mailbox,
+    mail: ComposedEmail,
+    ics: Option<(&str, String, &str)>,
+) -> Result<()> {
+    let body = build_multipart_body(&mail.plain, &mail.html);
+    let builder = Message::builder()
+        .from(config.mailbox_from()?)
+        .to(to)
+        .subject(mail.subject);
+    let email = match ics {
+        Some((filename, ics, method)) => {
+            let attachment = Attachment::new(filename.to_string()).body(
+                ics,
+                ContentType::parse(&format!("text/calendar; method={method}; charset=UTF-8"))?,
+            );
+            builder.multipart(MultiPart::mixed().multipart(body).singlepart(attachment))?
+        }
+        None => builder.multipart(body)?,
+    };
+    send_email(config, email).await
+}
+
+/// "You've been added as an attendee" copy for the additional attendees of
+/// a booking, in the booking's language: the guest invited them, so the
+/// guest's language is the best guess at theirs.
+fn compose_attendee_confirmation(details: &BookingDetails) -> ComposedEmail {
+    let lang = guest_lang(details);
+    let time_display = format!(
+        "{} \u{2013} {} ({})",
+        details.start_time, details.end_time, details.guest_timezone
+    );
+    EmailParts {
+        lang,
+        // Exchange titles the guest's appointment after the Subject header,
+        // not the ICS SUMMARY, so REQUEST emails keep a neutral
+        // "event, date" subject (#157).
+        subject: ta(
+            lang,
+            "email-confirm-subject",
+            [("event", &details.event_title), ("date", &details.date)],
+        ),
+        heading: t(lang, "email-attendee-greeting"),
+        message: t(lang, "email-attendee-message"),
+        accent: "#16a34a",
+        rows: vec![
+            row(t(lang, "confirmed-detail-event"), &details.event_title),
+            row(t(lang, "confirmed-detail-date"), &details.date),
+            row(t(lang, "confirmed-detail-time"), time_display),
+            row(t(lang, "email-detail-organizer"), &details.host_name),
+            row(
+                t(lang, "email-detail-booked-by"),
+                format!("{} <{}>", details.guest_name, details.guest_email),
+            ),
+        ],
+        plain_lines: vec![],
+        footer_plain: Some(t(lang, "email-confirm-ics-attached-plain")),
+        footer_html: Some(t(lang, "email-confirm-ics-attached-html")),
+        actions: vec![],
+    }
+    .compose()
+}
+
 /// Send booking notification to the host
 pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
-    let ics = generate_ics(details, "REQUEST");
-
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let ics = generate_ics(details, "REQUEST");
+    send_composed(
+        config,
+        to,
+        compose_host_notification(details),
+        Some(("invite.ics", ics, "REQUEST")),
+    )
+    .await
+}
 
+/// The host's "new booking" email, in the host's language.
+fn compose_host_notification(details: &BookingDetails) -> ComposedEmail {
+    let lang = host_lang(details);
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -1023,114 +1228,71 @@ pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetail
         &details.host_timezone,
         details.utc_times.as_ref(),
     );
-
-    let plain = format!(
-        "New booking!\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\
-         {}{}{}\n\
-         A calendar invite is attached.\n\n\
-         \u{2014} calrs",
-        details.event_title,
-        date_display,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
-        details
-            .notes
-            .as_ref()
-            .map(|n| format!("Notes: {}\n", n))
-            .unwrap_or_default(),
-        details
-            .resource_name
-            .as_ref()
-            .map(|r| format!("Resource: {}\n", r))
-            .unwrap_or_default(),
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &date_display,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
     );
-
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-    if let Some(loc) = &details.location {
-        rows.push(EmailRow {
-            label: "Location".to_string(),
-            value: loc.clone(),
-        });
-    }
-    if let Some(res) = &details.resource_name {
-        rows.push(EmailRow {
-            label: "Resource".to_string(),
-            value: res.clone(),
-        });
-    }
-    if let Some(notes) = &details.notes {
-        rows.push(EmailRow {
-            label: "Notes".to_string(),
-            value: notes.clone(),
-        });
-    }
-
-    let html = render_html_email(
-        "New booking!",
-        &format!("{} booked a slot with you.", h(&details.guest_name)),
-        "#16a34a",
-        &rows,
-        Some("A calendar invite is attached to this email."),
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
     );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let ics_attachment = Attachment::new("invite.ics".to_string()).body(
-        ics,
-        ContentType::parse("text/calendar; method=REQUEST; charset=UTF-8")?,
+    push_row(
+        &mut rows,
+        lang,
+        "bookings-resource",
+        details.resource_name.as_ref(),
     );
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "New booking: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, date_display
-        ))
-        .multipart(
-            MultiPart::mixed()
-                .multipart(body)
-                .singlepart(ics_attachment),
-        )?;
-
-    send_email(config, email).await
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-notes",
+        details.notes.as_ref(),
+    );
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-new-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &date_display),
+            ],
+        ),
+        heading: t(lang, "email-host-new-heading"),
+        message: ta(
+            lang,
+            "email-host-new-message",
+            [("guest", &details.guest_name)],
+        ),
+        accent: "#16a34a",
+        rows,
+        plain_lines: vec![],
+        footer_plain: Some(t(lang, "email-confirm-ics-attached-plain")),
+        footer_html: Some(t(lang, "email-confirm-ics-attached-html")),
+        actions: vec![],
+    }
+    .compose()
 }
 
-/// Send host a confirmation that a pending booking was approved (no ICS — event is already
-/// pushed via CalDAV write-back).
+/// Send host a confirmation that a pending booking was approved. No ICS: the
+/// event is already pushed via CalDAV write-back.
 pub async fn send_host_booking_confirmed(
     config: &SmtpConfig,
     details: &BookingDetails,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    send_composed(config, to, compose_host_booking_confirmed(details), None).await
+}
 
+fn compose_host_booking_confirmed(details: &BookingDetails) -> ComposedEmail {
+    let lang = host_lang(details);
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -1139,79 +1301,52 @@ pub async fn send_host_booking_confirmed(
         &details.host_timezone,
         details.utc_times.as_ref(),
     );
-
-    let plain = format!(
-        "Booking confirmed!\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\
-         {}\
-         The event has been added to your calendar.\n\n\
-         \u{2014} calrs",
-        details.event_title,
-        date_display,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &date_display,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
     );
-
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-    if let Some(loc) = &details.location {
-        rows.push(EmailRow {
-            label: "Location".to_string(),
-            value: loc.clone(),
-        });
-    }
-    if let Some(res) = &details.resource_name {
-        rows.push(EmailRow {
-            label: "Resource".to_string(),
-            value: res.clone(),
-        });
-    }
-
-    let html = render_html_email(
-        "Booking confirmed",
-        &format!("You approved the booking with {}.", h(&details.guest_name)),
-        "#16a34a",
-        &rows,
-        Some("The event has been added to your calendar."),
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
     );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Confirmed: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, date_display
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    push_row(
+        &mut rows,
+        lang,
+        "bookings-resource",
+        details.resource_name.as_ref(),
+    );
+    let footer = t(lang, "email-host-confirmed-footer");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-confirmed-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &date_display),
+            ],
+        ),
+        heading: t(lang, "email-host-confirmed-heading"),
+        message: ta(
+            lang,
+            "email-host-confirmed-message",
+            [("guest", &details.guest_name)],
+        ),
+        accent: "#16a34a",
+        rows,
+        plain_lines: vec![],
+        footer_plain: Some(footer.clone()),
+        footer_html: Some(footer),
+        actions: vec![],
+    }
+    .compose()
 }
 
 /// Tell the host their Google Calendar still shows the old time.
@@ -1220,15 +1355,25 @@ pub async fn send_host_booking_confirmed(
 /// that calrs patches in place, because a second ICS PUT would strip the
 /// conference. When that patch fails for good, the booking, the guest's invite
 /// and the reminders all hold the new time while the host's calendar holds the
-/// old one -- and without this email nobody would ever say so. English like the
-/// other host notifications in this module.
+/// old one, and without this email nobody would ever say so. `reason` is the
+/// technical error, shown as the API returned it.
 pub async fn send_host_calendar_sync_failure(
     config: &SmtpConfig,
     details: &BookingDetails,
     reason: &str,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    send_composed(
+        config,
+        to,
+        compose_host_calendar_sync_failure(details, reason),
+        None,
+    )
+    .await
+}
 
+fn compose_host_calendar_sync_failure(details: &BookingDetails, reason: &str) -> ComposedEmail {
+    let lang = host_lang(details);
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -1237,78 +1382,36 @@ pub async fn send_host_calendar_sync_failure(
         &details.host_timezone,
         details.utc_times.as_ref(),
     );
-
-    // Recreating the event would mint a different conference, so the Meet link
-    // already sitting in the guest's invite would stop admitting anyone.
-    let action = "Open the event in Google Calendar and move it to the time above. \
-                  Move the existing event rather than recreating it, or the Google Meet \
-                  link the guest already has stops working.";
-    let intro = "This booking moved, but calrs could not update the event on your Google \
-                 Calendar. The guest has the new time; your calendar still shows the old one.";
-
-    let plain = format!(
-        "Your calendar was not updated.\n\n\
-         {}\n\n\
-         Event: {}\n\
-         New date: {}\n\
-         New time: {}\n\
-         Guest: {} <{}>\n\
-         Reason: {}\n\n\
-         {}\n\n\
-         \u{2014} calrs",
-        intro,
-        details.event_title,
-        date_display,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        reason,
-        action,
-    );
-
-    let rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "New date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "New time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-        EmailRow {
-            label: "Reason".to_string(),
-            value: reason.to_string(),
-        },
-    ];
-
-    let html = render_html_email(
-        "Your calendar was not updated",
-        intro,
-        "#f59e0b",
-        &rows,
-        Some(action),
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Action needed: calendar not updated for {} ({})",
-            details.event_title, date_display
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    // Recreating the event would mint a different conference, so the Meet
+    // link already sitting in the guest's invite would stop admitting anyone:
+    // the closing line says to move the event instead.
+    let action = t(lang, "email-host-sync-failure-action");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-sync-failure-subject",
+            [("event", &details.event_title), ("date", &date_display)],
+        ),
+        heading: t(lang, "email-host-sync-failure-heading"),
+        message: t(lang, "email-host-sync-failure-intro"),
+        accent: "#f59e0b",
+        rows: vec![
+            row(t(lang, "confirmed-detail-event"), &details.event_title),
+            row(t(lang, "email-detail-new-date"), date_display.clone()),
+            row(t(lang, "email-detail-new-time"), time_display),
+            row(
+                t(lang, "common-detail-guest"),
+                format!("{} <{}>", details.guest_name, details.guest_email),
+            ),
+            row(t(lang, "common-detail-reason"), reason),
+        ],
+        plain_lines: vec![],
+        footer_plain: Some(action.clone()),
+        footer_html: Some(action),
+        actions: vec![],
+    }
+    .compose()
 }
 
 /// Send booking reminder to the guest
@@ -1438,7 +1541,11 @@ pub async fn send_guest_reminder(
 /// Send booking reminder to the host
 pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    send_composed(config, to, compose_host_reminder(details), None).await
+}
 
+fn compose_host_reminder(details: &BookingDetails) -> ComposedEmail {
+    let lang = host_lang(details);
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -1447,75 +1554,51 @@ pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -
         &details.host_timezone,
         details.utc_times.as_ref(),
     );
-
-    let plain = format!(
-        "Reminder: you have an upcoming booking.\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\
-         {}\n\
-         \u{2014} calrs",
-        details.event_title,
-        date_display,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &date_display,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
     );
-
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-    if let Some(res) = &details.resource_name {
-        rows.push(EmailRow {
-            label: "Resource".to_string(),
-            value: res.clone(),
-        });
-    }
-
-    let html = render_html_email(
-        "Upcoming booking",
-        &format!(
-            "Reminder: you have a booking with {} coming up.",
-            h(&details.guest_name)
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
+    );
+    push_row(
+        &mut rows,
+        lang,
+        "bookings-resource",
+        details.resource_name.as_ref(),
+    );
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-reminder-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &date_display),
+            ],
         ),
-        "#3b82f6",
-        &rows,
-        None,
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Reminder: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, date_display
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+        heading: t(lang, "email-host-reminder-heading"),
+        message: ta(
+            lang,
+            "email-host-reminder-message",
+            [("guest", &details.guest_name)],
+        ),
+        accent: "#3b82f6",
+        rows,
+        plain_lines: vec![],
+        footer_plain: None,
+        footer_html: None,
+        actions: vec![],
+    }
+    .compose()
 }
 
 /// Send cancellation notification to the guest
@@ -1656,10 +1739,19 @@ pub async fn send_host_cancellation(
     config: &SmtpConfig,
     details: &CancellationDetails,
 ) -> Result<()> {
-    let ics = generate_cancel_ics(details);
-
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let ics = generate_cancel_ics(details);
+    send_composed(
+        config,
+        to,
+        compose_host_cancellation(details),
+        Some(("cancel.ics", ics, "CANCEL")),
+    )
+    .await
+}
 
+fn compose_host_cancellation(details: &CancellationDetails) -> ComposedEmail {
+    let lang = lang_or_en(details.host_language.as_deref());
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -1668,87 +1760,50 @@ pub async fn send_host_cancellation(
         &details.host_timezone,
         details.utc_times.as_ref(),
     );
-    let reason_text = details
-        .reason
-        .as_ref()
-        .map(|r| format!("Reason: {}\n\n", r))
-        .unwrap_or_default();
-
-    let plain = format!(
-        "Booking cancelled.\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\n\
-         {}\
-         A calendar cancellation is attached.\n\n\
-         \u{2014} calrs",
-        details.event_title,
-        date_display,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        reason_text,
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &date_display,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
     );
-
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-    if let Some(reason) = &details.reason {
-        rows.push(EmailRow {
-            label: "Reason".to_string(),
-            value: reason.clone(),
-        });
+    push_row(
+        &mut rows,
+        lang,
+        "common-detail-reason",
+        details.reason.as_ref(),
+    );
+    let message = if details.cancelled_by_host {
+        t(lang, "email-host-cancel-message-by-host")
+    } else {
+        ta(
+            lang,
+            "email-host-cancel-message-by-guest",
+            [("guest", &details.guest_name)],
+        )
+    };
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-cancel-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &date_display),
+            ],
+        ),
+        heading: t(lang, "cancelled-heading"),
+        message,
+        accent: "#dc2626",
+        rows,
+        plain_lines: vec![],
+        footer_plain: Some(t(lang, "email-cancel-ics-attached-plain")),
+        footer_html: Some(t(lang, "email-cancel-ics-attached-html")),
+        actions: vec![],
     }
-
-    let html = render_html_email(
-        "Booking cancelled.",
-        &if details.cancelled_by_host {
-            "You cancelled this booking.".to_string()
-        } else {
-            format!("{} cancelled their booking.", h(&details.guest_name))
-        },
-        "#dc2626",
-        &rows,
-        Some("A calendar cancellation is attached to this email."),
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let ics_attachment = Attachment::new("cancel.ics".to_string()).body(
-        ics,
-        ContentType::parse("text/calendar; method=CANCEL; charset=UTF-8")?,
-    );
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Cancelled: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, date_display
-        ))
-        .multipart(
-            MultiPart::mixed()
-                .multipart(body)
-                .singlepart(ics_attachment),
-        )?;
-
-    send_email(config, email).await
+    .compose()
 }
 
 /// Send pending notice to guest (booking awaits host approval)
@@ -1969,7 +2024,17 @@ async fn send_host_approval_email(
     expires: Option<&str>,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let mail = compose_host_approval_email(details, confirm_token, base_url, expires);
+    send_composed(config, to, mail, None).await
+}
 
+fn compose_host_approval_email(
+    details: &BookingDetails,
+    confirm_token: Option<&str>,
+    base_url: Option<&str>,
+    expires: Option<&str>,
+) -> ComposedEmail {
+    let lang = host_lang(details);
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -1979,176 +2044,92 @@ async fn send_host_approval_email(
         details.utc_times.as_ref(),
     );
 
-    let (approve_url, decline_url) = match (confirm_token, base_url) {
-        (Some(token), Some(url)) => (
-            Some(format!(
-                "{}/booking/approve/{}",
-                url.trim_end_matches('/'),
-                token
-            )),
-            Some(format!(
-                "{}/booking/decline/{}",
-                url.trim_end_matches('/'),
-                token
-            )),
-        ),
-        _ => (None, None),
-    };
-
-    let action_text = match (&approve_url, &decline_url) {
-        (Some(a), Some(d)) => format!("Approve: {}\nDecline: {}", a, d),
-        _ => "Log in to your dashboard to confirm or decline this booking.".to_string(),
-    };
-
-    let headline_plain = match expires {
-        None => "New booking request requiring your approval!".to_string(),
-        Some(deadline) => format!(
-            "Reminder: this booking request is still waiting for your answer. \
-             If you do not respond, it will be declined automatically on {}.",
-            deadline
-        ),
-    };
-    let plain = format!(
-        "{}\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\
-         {}{}{}\n\
-         {}\n\n\
-         \u{2014} calrs",
-        headline_plain,
-        details.event_title,
-        date_display,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        details
-            .guest_phone
-            .as_ref()
-            .map(|p| format!("Phone: {}\n", p))
-            .unwrap_or_default(),
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
-        details
-            .notes
-            .as_ref()
-            .map(|n| format!("Notes: {}\n", n))
-            .unwrap_or_default(),
-        action_text,
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &date_display,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
     );
-
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-    if let Some(phone) = &details.guest_phone {
-        rows.push(EmailRow {
-            label: "Phone".to_string(),
-            value: phone.clone(),
-        });
-    }
-    if let Some(loc) = &details.location {
-        rows.push(EmailRow {
-            label: "Location".to_string(),
-            value: loc.clone(),
-        });
-    }
-    if let Some(res) = &details.resource_name {
-        rows.push(EmailRow {
-            label: "Resource".to_string(),
-            value: res.clone(),
-        });
-    }
-    if let Some(notes) = &details.notes {
-        rows.push(EmailRow {
-            label: "Notes".to_string(),
-            value: notes.clone(),
-        });
-    }
-
-    let actions: Vec<EmailAction> = match (approve_url, decline_url) {
-        (Some(a), Some(d)) => vec![
-            EmailAction {
-                label: "Approve".to_string(),
-                url: a,
-                color: "#16a34a".to_string(),
-            },
-            EmailAction {
-                label: "Decline".to_string(),
-                url: d,
-                color: "#dc2626".to_string(),
-            },
-        ],
-        _ => vec![],
-    };
-
+    push_row(
+        &mut rows,
+        lang,
+        "email-detail-phone",
+        details.guest_phone.as_ref(),
+    );
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
+    );
+    push_row(
+        &mut rows,
+        lang,
+        "bookings-resource",
+        details.resource_name.as_ref(),
+    );
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-notes",
+        details.notes.as_ref(),
+    );
     if let Some(deadline) = expires {
-        rows.push(EmailRow {
-            label: "Expires".to_string(),
-            value: deadline.to_string(),
-        });
+        rows.push(row(t(lang, "email-detail-expires"), deadline));
     }
 
+    let (plain_lines, actions) = approval_actions(lang, approval_urls(confirm_token, base_url));
+
+    let guest = details.guest_name.as_str();
     let (heading, message, subject) = match expires {
         None => (
-            "Action required",
-            format!("{} wants to book a slot with you.", h(&details.guest_name)),
-            format!(
-                "Action required: {} \u{2014} {} ({})",
-                details.event_title, details.guest_name, date_display
+            t(lang, "email-host-approval-heading"),
+            ta(lang, "email-host-approval-message", [("guest", guest)]),
+            ta(
+                lang,
+                "email-host-approval-subject",
+                [
+                    ("event", &details.event_title),
+                    ("guest", guest),
+                    ("date", &date_display),
+                ],
             ),
         ),
         Some(deadline) => (
-            "Reminder: action required",
-            format!(
-                "{} is still waiting for your answer. If you do not respond, \
-                 the request will be declined automatically on {}.",
-                h(&details.guest_name),
-                h(deadline)
+            t(lang, "email-host-approval-reminder-heading"),
+            ta(
+                lang,
+                "email-host-approval-reminder-message",
+                [("guest", guest), ("deadline", deadline)],
             ),
-            format!(
-                "Reminder: {} is waiting for your answer ({}, {})",
-                details.guest_name, details.event_title, date_display
+            ta(
+                lang,
+                "email-host-approval-reminder-subject",
+                [
+                    ("event", &details.event_title),
+                    ("guest", guest),
+                    ("date", &date_display),
+                ],
             ),
         ),
     };
 
-    let html = render_html_email_with_actions(
+    let footer = t(lang, "email-host-approval-footer");
+    EmailParts {
+        lang,
+        subject,
         heading,
-        &message,
-        "#f59e0b",
-        &rows,
-        Some("You can also manage this from your dashboard."),
-        &actions,
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(subject)
-        .multipart(body)?;
-
-    send_email(config, email).await
+        message,
+        accent: "#f59e0b",
+        rows,
+        plain_lines,
+        footer_plain: Some(footer.clone()),
+        footer_html: Some(footer),
+        actions,
+    }
+    .compose()
 }
 
 /// Send decline notification to the guest
@@ -2380,13 +2361,17 @@ fn compose_guest_pending_expired(
 }
 
 /// Tell the host a request they did not answer has expired and was declined
-/// automatically (#234). English, like the other host emails.
+/// automatically (#234), in the host's language.
 pub async fn send_host_pending_expired(
     config: &SmtpConfig,
     details: &CancellationDetails,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    send_composed(config, to, compose_host_pending_expired(details), None).await
+}
 
+fn compose_host_pending_expired(details: &CancellationDetails) -> ComposedEmail {
+    let lang = lang_or_en(details.host_language.as_deref());
     let (date_display, time_display) = host_time_display_exact(
         &details.date,
         &details.start_time,
@@ -2395,62 +2380,39 @@ pub async fn send_host_pending_expired(
         &details.host_timezone,
         details.utc_times.as_ref(),
     );
-
-    let plain = format!(
-        "Booking request expired.\n\n\
-         Nobody answered this request before its deadline, so it was declined \
-         automatically and the guest was told to pick another time.\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\n\
-         calrs",
-        details.event_title, date_display, time_display, details.guest_name, details.guest_email,
-    );
-
-    let rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: date_display.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-
-    let html = render_html_email(
-        "Booking request expired.",
-        &format!(
-            "Nobody answered the request from {} before its deadline, so it was \
-             declined automatically and the guest was told to pick another time.",
-            h(&details.guest_name)
+    let footer = t(lang, "email-host-expired-footer");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-expired-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &date_display),
+            ],
         ),
-        "#dc2626",
-        &rows,
-        Some("You can change how long requests wait in the event type settings."),
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Expired: {} with {} ({})",
-            details.event_title, details.guest_name, date_display
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+        heading: t(lang, "email-host-expired-heading"),
+        message: ta(
+            lang,
+            "email-host-expired-message",
+            [("guest", &details.guest_name)],
+        ),
+        accent: "#dc2626",
+        rows: host_rows(
+            lang,
+            &details.event_title,
+            &date_display,
+            &time_display,
+            &details.guest_name,
+            &details.guest_email,
+        ),
+        plain_lines: vec![],
+        footer_plain: Some(footer.clone()),
+        footer_html: Some(footer),
+        actions: vec![],
+    }
+    .compose()
 }
 
 // --- Utility ---
@@ -2716,9 +2678,15 @@ pub async fn send_test_email(config: &SmtpConfig, to_email: &str) -> Result<()> 
     send_email(config, email).await
 }
 
-/// Send a booking invite email to a guest
+/// Send a booking invite email to a guest.
+///
+/// `lang` is the inviting user's language as their dashboard resolved it
+/// (saved preference, then their browser's `Accept-Language`). Nothing is
+/// known about the invitee yet, and the optional personal message is written
+/// by the inviter, so the email is in the inviter's language.
 pub async fn send_invite_email(
     config: &SmtpConfig,
+    lang: &str,
     guest_name: &str,
     guest_email: &str,
     event_title: &str,
@@ -2727,82 +2695,57 @@ pub async fn send_invite_email(
     invite_url: &str,
     expires_at: Option<&str>,
 ) -> Result<()> {
-    let from = config.mailbox_from()?;
     let to = format!("{} <{}>", guest_name, guest_email).parse()?;
-
-    let expiry_note = expires_at
-        .map(|e| format!("\nThis invite expires on {}.", e))
-        .unwrap_or_default();
-    let message_note = message
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\n\"{}\"\n", m))
-        .unwrap_or_default();
-
-    let plain = format!(
-        "Hi {},\n\n\
-         {} has invited you to book: {}\n\
-         {}\
-         Click the link below to choose a time:\n\
-         {}\n\
-         {}\n\
-         \u{2014} calrs",
-        guest_name, host_name, event_title, message_note, invite_url, expiry_note,
+    let mail = compose_invite_email(
+        lang,
+        guest_name,
+        event_title,
+        host_name,
+        message,
+        invite_url,
+        expires_at,
     );
+    send_composed(config, to, mail, None).await
+}
 
+fn compose_invite_email(
+    lang: &str,
+    guest_name: &str,
+    event_title: &str,
+    host_name: &str,
+    message: Option<&str>,
+    invite_url: &str,
+    expires_at: Option<&str>,
+) -> ComposedEmail {
+    let lang = lang_or_en(Some(lang));
     let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: event_title.to_string(),
-        },
-        EmailRow {
-            label: "Invited by".to_string(),
-            value: host_name.to_string(),
-        },
+        row(t(lang, "confirmed-detail-event"), event_title),
+        row(t(lang, "email-detail-invited-by"), host_name),
     ];
     if let Some(msg) = message.filter(|m| !m.trim().is_empty()) {
-        rows.push(EmailRow {
-            label: "Message".to_string(),
-            value: msg.to_string(),
-        });
+        rows.push(row(t(lang, "email-detail-message"), msg));
     }
     if let Some(exp) = expires_at {
-        rows.push(EmailRow {
-            label: "Expires".to_string(),
-            value: exp.to_string(),
-        });
+        rows.push(row(t(lang, "email-detail-expires"), exp));
     }
-
-    let actions = vec![EmailAction {
-        label: "Choose a time".to_string(),
-        url: invite_url.to_string(),
-        color: "#6366f1".to_string(),
-    }];
-
-    let html = render_html_email_with_actions(
-        &format!("Hi {},", h(guest_name)),
-        &format!(
-            "{} has invited you to book: {}",
-            h(host_name),
-            h(event_title)
-        ),
-        "#6366f1",
-        &rows,
-        None,
-        &actions,
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(from)
-        .to(to)
-        .subject(format!(
-            "{} invited you to book: {}",
-            host_name, event_title
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    let invite_args = [("host", host_name), ("event", event_title)];
+    EmailParts {
+        lang,
+        subject: ta(lang, "email-invite-subject", invite_args),
+        heading: ta(lang, "email-confirm-greeting", [("name", guest_name)]),
+        message: ta(lang, "email-invite-message", invite_args),
+        accent: "#6366f1",
+        rows,
+        plain_lines: vec![t(lang, "email-invite-link"), invite_url.to_string()],
+        footer_plain: None,
+        footer_html: None,
+        actions: vec![EmailAction {
+            label: t(lang, "email-invite-action"),
+            url: invite_url.to_string(),
+            color: "#6366f1".to_string(),
+        }],
+    }
+    .compose()
 }
 
 /// How long to wait for the TCP (and implicit TLS) connection to the SMTP
@@ -2920,110 +2863,99 @@ pub struct RescheduleDetails {
     pub location: Option<String>,
     /// Host's IANA timezone (from `users.timezone`). See `BookingDetails::host_timezone`.
     pub host_timezone: String,
+    /// Language the guest booked in (`bookings.language`). See
+    /// `BookingDetails::guest_language`.
+    pub guest_language: Option<String>,
+    /// Host recipient's saved language (`users.language`). See
+    /// `BookingDetails::host_language`.
+    pub host_language: Option<String>,
 }
 
 /// Ask the guest to pick a new time (host-initiated reschedule).
-/// The guest clicks the link to choose a slot — no time is pre-selected.
+/// The guest clicks the link to choose a slot; no time is pre-selected.
 pub async fn send_guest_pick_new_time(
     config: &SmtpConfig,
     details: &BookingDetails,
     reschedule_url: &str,
     cancel_url: Option<&str>,
 ) -> Result<()> {
-    let from = config.mailbox_from()?;
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let mail = compose_guest_pick_new_time(details, reschedule_url, cancel_url);
+    send_composed(config, to, mail, None).await
+}
 
+fn compose_guest_pick_new_time(
+    details: &BookingDetails,
+    reschedule_url: &str,
+    cancel_url: Option<&str>,
+) -> ComposedEmail {
+    let lang = guest_lang(details);
     let time_display = format!(
         "{} \u{2013} {} ({})",
         details.start_time, details.end_time, details.guest_timezone
     );
 
-    let plain = format!(
-        "Hi {},\n\n\
-         {} needs to reschedule your booking.\n\n\
-         Event: {}\n\
-         Originally: {} at {}\n\n\
-         Please pick a new time: {}\n\
-         {}\n\
-         \u{2014} calrs",
-        details.guest_name,
-        details.host_name,
-        details.event_title,
-        details.date,
-        time_display,
-        reschedule_url,
-        cancel_url
-            .map(|u| format!("\nOr cancel: {}\n", u))
-            .unwrap_or_default(),
-    );
-
-    let rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Originally".to_string(),
-            value: format!("{} at {}", details.date, time_display),
-        },
-        EmailRow {
-            label: "Host".to_string(),
-            value: details.host_name.clone(),
-        },
-    ];
-
+    let mut plain_lines = vec![ta(
+        lang,
+        "email-pick-new-time-link",
+        [("url", reschedule_url)],
+    )];
     let mut actions = vec![EmailAction {
-        label: "Pick a new time".to_string(),
+        label: t(lang, "email-action-pick-new-time"),
         url: reschedule_url.to_string(),
         color: "#d97706".to_string(),
     }];
     if let Some(u) = cancel_url {
+        plain_lines.push(ta(lang, "email-confirm-need-to-cancel", [("url", u)]));
         actions.push(EmailAction {
-            label: "Cancel booking".to_string(),
+            label: t(lang, "email-action-cancel-booking"),
             url: u.to_string(),
             color: "#dc2626".to_string(),
         });
     }
 
-    let html = render_html_email_with_actions(
-        &format!("Hi {},", h(&details.guest_name)),
-        &format!(
-            "{} needs to reschedule your booking. Please pick a new time.",
-            h(&details.host_name)
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-pick-new-time-subject",
+            [("event", &details.event_title)],
         ),
-        "#d97706",
-        &rows,
-        None,
-        &actions,
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(from)
-        .to(to)
-        .subject(format!(
-            "Reschedule: {} \u{2014} please pick a new time",
-            details.event_title
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+        heading: ta(
+            lang,
+            "email-confirm-greeting",
+            [("name", &details.guest_name)],
+        ),
+        message: ta(
+            lang,
+            "email-pick-new-time-message",
+            [("host", &details.host_name)],
+        ),
+        accent: "#d97706",
+        rows: vec![
+            row(t(lang, "confirmed-detail-event"), &details.event_title),
+            row(
+                t(lang, "email-detail-originally"),
+                date_at_time(lang, &details.date, &time_display),
+            ),
+            row(t(lang, "confirmed-detail-with"), &details.host_name),
+        ],
+        plain_lines,
+        footer_plain: None,
+        footer_html: None,
+        actions,
+    }
+    .compose()
 }
 
-/// Notify the guest that their booking was rescheduled by the host.
-/// Includes updated ICS calendar invite.
+/// Notify the guest that their booking was rescheduled, in the language they
+/// booked in. Includes updated ICS calendar invite.
 pub async fn send_guest_reschedule_notification(
     config: &SmtpConfig,
     details: &RescheduleDetails,
     cancel_url: Option<&str>,
     reschedule_url: Option<&str>,
 ) -> Result<()> {
-    let new_time_display = format!(
-        "{} \u{2013} {} ({})",
-        details.new_start_time, details.new_end_time, details.guest_timezone
-    );
-
     let booking_details = BookingDetails {
         utc_times: details.utc_times.clone(),
         event_title: details.event_title.clone(),
@@ -3045,123 +2977,108 @@ pub async fn send_guest_reschedule_notification(
     let ics = generate_ics(&booking_details, "REQUEST");
 
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let mail = compose_guest_reschedule_notification(details, cancel_url, reschedule_url);
+    send_composed(config, to, mail, Some(("invite.ics", ics, "REQUEST"))).await
+}
 
-    let plain = format!(
-        "Hi {},\n\n\
-         Your booking has been rescheduled by {}.\n\n\
-         Event: {}\n\
-         Previous: {} at {} \u{2013} {}\n\
-         New: {} at {}\n\
-         {}\
-         An updated calendar invite is attached.\n\
-         {}{}\n\
-         \u{2014} calrs",
-        details.guest_name,
-        details.host_name,
-        details.event_title,
-        details.old_date,
-        details.old_start_time,
-        details.old_end_time,
-        details.new_date,
-        new_time_display,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
-        cancel_url
-            .map(|u| format!("Need to cancel? {}\n", u))
-            .unwrap_or_default(),
-        reschedule_url
-            .map(|u| format!("Need to reschedule? {}\n", u))
-            .unwrap_or_default(),
+fn compose_guest_reschedule_notification(
+    details: &RescheduleDetails,
+    cancel_url: Option<&str>,
+    reschedule_url: Option<&str>,
+) -> ComposedEmail {
+    let lang = lang_or_en(details.guest_language.as_deref());
+    let new_time_display = format!(
+        "{} \u{2013} {} ({})",
+        details.new_start_time, details.new_end_time, details.guest_timezone
+    );
+    let old_time_display = format!(
+        "{} \u{2013} {}",
+        details.old_start_time, details.old_end_time
     );
 
-    let rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Previous".to_string(),
-            value: format!(
-                "{} at {} \u{2013} {}",
-                details.old_date, details.old_start_time, details.old_end_time
-            ),
-        },
-        EmailRow {
-            label: "New date".to_string(),
-            value: details.new_date.clone(),
-        },
-        EmailRow {
-            label: "New time".to_string(),
-            value: new_time_display,
-        },
-        EmailRow {
-            label: "With".to_string(),
-            value: details.host_name.clone(),
-        },
+    let mut rows = vec![
+        row(t(lang, "confirmed-detail-event"), &details.event_title),
+        row(
+            t(lang, "email-detail-previous"),
+            date_at_time(lang, &details.old_date, &old_time_display),
+        ),
+        row(t(lang, "email-detail-new-date"), &details.new_date),
+        row(t(lang, "email-detail-new-time"), new_time_display),
+        row(t(lang, "confirmed-detail-with"), &details.host_name),
     ];
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
+    );
 
+    let mut plain_lines = Vec::new();
     let mut actions = Vec::new();
     if let Some(u) = reschedule_url {
+        plain_lines.push(ta(lang, "email-need-to-reschedule", [("url", u)]));
         actions.push(EmailAction {
-            label: "Reschedule".to_string(),
+            label: t(lang, "email-action-reschedule"),
             url: u.to_string(),
             color: "#d97706".to_string(),
         });
     }
     if let Some(u) = cancel_url {
+        plain_lines.push(ta(lang, "email-confirm-need-to-cancel", [("url", u)]));
         actions.push(EmailAction {
-            label: "Cancel booking".to_string(),
+            label: t(lang, "email-action-cancel-booking"),
             url: u.to_string(),
             color: "#dc2626".to_string(),
         });
     }
 
-    let html = render_html_email_with_actions(
-        &format!("Hi {},", h(&details.guest_name)),
-        &format!(
-            "Your booking has been rescheduled by {}.",
-            h(&details.host_name)
-        ),
-        "#d97706",
-        &rows,
-        Some("An updated calendar invite is attached to this email."),
-        &actions,
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let ics_attachment = Attachment::new("invite.ics".to_string()).body(
-        ics,
-        ContentType::parse("text/calendar; method=REQUEST; charset=UTF-8")?,
-    );
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
+    EmailParts {
+        lang,
         // Neutral subject: Exchange uses it as the appointment title (#157).
-        .subject(format!(
-            "{} \u{2014} {}",
-            details.event_title, details.new_date
-        ))
-        .multipart(
-            MultiPart::mixed()
-                .multipart(body)
-                .singlepart(ics_attachment),
-        )?;
-
-    send_email(config, email).await
+        subject: ta(
+            lang,
+            "email-confirm-subject",
+            [("event", &details.event_title), ("date", &details.new_date)],
+        ),
+        heading: ta(
+            lang,
+            "email-confirm-greeting",
+            [("name", &details.guest_name)],
+        ),
+        message: ta(
+            lang,
+            "email-rescheduled-message",
+            [("host", &details.host_name)],
+        ),
+        accent: "#d97706",
+        rows,
+        plain_lines,
+        footer_plain: Some(t(lang, "email-rescheduled-ics-attached-plain")),
+        footer_html: Some(t(lang, "email-rescheduled-ics-attached-html")),
+        actions,
+    }
+    .compose()
 }
 
-/// Notify the host that a guest wants to reschedule — includes approve/decline buttons.
+/// Notify the host that a guest wants to reschedule, with approve/decline
+/// buttons, in the host's language.
 pub async fn send_host_reschedule_request(
     config: &SmtpConfig,
     details: &RescheduleDetails,
     confirm_token: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<()> {
+    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let mail = compose_host_reschedule_request(details, confirm_token, base_url);
+    send_composed(config, to, mail, None).await
+}
+
+fn compose_host_reschedule_request(
+    details: &RescheduleDetails,
+    confirm_token: Option<&str>,
+    base_url: Option<&str>,
+) -> ComposedEmail {
+    let lang = lang_or_en(details.host_language.as_deref());
     let (old_date_display, old_time_display) = host_time_display_exact(
         &details.old_date,
         &details.old_start_time,
@@ -3179,287 +3096,196 @@ pub async fn send_host_reschedule_request(
         details.utc_times.as_ref(),
     );
 
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
-
-    let (approve_url, decline_url) = match (confirm_token, base_url) {
-        (Some(token), Some(url)) => (
-            Some(format!(
-                "{}/booking/approve/{}",
-                url.trim_end_matches('/'),
-                token
-            )),
-            Some(format!(
-                "{}/booking/decline/{}",
-                url.trim_end_matches('/'),
-                token
-            )),
+    let mut rows = vec![
+        row(t(lang, "confirmed-detail-event"), &details.event_title),
+        row(
+            t(lang, "email-detail-previous"),
+            date_at_time(lang, &old_date_display, &old_time_display),
         ),
-        _ => (None, None),
-    };
-
-    let action_text = match (&approve_url, &decline_url) {
-        (Some(a), Some(d)) => format!("Approve: {}\nDecline: {}", a, d),
-        _ => "Log in to your dashboard to confirm or decline.".to_string(),
-    };
-
-    let plain = format!(
-        "{} wants to reschedule their booking.\n\n\
-         Event: {}\n\
-         Previous: {} at {}\n\
-         Requested: {} at {}\n\
-         Guest: {} <{}>\n\
-         {}\n\n\
-         {}\n\n\
-         \u{2014} calrs",
-        details.guest_name,
-        details.event_title,
-        old_date_display,
-        old_time_display,
-        new_date_display,
-        new_time_display,
-        details.guest_name,
-        details.guest_email,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
-        action_text,
-    );
-
-    let rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Previous".to_string(),
-            value: format!("{} at {}", old_date_display, old_time_display),
-        },
-        EmailRow {
-            label: "Requested".to_string(),
-            value: format!("{} at {}", new_date_display, new_time_display),
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
+        row(
+            t(lang, "email-detail-requested"),
+            date_at_time(lang, &new_date_display, &new_time_display),
+        ),
+        row(
+            t(lang, "common-detail-guest"),
+            format!("{} <{}>", details.guest_name, details.guest_email),
+        ),
     ];
-
-    let mut actions = Vec::new();
-    if let Some(u) = &approve_url {
-        actions.push(EmailAction {
-            label: "Approve".to_string(),
-            url: u.clone(),
-            color: "#16a34a".to_string(),
-        });
-    }
-    if let Some(u) = &decline_url {
-        actions.push(EmailAction {
-            label: "Decline".to_string(),
-            url: u.clone(),
-            color: "#dc2626".to_string(),
-        });
-    }
-
-    let html = render_html_email_with_actions(
-        &format!("Hi {},", h(&details.host_name)),
-        &format!(
-            "{} wants to reschedule their booking.",
-            h(&details.guest_name)
-        ),
-        "#d97706",
-        &rows,
-        None,
-        &actions,
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
     );
 
-    let body = build_multipart_body(&plain, &html);
+    let (plain_lines, actions) = approval_actions(lang, approval_urls(confirm_token, base_url));
 
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Reschedule request: {} \u{2014} {} <{}>",
-            details.event_title, details.guest_name, details.guest_email
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-host-reschedule-request-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("email", &details.guest_email),
+            ],
+        ),
+        heading: ta(
+            lang,
+            "email-confirm-greeting",
+            [("name", &details.host_name)],
+        ),
+        message: ta(
+            lang,
+            "email-host-reschedule-request-message",
+            [("guest", &details.guest_name)],
+        ),
+        accent: "#d97706",
+        rows,
+        plain_lines,
+        footer_plain: None,
+        footer_html: None,
+        actions,
+    }
+    .compose()
 }
 
 // --- Watcher claim emails ---
 
+/// Offer a booking to a watcher, in the watcher's own language (`lang`, from
+/// their `users.language`; `None` is English).
 pub async fn send_watcher_claim_notification(
     config: &SmtpConfig,
     details: &BookingDetails,
     watcher_name: &str,
     watcher_email: &str,
+    lang: Option<&str>,
     assigned_to_name: &str,
     claim_url: &str,
 ) -> Result<()> {
     let to = format!("{} <{}>", watcher_name, watcher_email).parse()?;
-
-    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
-
-    let plain = format!(
-        "New booking available to claim!\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\
-         Assigned to: {}\n\
-         {}\
-         Claim this booking: {}\n\n\
-         \u{2014} calrs",
-        details.event_title,
-        details.date,
-        time_display,
-        details.guest_name,
-        details.guest_email,
+    let mail = compose_watcher_claim_notification(
+        details,
+        watcher_name,
+        lang,
         assigned_to_name,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
         claim_url,
     );
-
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: details.date.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-        EmailRow {
-            label: "Assigned to".to_string(),
-            value: assigned_to_name.to_string(),
-        },
-    ];
-    if let Some(loc) = &details.location {
-        rows.push(EmailRow {
-            label: "Location".to_string(),
-            value: loc.clone(),
-        });
-    }
-
-    let actions = vec![EmailAction {
-        label: "Claim this booking".to_string(),
-        url: claim_url.to_string(),
-        color: "#3b82f6".to_string(),
-    }];
-
-    let html = render_html_email_with_actions(
-        &format!("Hi {},", h(watcher_name)),
-        "A new booking is available to claim. Click below to join as an attendee.",
-        "#3b82f6",
-        &rows,
-        Some("You can also claim from your dashboard."),
-        &actions,
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Claim available: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    send_composed(config, to, mail, None).await
 }
 
+fn compose_watcher_claim_notification(
+    details: &BookingDetails,
+    watcher_name: &str,
+    lang: Option<&str>,
+    assigned_to_name: &str,
+    claim_url: &str,
+) -> ComposedEmail {
+    let lang = lang_or_en(lang);
+    let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &details.date,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
+    );
+    rows.push(row(t(lang, "claim-assigned-to"), assigned_to_name));
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
+    );
+
+    let footer = t(lang, "email-watcher-claim-footer");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-watcher-claim-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &details.date),
+            ],
+        ),
+        heading: ta(lang, "email-confirm-greeting", [("name", watcher_name)]),
+        message: t(lang, "email-watcher-claim-message"),
+        accent: "#3b82f6",
+        rows,
+        plain_lines: vec![ta(lang, "email-watcher-claim-link", [("url", claim_url)])],
+        footer_plain: Some(footer.clone()),
+        footer_html: Some(footer),
+        actions: vec![EmailAction {
+            label: t(lang, "claim-button"),
+            url: claim_url.to_string(),
+            color: "#3b82f6".to_string(),
+        }],
+    }
+    .compose()
+}
+
+/// Confirm a claim to the watcher who made it, in their language (`lang`,
+/// from their `users.language`; `None` is English).
 pub async fn send_claim_confirmation(
     config: &SmtpConfig,
     details: &BookingDetails,
     claimant_name: &str,
     claimant_email: &str,
+    lang: Option<&str>,
 ) -> Result<()> {
     let to = format!("{} <{}>", claimant_name, claimant_email).parse()?;
+    let mail = compose_claim_confirmation(details, claimant_name, lang);
+    send_composed(config, to, mail, None).await
+}
 
+fn compose_claim_confirmation(
+    details: &BookingDetails,
+    claimant_name: &str,
+    lang: Option<&str>,
+) -> ComposedEmail {
+    let lang = lang_or_en(lang);
     let time_display = format!("{} \u{2013} {}", details.start_time, details.end_time);
-
-    let plain = format!(
-        "You claimed this booking!\n\n\
-         Event: {}\n\
-         Date: {}\n\
-         Time: {}\n\
-         Guest: {} <{}>\n\
-         {}\
-         A calendar invite has been sent.\n\n\
-         \u{2014} calrs",
-        details.event_title,
-        details.date,
-        time_display,
-        details.guest_name,
-        details.guest_email,
-        details
-            .location
-            .as_ref()
-            .map(|l| format!("Location: {}\n", l))
-            .unwrap_or_default(),
+    let mut rows = host_rows(
+        lang,
+        &details.event_title,
+        &details.date,
+        &time_display,
+        &details.guest_name,
+        &details.guest_email,
+    );
+    push_row(
+        &mut rows,
+        lang,
+        "confirmed-detail-location",
+        details.location.as_ref(),
     );
 
-    let mut rows = vec![
-        EmailRow {
-            label: "Event".to_string(),
-            value: details.event_title.clone(),
-        },
-        EmailRow {
-            label: "Date".to_string(),
-            value: details.date.clone(),
-        },
-        EmailRow {
-            label: "Time".to_string(),
-            value: time_display,
-        },
-        EmailRow {
-            label: "Guest".to_string(),
-            value: format!("{} <{}>", details.guest_name, details.guest_email),
-        },
-    ];
-    if let Some(loc) = &details.location {
-        rows.push(EmailRow {
-            label: "Location".to_string(),
-            value: loc.clone(),
-        });
+    let footer = t(lang, "email-claim-confirmed-footer");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-claim-confirmed-subject",
+            [
+                ("event", &details.event_title),
+                ("guest", &details.guest_name),
+                ("date", &details.date),
+            ],
+        ),
+        heading: ta(lang, "email-confirm-greeting", [("name", claimant_name)]),
+        message: t(lang, "claimed-subtitle"),
+        accent: "#16a34a",
+        rows,
+        plain_lines: vec![],
+        footer_plain: Some(footer.clone()),
+        footer_html: Some(footer),
+        actions: vec![],
     }
-
-    let html = render_html_email(
-        &format!("Hi {},", h(claimant_name)),
-        "You have successfully claimed this booking. A calendar invite is attached.",
-        "#16a34a",
-        &rows,
-        Some("You will be added as an attendee on this meeting."),
-    );
-
-    let body = build_multipart_body(&plain, &html);
-
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(format!(
-            "Booking claimed: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, details.date
-        ))
-        .multipart(body)?;
-
-    send_email(config, email).await
+    .compose()
 }
 
 #[cfg(test)]
@@ -7176,5 +7002,523 @@ mod tests {
         // Untranslated emails keep declaring English.
         let html = render_html_email("Hi,", "Body", "#000", &[], None);
         assert!(html.contains("<html lang=\"en\">"));
+    }
+
+    // --- #209: host, watcher and remaining guest emails are translated ---
+
+    /// No English copy left in a translated email. Names, the event title and
+    /// URLs are data, so only phrases calrs writes itself are checked.
+    fn assert_no_english(mail: &ComposedEmail, phrases: &[&str]) {
+        for english in phrases {
+            assert!(
+                !mail.subject.contains(english),
+                "{english} leaked into the subject: {}",
+                mail.subject
+            );
+            assert!(
+                !mail.plain.contains(english),
+                "{english} leaked into: {}",
+                mail.plain
+            );
+            assert!(
+                !mail.html.contains(english),
+                "{english} leaked into the HTML"
+            );
+        }
+    }
+
+    fn host_in(lang: Option<&str>) -> BookingDetails {
+        BookingDetails {
+            host_language: lang.map(str::to_string),
+            ..sample_booking_details()
+        }
+    }
+
+    #[test]
+    fn host_notification_is_written_in_the_host_language() {
+        let mail = compose_host_notification(&host_in(Some("de")));
+        assert_eq!(
+            mail.subject,
+            "Neue Buchung: 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail.plain.starts_with("Neue Buchung!"), "{}", mail.plain);
+        assert!(mail.plain.contains("Gast: Jane Doe <jane@example.com>"));
+        assert!(mail.html.contains("<html lang=\"de\">"));
+        assert!(mail.html.contains("Gesendet von"));
+        assert_no_english(
+            &mail,
+            &[
+                "New booking",
+                "booked a slot",
+                "Guest:",
+                "Sent by",
+                "attached",
+            ],
+        );
+    }
+
+    #[test]
+    fn host_notification_without_a_language_is_english() {
+        for lang in [None, Some(""), Some("xx")] {
+            let mail = compose_host_notification(&host_in(lang));
+            assert_eq!(
+                mail.subject,
+                "New booking: 30min Intro, Jane Doe (2026-04-10)"
+            );
+            assert!(mail.plain.starts_with("New booking!"));
+            assert!(mail.plain.contains("Jane Doe booked a slot with you."));
+            assert!(mail.html.contains("<html lang=\"en\">"));
+            assert!(mail.html.contains("Sent by"));
+        }
+    }
+
+    /// The guest's language never leaks into the host's copy: a French guest
+    /// booking an English-speaking host still gets the host an English email.
+    #[test]
+    fn host_email_ignores_the_guest_language() {
+        let details = BookingDetails {
+            guest_language: Some("fr".to_string()),
+            ..host_in(None)
+        };
+        let mail = compose_host_notification(&details);
+        assert!(mail.subject.starts_with("New booking:"));
+        assert!(mail.html.contains("<html lang=\"en\">"));
+    }
+
+    #[test]
+    fn host_booking_confirmed_is_written_in_the_host_language() {
+        let mail = compose_host_booking_confirmed(&host_in(Some("fr")));
+        assert_eq!(
+            mail.subject,
+            "Confirmée : 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail.plain.starts_with("Réservation confirmée"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(&mail, &["Booking confirmed", "You approved", "calendar."]);
+
+        let mail = compose_host_booking_confirmed(&host_in(None));
+        assert_eq!(
+            mail.subject,
+            "Confirmed: 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail.html.contains("<html lang=\"en\">"));
+    }
+
+    #[test]
+    fn host_calendar_sync_failure_is_written_in_the_host_language() {
+        let mail = compose_host_calendar_sync_failure(&host_in(Some("de")), "HTTP 409");
+        assert!(
+            mail.subject.starts_with("Aktion nötig:"),
+            "{}",
+            mail.subject
+        );
+        assert!(mail
+            .plain
+            .starts_with("Dein Kalender wurde nicht aktualisiert"));
+        assert!(mail.plain.contains("Neues Datum: 2026-04-10"));
+        // The technical reason is shown as the API returned it.
+        assert!(mail.plain.contains("HTTP 409"));
+        assert!(mail.html.contains("<html lang=\"de\">"));
+        assert_no_english(&mail, &["Action needed", "Your calendar", "New date"]);
+
+        let mail = compose_host_calendar_sync_failure(&host_in(None), "HTTP 409");
+        assert_eq!(
+            mail.subject,
+            "Action needed: calendar not updated for 30min Intro (2026-04-10)"
+        );
+    }
+
+    #[test]
+    fn host_reminder_is_written_in_the_host_language() {
+        let mail = compose_host_reminder(&host_in(Some("fr")));
+        assert_eq!(mail.subject, "Rappel : 30min Intro, Jane Doe (2026-04-10)");
+        assert!(mail.plain.starts_with("Réservation à venir"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(&mail, &["Reminder", "Upcoming", "coming up"]);
+
+        let mail = compose_host_reminder(&host_in(None));
+        assert_eq!(mail.subject, "Reminder: 30min Intro, Jane Doe (2026-04-10)");
+        assert!(mail.plain.starts_with("Upcoming booking"));
+    }
+
+    #[test]
+    fn host_cancellation_is_written_in_the_host_language() {
+        let details = CancellationDetails {
+            host_language: Some("fr".to_string()),
+            cancelled_by_host: false,
+            ..cancellation_from(&sample_booking_details())
+        };
+        let mail = compose_host_cancellation(&details);
+        assert_eq!(mail.subject, "Annulée : 30min Intro, Jane Doe (2026-04-10)");
+        assert!(mail.plain.starts_with("Réservation annulée"));
+        assert!(mail.plain.contains("Jane Doe a annulé sa réservation."));
+        assert!(mail.plain.contains("Motif : Conflit"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(&mail, &["Cancelled", "cancelled their", "Reason:"]);
+
+        let mail = compose_host_cancellation(&CancellationDetails {
+            host_language: None,
+            cancelled_by_host: true,
+            ..details
+        });
+        assert_eq!(
+            mail.subject,
+            "Cancelled: 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail.plain.contains("You cancelled this booking."));
+    }
+
+    #[test]
+    fn host_approval_request_is_written_in_the_host_language() {
+        let details = BookingDetails {
+            guest_phone: Some("+33612345678".to_string()),
+            ..host_in(Some("fr"))
+        };
+        let mail = compose_host_approval_email(
+            &details,
+            Some("tok"),
+            Some("https://cal.example.com/"),
+            None,
+        );
+        assert_eq!(
+            mail.subject,
+            "Action requise : 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail
+            .plain
+            .contains("Approuver : https://cal.example.com/booking/approve/tok"));
+        assert!(mail
+            .plain
+            .contains("Refuser : https://cal.example.com/booking/decline/tok"));
+        assert!(mail.plain.contains("Téléphone : +33612345678"));
+        assert!(mail.html.contains(">Approuver</a>"));
+        assert!(mail.html.contains(">Refuser</a>"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(
+            &mail,
+            &[
+                "Action required",
+                "Approve",
+                "Decline",
+                "Phone:",
+                "dashboard",
+            ],
+        );
+
+        // Without a base URL the plain text points to the dashboard instead.
+        let mail = compose_host_approval_email(&details, Some("tok"), None, None);
+        assert!(mail
+            .plain
+            .contains("Connectez-vous à votre tableau de bord"));
+        assert!(!mail.html.contains("booking/approve"));
+    }
+
+    #[test]
+    fn host_approval_reminder_is_written_in_the_host_language() {
+        let mail = compose_host_approval_email(
+            &host_in(Some("de")),
+            Some("tok"),
+            Some("https://cal.example.com"),
+            Some("2026-04-09 18:00 (Europe/Paris)"),
+        );
+        assert_eq!(
+            mail.subject,
+            "Erinnerung: Jane Doe wartet auf deine Antwort (30min Intro, 2026-04-10)"
+        );
+        assert!(mail
+            .plain
+            .contains("am 2026-04-09 18:00 (Europe/Paris) automatisch abgelehnt"));
+        assert!(mail.plain.contains("Läuft ab: 2026-04-09 18:00"));
+        assert!(mail.html.contains(">Genehmigen</a>"));
+        assert_no_english(&mail, &["Reminder", "waiting", "Expires"]);
+
+        let mail = compose_host_approval_email(
+            &host_in(None),
+            Some("tok"),
+            Some("https://cal.example.com"),
+            Some("2026-04-09 18:00 (Europe/Paris)"),
+        );
+        assert_eq!(
+            mail.subject,
+            "Reminder: Jane Doe is waiting for your answer (30min Intro, 2026-04-10)"
+        );
+        assert!(mail
+            .plain
+            .contains("Approve: https://cal.example.com/booking/approve/tok"));
+    }
+
+    #[test]
+    fn host_pending_expired_is_written_in_the_host_language() {
+        let details = CancellationDetails {
+            host_language: Some("pl".to_string()),
+            ..cancellation_from(&sample_booking_details())
+        };
+        let mail = compose_host_pending_expired(&details);
+        assert_eq!(mail.subject, "Wygasła: 30min Intro, Jane Doe (2026-04-10)");
+        assert!(mail.plain.starts_with("Prośba o rezerwację wygasła"));
+        assert!(mail.html.contains("<html lang=\"pl\">"));
+        assert_no_english(&mail, &["Expired", "Nobody answered", "Guest:"]);
+
+        let mail = compose_host_pending_expired(&CancellationDetails {
+            host_language: None,
+            ..details
+        });
+        assert_eq!(
+            mail.subject,
+            "Expired: 30min Intro with Jane Doe (2026-04-10)"
+        );
+    }
+
+    #[test]
+    fn host_reschedule_request_is_written_in_the_host_language() {
+        let details = RescheduleDetails {
+            host_language: Some("de".to_string()),
+            guest_language: Some("fr".to_string()),
+            ..sample_reschedule_details()
+        };
+        let mail =
+            compose_host_reschedule_request(&details, Some("tok"), Some("https://cal.example.com"));
+        assert_eq!(
+            mail.subject,
+            "Verschiebungsanfrage: 30min call, Jane (jane@example.com)"
+        );
+        assert!(mail.plain.starts_with("Hallo Alice,"));
+        assert!(mail.plain.contains("Bisher: 2026-03-16 um 10:00"));
+        assert!(mail.plain.contains("Angefragt: 2026-03-17 um 14:00"));
+        assert!(mail.html.contains(">Ablehnen</a>"));
+        assert!(mail.html.contains("<html lang=\"de\">"));
+        assert_no_english(
+            &mail,
+            &["Reschedule request", "Previous", "Requested", "Hi "],
+        );
+
+        let mail = compose_host_reschedule_request(
+            &RescheduleDetails {
+                host_language: None,
+                ..details
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            mail.subject,
+            "Reschedule request: 30min call, Jane (jane@example.com)"
+        );
+        assert!(mail.plain.contains("Log in to your dashboard"));
+    }
+
+    #[test]
+    fn watcher_claim_offer_is_written_in_the_watcher_language() {
+        let mail = compose_watcher_claim_notification(
+            &sample_booking_details(),
+            "Wanda",
+            Some("fr"),
+            "Alice Smith",
+            "https://cal.example.com/booking/claim/b?token=t",
+        );
+        assert_eq!(
+            mail.subject,
+            "À prendre en charge : 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail.plain.starts_with("Bonjour Wanda,"));
+        assert!(mail.plain.contains("Attribuée à : Alice Smith"));
+        assert!(mail.plain.contains(
+            "Prendre en charge cette réservation : https://cal.example.com/booking/claim/b?token=t"
+        ));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(&mail, &["Claim", "Assigned", "Hi "]);
+
+        let mail = compose_watcher_claim_notification(
+            &sample_booking_details(),
+            "Wanda",
+            None,
+            "Alice Smith",
+            "https://cal.example.com/c",
+        );
+        assert_eq!(
+            mail.subject,
+            "Claim available: 30min Intro, Jane Doe (2026-04-10)"
+        );
+    }
+
+    #[test]
+    fn claim_confirmation_is_written_in_the_claimant_language() {
+        let mail = compose_claim_confirmation(&sample_booking_details(), "Wanda", Some("de"));
+        assert_eq!(
+            mail.subject,
+            "Buchung übernommen: 30min Intro, Jane Doe (2026-04-10)"
+        );
+        assert!(mail.plain.starts_with("Hallo Wanda,"));
+        assert!(mail.html.contains("<html lang=\"de\">"));
+        assert_no_english(&mail, &["claimed", "attendee", "Hi "]);
+
+        let mail = compose_claim_confirmation(&sample_booking_details(), "Wanda", None);
+        assert_eq!(
+            mail.subject,
+            "Booking claimed: 30min Intro, Jane Doe (2026-04-10)"
+        );
+    }
+
+    #[test]
+    fn guest_pick_new_time_is_written_in_the_booking_language() {
+        let details = BookingDetails {
+            guest_language: Some("fr".to_string()),
+            host_language: Some("de".to_string()),
+            ..sample_booking_details()
+        };
+        let mail = compose_guest_pick_new_time(
+            &details,
+            "https://cal.example.com/booking/reschedule/r",
+            Some("https://cal.example.com/booking/cancel/c"),
+        );
+        assert_eq!(
+            mail.subject,
+            "Reprogrammation : 30min Intro, merci de choisir un nouveau créneau"
+        );
+        assert!(mail.plain.starts_with("Bonjour Jane Doe,"));
+        assert!(mail
+            .plain
+            .contains("Alice Smith doit reprogrammer votre réservation."));
+        assert!(mail
+            .plain
+            .contains("Initialement : 2026-04-10 à 14:00 \u{2013} 14:30 (Europe/Paris)"));
+        assert!(mail.html.contains(">Annuler la réservation</a>"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(
+            &mail,
+            &["Reschedule", "pick a new time", "Originally", "Hi "],
+        );
+
+        let mail = compose_guest_pick_new_time(&sample_booking_details(), "https://x/r", None);
+        assert_eq!(
+            mail.subject,
+            "Reschedule: 30min Intro, please pick a new time"
+        );
+    }
+
+    #[test]
+    fn guest_reschedule_notification_is_written_in_the_booking_language() {
+        let details = RescheduleDetails {
+            guest_language: Some("fr".to_string()),
+            host_language: Some("de".to_string()),
+            ..sample_reschedule_details()
+        };
+        let mail = compose_guest_reschedule_notification(
+            &details,
+            Some("https://cal.example.com/booking/cancel/c"),
+            Some("https://cal.example.com/booking/reschedule/r"),
+        );
+        // The neutral "event, date" subject Exchange titles the event after.
+        assert_eq!(
+            mail.subject,
+            ta(
+                "fr",
+                "email-confirm-subject",
+                [("event", "30min call"), ("date", "2026-03-17")]
+            )
+        );
+        assert!(mail.plain.starts_with("Bonjour Jane,"));
+        assert!(mail
+            .plain
+            .contains("Votre réservation a été reprogrammée par Alice."));
+        assert!(mail
+            .plain
+            .contains("Précédemment : 2026-03-16 à 10:00 \u{2013} 10:30"));
+        assert!(mail.plain.contains("Nouvelle date : 2026-03-17"));
+        assert!(mail
+            .plain
+            .contains("Besoin de reprogrammer ? https://cal.example.com/booking/reschedule/r"));
+        assert!(mail.html.contains("<html lang=\"fr\">"));
+        assert_no_english(
+            &mail,
+            &["rescheduled", "Previous", "New date", "Need to", "Hi "],
+        );
+
+        let mail = compose_guest_reschedule_notification(&sample_reschedule_details(), None, None);
+        assert!(mail
+            .plain
+            .contains("Your booking has been rescheduled by Alice."));
+        assert!(mail.html.contains("<html lang=\"en\">"));
+    }
+
+    #[test]
+    fn attendee_confirmation_is_written_in_the_booking_language() {
+        let details = BookingDetails {
+            guest_language: Some("es".to_string()),
+            ..sample_booking_details()
+        };
+        let mail = compose_attendee_confirmation(&details);
+        assert!(mail.plain.starts_with("Hola,"));
+        assert!(mail.plain.contains("Organizador: Alice Smith"));
+        assert!(mail
+            .plain
+            .contains("Reservado por: Jane Doe <jane@example.com>"));
+        assert!(mail.html.contains("<html lang=\"es\">"));
+        assert_no_english(&mail, &["added as an attendee", "Organizer", "Booked by"]);
+
+        let mail = compose_attendee_confirmation(&sample_booking_details());
+        assert!(mail
+            .plain
+            .contains("You've been added as an attendee to a booking."));
+    }
+
+    #[test]
+    fn invite_email_is_written_in_the_inviter_language() {
+        let mail = compose_invite_email(
+            "de",
+            "Gina",
+            "Demo",
+            "Alice",
+            Some("Bis bald"),
+            "https://cal.example.com/u/alice/demo?invite=t",
+            Some("2026-04-17"),
+        );
+        assert_eq!(
+            mail.subject,
+            "Alice hat dich eingeladen, einen Termin zu buchen: Demo"
+        );
+        assert!(mail.plain.starts_with("Hallo Gina,"));
+        assert!(mail.plain.contains("Eingeladen von: Alice"));
+        assert!(mail.plain.contains("Nachricht: Bis bald"));
+        assert!(mail.plain.contains("Läuft ab: 2026-04-17"));
+        assert!(mail
+            .plain
+            .contains("https://cal.example.com/u/alice/demo?invite=t"));
+        assert!(mail.html.contains(">Termin wählen</a>"));
+        assert!(mail.html.contains("<html lang=\"de\">"));
+        assert_no_english(
+            &mail,
+            &["invited you", "Invited by", "Choose a time", "Hi "],
+        );
+
+        let mail = compose_invite_email("en", "Gina", "Demo", "Alice", None, "https://x", None);
+        assert_eq!(mail.subject, "Alice invited you to book: Demo");
+    }
+
+    #[test]
+    fn calendar_deleted_reason_follows_the_reader() {
+        assert_eq!(
+            calendar_deleted_reason(None),
+            "The calendar event was deleted by the host."
+        );
+        assert_eq!(
+            calendar_deleted_reason(Some("fr")),
+            "L'événement a été supprimé de l'agenda de l'hôte."
+        );
+    }
+
+    /// Every email now carries the footer in its own language, and the
+    /// guest emails translated before #209 pick it up too.
+    #[test]
+    fn footer_is_translated() {
+        let html = render_html_email_in("nl", "Hoi,", "Body", "#000", &[], None, &[]);
+        assert!(html.contains("Verzonden door"));
+        assert!(!html.contains("Sent by"));
+        let details = BookingDetails {
+            guest_language: Some("it".to_string()),
+            ..sample_booking_details()
+        };
+        let mail = compose_guest_pending_notice(&details, None, None);
+        assert!(mail.html.contains("Inviato da"));
     }
 }

@@ -1096,9 +1096,10 @@ pub async fn drain_emails(timeout: std::time::Duration) {
 struct NewBookingEmails {
     smtp_config: crate::email::SmtpConfig,
     details: crate::email::BookingDetails,
-    /// Host-side recipients as (name, email). Collective team bookings list
-    /// every member; everything else lists the single host from `details`.
-    host_recipients: Vec<(String, String)>,
+    /// Host-side recipients as (name, email, language). Collective team
+    /// bookings list every member, each in their own language; everything
+    /// else lists the single host from `details`.
+    host_recipients: Vec<(String, String, Option<String>)>,
     booking_id: String,
     needs_approval: bool,
     confirm_token: Option<String>,
@@ -1114,17 +1115,19 @@ struct NewBookingEmails {
 fn send_new_booking_emails(m: NewBookingEmails) {
     spawn_emails(async move {
         let uid = m.details.uid.as_str();
-        let host_details = |name: &str, email: &str| crate::email::BookingDetails {
-            host_name: name.to_string(),
-            host_email: email.to_string(),
-            ..m.details.clone()
-        };
+        let host_details =
+            |name: &str, email: &str, language: &Option<String>| crate::email::BookingDetails {
+                host_name: name.to_string(),
+                host_email: email.to_string(),
+                host_language: language.clone(),
+                ..m.details.clone()
+            };
         if m.needs_approval {
-            for (name, email) in &m.host_recipients {
+            for (name, email, language) in &m.host_recipients {
                 log_email_result(
                     crate::email::send_host_approval_request(
                         &m.smtp_config,
-                        &host_details(name, email),
+                        &host_details(name, email, language),
                         &m.booking_id,
                         m.confirm_token.as_deref(),
                         m.base_url.as_deref(),
@@ -1159,11 +1162,11 @@ fn send_new_booking_emails(m: NewBookingEmails) {
                 "guest_confirmation",
                 uid,
             );
-            for (name, email) in &m.host_recipients {
+            for (name, email, language) in &m.host_recipients {
                 log_email_result(
                     crate::email::send_host_notification(
                         &m.smtp_config,
-                        &host_details(name, email),
+                        &host_details(name, email, language),
                     )
                     .await,
                     "host_notification",
@@ -5291,8 +5294,8 @@ async fn cancel_booking(
         reason,
         cancelled_by_host: true,
         guest_language,
+        host_language: user.language.clone(),
         host_timezone: stored_tz.name().to_string(),
-        ..Default::default()
     };
 
     if let Ok(Some(smtp_config)) =
@@ -5540,6 +5543,9 @@ async fn confirm_booking(
                     .unwrap_or_else(|| user.email.clone()),
             )
         });
+    // The host email goes to the booking's host, who is not always the
+    // approver, so it is written in that host's own saved language.
+    let host_language = crate::email::user_language_by_email(&state.pool, &host_email).await;
 
     let details = crate::email::BookingDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
@@ -5560,6 +5566,7 @@ async fn confirm_booking(
         // The host clicked approve, so the request carries the host's
         // language; the guest's is the one stored with the booking (#209).
         guest_language,
+        host_language,
         host_timezone: stored_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
         ..Default::default()
@@ -8781,6 +8788,7 @@ async fn send_invite_bulk(
             if !invite_url.is_empty() {
                 let send_res = crate::email::send_invite_email(
                     cfg,
+                    auth_user.lang,
                     &name,
                     &email,
                     &et_title,
@@ -11685,9 +11693,12 @@ async fn handle_group_booking(
         reminder_minutes: reminder_min,
         additional_attendees: additional_attendees.clone(),
         guest_language: Some(lang.to_string()),
+        host_language: match assigned_user_id.as_deref() {
+            Some(member) => crate::email::user_language(&state.pool, member).await,
+            None => None,
+        },
         host_timezone: host_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
-        ..Default::default()
     };
 
     // For confirmed bookings, push to CalDAV and notify watchers regardless of
@@ -11743,13 +11754,19 @@ async fn handle_group_booking(
 
         // Collective: every member is a host and gets the host-side email;
         // the guest-facing emails keep the joined team contact (#147).
-        let host_recipients: Vec<(String, String)> = if is_collective {
-            member_contacts
-                .iter()
-                .map(|(_, name, email)| (name.clone(), email.clone()))
-                .collect()
+        let host_recipients = if is_collective {
+            let mut recipients = Vec::with_capacity(member_contacts.len());
+            for (member_id, name, email) in &member_contacts {
+                let language = crate::email::user_language(&state.pool, member_id).await;
+                recipients.push((name.clone(), email.clone(), language));
+            }
+            recipients
         } else {
-            vec![(details.host_name.clone(), details.host_email.clone())]
+            vec![(
+                details.host_name.clone(),
+                details.host_email.clone(),
+                details.host_language.clone(),
+            )]
         };
 
         send_new_booking_emails(NewBookingEmails {
@@ -12733,9 +12750,9 @@ async fn handle_dynamic_group_booking(
         reminder_minutes: reminder_min,
         additional_attendees: all_additional.clone(),
         guest_language: Some(lang.to_string()),
+        host_language: crate::email::user_language(&state.pool, &owner_user_id).await,
         host_timezone: host_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
-        ..Default::default()
     };
 
     // Push confirmed bookings to the owner's CalDAV regardless of SMTP.
@@ -12775,7 +12792,11 @@ async fn handle_dynamic_group_booking(
             )
         });
 
-        let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+        let host_recipients = vec![(
+            details.host_name.clone(),
+            details.host_email.clone(),
+            details.host_language.clone(),
+        )];
         send_new_booking_emails(NewBookingEmails {
             smtp_config,
             details,
@@ -13696,9 +13717,12 @@ async fn handle_booking_for_user(
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
+            host_language: match host_user_id.as_deref() {
+                Some(id) => crate::email::user_language(&state.pool, id).await,
+                None => None,
+            },
             host_timezone: host_tz.name().to_string(),
             resource_name: booking_resource_label(&state.pool, &uid).await,
-            ..Default::default()
         };
 
         // Push confirmed bookings to CalDAV regardless of SMTP availability.
@@ -13732,7 +13756,11 @@ async fn handle_booking_for_user(
                 )
             });
 
-            let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+            let host_recipients = vec![(
+                details.host_name.clone(),
+                details.host_email.clone(),
+                details.host_language.clone(),
+            )];
             send_new_booking_emails(NewBookingEmails {
                 smtp_config,
                 details,
@@ -16494,9 +16522,12 @@ async fn handle_booking(
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
+            host_language: match host_user_id.as_deref() {
+                Some(id) => crate::email::user_language(&state.pool, id).await,
+                None => None,
+            },
             host_timezone: host_tz.name().to_string(),
             resource_name: booking_resource_label(&state.pool, &uid).await,
-            ..Default::default()
         };
 
         // Push confirmed bookings to CalDAV regardless of SMTP availability.
@@ -16530,7 +16561,11 @@ async fn handle_booking(
                 )
             });
 
-            let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+            let host_recipients = vec![(
+                details.host_name.clone(),
+                details.host_email.clone(),
+                details.host_language.clone(),
+            )];
             send_new_booking_emails(NewBookingEmails {
                 smtp_config,
                 details,
@@ -20310,6 +20345,7 @@ async fn approve_booking_by_token(
     .await;
 
     let guest_language = crate::email::stored_booking_language(&state.pool, &bid).await;
+    let host_language = crate::email::user_language_by_email(&state.pool, &host_email).await;
 
     let details = crate::email::BookingDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
@@ -20331,6 +20367,7 @@ async fn approve_booking_by_token(
         // well be browsing in another one, so this comes from the booking row
         // rather than from the approver's Accept-Language.
         guest_language,
+        host_language,
         host_timezone: stored_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
         ..Default::default()
@@ -21040,6 +21077,7 @@ async fn guest_cancel_booking(
     let date_label = format_date_label(&date, lang);
 
     let reason = form.reason.filter(|r| !r.trim().is_empty());
+    let host_language = crate::email::user_language_by_email(&state.pool, &host_email).await;
 
     // Built before the SMTP block so the SMS path can borrow the same strings.
     let details = crate::email::CancellationDetails {
@@ -21059,8 +21097,8 @@ async fn guest_cancel_booking(
         // Guest is the one cancelling; their browser language now is the
         // best signal we have (they chose this language to view the form).
         guest_language: Some(lang.to_string()),
+        host_language,
         host_timezone: stored_tz.name().to_string(),
-        ..Default::default()
     };
 
     // Send cancellation emails
@@ -21842,6 +21880,12 @@ async fn guest_reschedule_booking(
             )
         }
     };
+    // Each side reads the emails below in their own language: the host in
+    // their saved one, the guest in the one stored with the booking (#209).
+    let host_language = crate::email::user_language_by_email(&state.pool, &host_email).await;
+    let booking_language = crate::email::stored_booking_language(&state.pool, &booking_id)
+        .await
+        .or_else(|| Some(lang.to_string()));
 
     // Legacy values use the event-type timezone; new values are UTC. Convert into the
     // guest's tz so `RescheduleDetails` carries guest-local wall-clock for
@@ -21899,6 +21943,8 @@ async fn guest_reschedule_booking(
                 uid: uid.clone(),
                 location: loc_value.clone(),
                 host_timezone: host_tz.name().to_string(),
+                guest_language: booking_language.clone(),
+                host_language: host_language.clone(),
             };
 
             // Send guest pending notice with new tokens
@@ -21932,9 +21978,7 @@ async fn guest_reschedule_booking(
                 location: loc_value,
                 reminder_minutes: None,
                 additional_attendees: vec![],
-                guest_language: crate::email::stored_booking_language(&state.pool, &booking_id)
-                    .await
-                    .or_else(|| Some(lang.to_string())),
+                guest_language: booking_language,
                 host_timezone: host_tz.name().to_string(),
                 resource_name: booking_resource_label(&state.pool, &uid).await,
                 ..Default::default()
@@ -21985,6 +22029,8 @@ async fn guest_reschedule_booking(
             location: loc_value.clone(),
             reminder_minutes: None,
             additional_attendees: vec![],
+            guest_language: booking_language.clone(),
+            host_language: host_language.clone(),
             host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
@@ -22035,6 +22081,8 @@ async fn guest_reschedule_booking(
                 uid,
                 location: loc_value,
                 host_timezone: host_tz.name().to_string(),
+                guest_language: booking_language,
+                host_language,
             };
             spawn_emails(async move {
                 let uid = reschedule_details.uid.as_str();
@@ -22294,6 +22342,9 @@ async fn host_reschedule_booking(
             location: None,
             reminder_minutes: None,
             additional_attendees: vec![],
+            // The host asked for this, but the email is the guest's: written
+            // in the language they booked in (#209).
+            guest_language: crate::email::stored_booking_language(&state.pool, &bid).await,
             host_timezone: host_tz.name().to_string(),
             ..Default::default()
         };
@@ -22783,8 +22834,15 @@ async fn notify_host_meet_time_desync(
     let reason: String = reason.chars().take(300).collect();
     match crate::email::load_smtp_config(pool, key).await {
         Ok(Some(smtp)) => {
+            // The details come from the CalDAV push path, which does not
+            // carry the host's language: look it up for this email (#209).
+            let mut details = details.clone();
+            if details.host_language.is_none() {
+                details.host_language =
+                    crate::email::user_language_by_email(pool, &details.host_email).await;
+            }
             if let Err(e) =
-                crate::email::send_host_calendar_sync_failure(&smtp, details, &reason).await
+                crate::email::send_host_calendar_sync_failure(&smtp, &details, &reason).await
             {
                 tracing::error!(
                     error = %e,
@@ -23650,12 +23708,13 @@ async fn notify_watchers(
 
     // Claim tokens are written here, in the request; the emails carrying them
     // go out in the background so a slow relay cannot stall the booking.
-    let mut outgoing: Vec<(String, String, String)> = Vec::new();
+    // Each watcher reads the offer in their own saved language (#209).
+    let mut outgoing: Vec<(String, String, Option<String>, String)> = Vec::new();
 
     for (team_id,) in &watcher_team_ids {
         // Get all members of the watcher team
-        let members: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT u.id, u.name, COALESCE(u.booking_email, u.email) \
+        let members: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT u.id, u.name, COALESCE(u.booking_email, u.email), u.language \
              FROM users u JOIN team_members tm ON tm.user_id = u.id \
              WHERE tm.team_id = ? AND u.enabled = 1",
         )
@@ -23664,7 +23723,7 @@ async fn notify_watchers(
         .await
         .unwrap_or_default();
 
-        for (user_id, user_name, user_email) in &members {
+        for (user_id, user_name, user_email, user_language) in &members {
             let token = uuid::Uuid::new_v4().to_string();
             let token_id = uuid::Uuid::new_v4().to_string();
 
@@ -23687,7 +23746,12 @@ async fn notify_watchers(
                 token
             );
 
-            outgoing.push((user_name.clone(), user_email.clone(), claim_url));
+            outgoing.push((
+                user_name.clone(),
+                user_email.clone(),
+                user_language.clone(),
+                claim_url,
+            ));
         }
     }
 
@@ -23701,13 +23765,14 @@ async fn notify_watchers(
     let details = details.clone();
     let assigned_to_name = assigned_to_name.to_string();
     spawn_emails(async move {
-        for (user_name, user_email, claim_url) in &outgoing {
+        for (user_name, user_email, user_language, claim_url) in &outgoing {
             log_email_result(
                 crate::email::send_watcher_claim_notification(
                     &smtp_config,
                     &details,
                     user_name,
                     user_email,
+                    user_language.as_deref(),
                     &assigned_to_name,
                     claim_url,
                 )
@@ -24116,6 +24181,7 @@ async fn claim_booking(
         let details = details.clone();
         let claimant_name = claimant_name.clone();
         let claimant_email = claimant_email.clone();
+        let claimant_language = crate::email::user_language(&state.pool, &claimant_user_id).await;
         spawn_emails(async move {
             log_email_result(
                 crate::email::send_claim_confirmation(
@@ -24123,6 +24189,7 @@ async fn claim_booking(
                     &details,
                     &claimant_name,
                     &claimant_email,
+                    claimant_language.as_deref(),
                 )
                 .await,
                 "claim_confirmation",
@@ -37059,5 +37126,216 @@ mod tests {
 
         let body = body_string(app.oneshot(get("/auth/login")).await.unwrap()).await;
         assert!(body.contains("<html lang=\"en\">"), "{body}");
+    }
+
+    // --- #209: host, member and watcher emails follow each recipient's language ---
+
+    async fn set_user_language(pool: &SqlitePool, email: &str, language: &str) {
+        sqlx::query("UPDATE users SET language = ? WHERE email = ?")
+            .bind(language)
+            .bind(email)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The host reads the new-booking email in their saved language, the
+    /// guest in the one they booked in. The legacy route takes the page
+    /// language from `Accept-Language` alone, so the two differ here.
+    #[tokio::test]
+    async fn new_booking_emails_the_host_in_their_saved_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        set_user_language(&pool, "test@example.com", "fr").await;
+
+        let csrf = "csrf-209-host-lang";
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/test-meeting/book",
+                csrf,
+                &book_body(csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+
+        let host = mail_to(&mails, "test@example.com").await;
+        assert!(host.contains("Nouvelle réservation !"), "{host}");
+        assert!(
+            host.contains("Guest a réservé un créneau avec vous."),
+            "{host}"
+        );
+        assert!(host.contains("<html lang=\"fr\">"), "{host}");
+        assert!(!host.contains("booked a slot"), "{host}");
+
+        let guest = mail_to(&mails, "guest@test.com").await;
+        assert!(guest.contains("Hi Guest,"), "{guest}");
+        assert!(guest.contains("<html lang=\"en\">"), "{guest}");
+        assert!(!guest.contains("Bonjour"), "{guest}");
+    }
+
+    /// Collective team bookings email every member, each in their own
+    /// language.
+    #[tokio::test]
+    async fn collective_booking_emails_each_member_in_their_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        let (team_id, team_et_id) = seed_team_event_type(&pool).await;
+        sqlx::query("UPDATE event_types SET scheduling_mode = 'collective' WHERE id = ?")
+            .bind(&team_et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bob = insert_role_user(&pool, "bob@test.com", "user").await;
+        sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
+            .bind(&team_id)
+            .bind(&bob)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // insert_role_user names users after their address, which is not a
+        // valid display name in a To: header.
+        sqlx::query("UPDATE users SET name = 'Bob' WHERE id = ?")
+            .bind(&bob)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_user_language(&pool, "test@example.com", "fr").await;
+        set_user_language(&pool, "bob@test.com", "de").await;
+
+        let csrf = "csrf-209-collective";
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/team/horizon-team/team-sync/book",
+                csrf,
+                &book_body(csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+
+        let alice = mail_to(&mails, "test@example.com").await;
+        assert!(alice.contains("Nouvelle réservation !"), "{alice}");
+        assert!(alice.contains("<html lang=\"fr\">"), "{alice}");
+        let bob_mail = mail_to(&mails, "bob@test.com").await;
+        assert!(bob_mail.contains("Neue Buchung!"), "{bob_mail}");
+        assert!(bob_mail.contains("<html lang=\"de\">"), "{bob_mail}");
+        assert!(!bob_mail.contains("Nouvelle"), "{bob_mail}");
+    }
+
+    /// A guest rescheduling from a browser in another language still gets
+    /// the update in the language stored with the booking; the host gets
+    /// theirs in their own.
+    #[tokio::test]
+    async fn reschedule_emails_follow_the_booking_and_host_languages() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        set_user_language(&pool, "test@example.com", "de").await;
+        let cancel_tok = uuid::Uuid::new_v4().to_string();
+        let resched_tok = uuid::Uuid::new_v4().to_string();
+        let booking_id = insert_booking_at(
+            &pool,
+            &et_id,
+            &cancel_tok,
+            &resched_tok,
+            chrono::Duration::hours(48),
+        )
+        .await;
+        sqlx::query("UPDATE bookings SET language = 'fr' WHERE id = ?")
+            .bind(&booking_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "csrf-209-resched";
+        let body = format!(
+            "_csrf={}&date={}&time=10:00&tz=UTC",
+            csrf,
+            far_future_monday()
+        );
+        let response = app
+            .oneshot(post_form_unauthed(
+                &format!("/booking/reschedule/{}", resched_tok),
+                csrf,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+
+        let guest = mail_to(&mails, "guest@test.com").await;
+        assert!(
+            guest.contains("Votre réservation a été reprogrammée par"),
+            "{guest}"
+        );
+        assert!(guest.contains("<html lang=\"fr\">"), "{guest}");
+        assert!(!guest.contains("has been rescheduled"), "{guest}");
+
+        let host = mail_to(&mails, "test@example.com").await;
+        assert!(host.contains("Buchung bestätigt"), "{host}");
+        assert!(host.contains("<html lang=\"de\">"), "{host}");
+    }
+
+    /// Watchers get the claim offer in their own saved language.
+    #[tokio::test]
+    async fn watcher_claim_email_is_in_the_watcher_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let _vars = crate::test_support::EnvGuard::new();
+        std::env::set_var("CALRS_BASE_URL", "https://cal.test");
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+
+        let watcher_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled, language) VALUES (?, 'watcher@test.com', 'Watcher', 'user', 'local', 'watcher', 1, 'de')")
+            .bind(&watcher_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let team_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO teams (id, name, slug, visibility) VALUES (?, 'Sales', 'sales', 'public')",
+        )
+        .bind(&team_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
+            .bind(&team_id)
+            .bind(&watcher_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO event_type_watchers (event_type_id, team_id) VALUES (?, ?)")
+            .bind(&et_id)
+            .bind(&team_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-209-watch").await;
+
+        let csrf = "test-csrf-209-watch";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let mail = mail_to(&mails, "watcher@test.com").await;
+        assert!(mail.contains("Hallo Watcher,"), "{mail}");
+        assert!(mail.contains("<html lang=\"de\">"), "{mail}");
+        assert!(mail.contains("Diese Buchung übernehmen"), "{mail}");
+        assert!(!mail.contains("available to claim"), "{mail}");
     }
 }
