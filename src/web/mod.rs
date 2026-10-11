@@ -698,6 +698,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 host_email: host_email.clone(),
                 uid: uid.clone(),
                 notes: None,
+                guest_phone: None,
                 location,
                 reminder_minutes: None,
                 additional_attendees: vec![],
@@ -2238,12 +2239,15 @@ async fn dashboard_bookings(
         String,
         String,
         String,
+        Option<String>,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title,
                 COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                 COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                 COALESCE(r.name, '') AS resource_name,
-                COALESCE(b.notes, '') AS notes
+                COALESCE(b.notes, '') AS notes,
+                b.guest_phone, et.sms_phone_mode
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2334,13 +2338,29 @@ async fn dashboard_bookings(
     let pending_ctx: Vec<minijinja::Value> = pending_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, stored_tz, guest_tz, resource_name, notes)| {
+            |(
+                id,
+                name,
+                email,
+                start,
+                end,
+                title,
+                stored_tz,
+                guest_tz,
+                resource_name,
+                notes,
+                phone,
+                sms_phone_mode,
+            )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
                     id => id,
                     guest_name => name,
                     guest_email => email,
+                    // Shown while pending too: the host may need to call the
+                    // guest before deciding (#231).
+                    guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },
                     start_at => primary,
                     start_at_guest => secondary,
                     event_title => title,
@@ -10977,6 +10997,7 @@ async fn handle_group_booking(
         host_email: host_email.clone(),
         uid: uid.clone(),
         notes: form.notes.clone(),
+        guest_phone: phone_to_store.clone(),
         location: location_display.clone(),
         reminder_minutes: reminder_min,
         additional_attendees: additional_attendees.clone(),
@@ -12020,6 +12041,7 @@ async fn handle_dynamic_group_booking(
         host_email: owner_email,
         uid: uid.clone(),
         notes: form.notes.clone(),
+        guest_phone: phone_to_store.clone(),
         location: location_display.clone(),
         reminder_minutes: reminder_min,
         additional_attendees: all_additional.clone(),
@@ -12978,6 +13000,7 @@ async fn handle_booking_for_user(
             host_email,
             uid: uid.clone(),
             notes: form.notes.clone(),
+            guest_phone: phone_to_store.clone(),
             location: location_display.clone(),
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
@@ -15623,6 +15646,7 @@ async fn handle_booking(
             host_email,
             uid: uid.clone(),
             notes: form.notes.clone(),
+            guest_phone: phone_to_store.clone(),
             location: location_display,
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
@@ -33993,6 +34017,91 @@ mod tests {
             body.contains("Phone Guest") && body.contains("+15550000001"),
             "Upcoming booking should display the guest phone number when SMS is enabled"
         );
+    }
+
+    /// The phone shows on pending requests too: the host may need to call
+    /// the guest before approving (#231).
+    #[tokio::test]
+    async fn dashboard_bookings_shows_guest_phone_while_pending() {
+        let (app, pool, session, et_id) = setup_test_app().await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token, guest_phone) VALUES (?, ?, 'uid-phone-pending', 'Pending Guest', 'pending-phone@test.com', 'UTC', '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'pending', ?, ?, 'confirm-phone-pending', '+15550000002')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/dashboard/bookings", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(
+            body.contains("Pending Guest") && body.contains("+15550000002"),
+            "a pending request should display the guest phone"
+        );
+
+        // Not collected any more: the stored number is not shown.
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'off' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(get_authed("/dashboard/bookings", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Pending Guest") && !body.contains("+15550000002"));
+    }
+
+    /// The host's approval-request email carries the guest phone (#231).
+    #[tokio::test]
+    async fn approval_request_email_includes_the_guest_phone() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional', requires_confirmation = 1 WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sms_config (id, provider, api_secret_enc, sender, default_country_code) \
+             VALUES ('cfg', 'sevenio', 'x', 'calrs', '+33')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let base = chrono::Utc::now() + chrono::Duration::days(3);
+        let csrf = "test-csrf-231-email";
+        let form = format!(
+            "_csrf={}&date={}&time=10%3A00&name=Phone+Guest&email=phone-guest%40test.com&notes=&phone=06+12+34+56+78",
+            csrf,
+            base.format("%Y-%m-%d")
+        );
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &form,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+
+        let mail = mail_to(&mails, "test@example.com").await;
+        assert!(mail.contains("+33612345678"), "{mail}");
     }
 
     // --- Invalid date in booking ---

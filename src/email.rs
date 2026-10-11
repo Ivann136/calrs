@@ -167,6 +167,9 @@ pub struct BookingDetails {
     pub host_email: String,
     pub uid: String,
     pub notes: Option<String>,
+    /// Guest phone in E.164, only when the event type collects one. Shown in
+    /// the host approval request so the host can call before deciding (#231).
+    pub guest_phone: Option<String>,
     pub location: Option<String>,
     pub reminder_minutes: Option<i32>,
     pub additional_attendees: Vec<String>,
@@ -1971,7 +1974,7 @@ pub async fn send_host_approval_request(
          Date: {}\n\
          Time: {}\n\
          Guest: {} <{}>\n\
-         {}{}\n\
+         {}{}{}\n\
          {}\n\n\
          \u{2014} calrs",
         details.event_title,
@@ -1979,6 +1982,11 @@ pub async fn send_host_approval_request(
         time_display,
         details.guest_name,
         details.guest_email,
+        details
+            .guest_phone
+            .as_ref()
+            .map(|p| format!("Phone: {}\n", p))
+            .unwrap_or_default(),
         details
             .location
             .as_ref()
@@ -2010,6 +2018,12 @@ pub async fn send_host_approval_request(
             value: format!("{} <{}>", details.guest_name, details.guest_email),
         },
     ];
+    if let Some(phone) = &details.guest_phone {
+        rows.push(EmailRow {
+            label: "Phone".to_string(),
+            value: phone.clone(),
+        });
+    }
     if let Some(loc) = &details.location {
         rows.push(EmailRow {
             label: "Location".to_string(),
