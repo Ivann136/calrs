@@ -17976,25 +17976,15 @@ async fn admin_dashboard(
         version => env!("CARGO_PKG_VERSION"),
     };
 
-    let captcha_cfg = state.captcha_config.read().await;
-    let captcha_configured = captcha_cfg.is_some();
-    let captcha_instance_url = captcha_cfg
-        .as_ref()
-        .map(|c| c.instance_url.clone())
-        .unwrap_or_default();
-    let captcha_site_key = captcha_cfg
-        .as_ref()
-        .map(|c| c.site_key.clone())
-        .unwrap_or_default();
-    let captcha_widget_url = captcha_cfg
-        .as_ref()
-        .map(|c| c.widget_url.clone())
-        .unwrap_or_else(|| captcha::DEFAULT_WIDGET_URL.to_string());
-    let captcha_wasm_url = captcha_cfg
-        .as_ref()
-        .and_then(|c| c.wasm_url.clone())
-        .unwrap_or_default();
-    drop(captcha_cfg);
+    let captcha_configured = state.captcha_config.read().await.is_some();
+    // The form shows what is stored, not the active config, which is `None`
+    // while the configuration is incomplete.
+    let captcha::CaptchaFormValues {
+        instance_url: captcha_instance_url,
+        site_key: captcha_site_key,
+        widget_url: captcha_widget_url,
+        wasm_url: captcha_wasm_url,
+    } = captcha::load_captcha_form_values(&state.pool).await;
 
     let meeting_cfg = state.meeting_config.read().await;
     let jitsi_configured = meeting_cfg.jitsi.is_some();
@@ -32877,6 +32867,49 @@ mod tests {
             stored().await.as_deref(),
             Some("https://cap.example.com/assets/cap_wasm_bg.wasm")
         );
+    }
+
+    #[tokio::test]
+    async fn admin_captcha_form_shows_stored_values_while_incomplete() {
+        let (app, pool, session, _) = setup_test_app().await;
+        // No secret, so the captcha is not active, but the URLs are stored.
+        sqlx::query(
+            "UPDATE auth_config SET captcha_instance_url = 'https://cap.example.com', \
+             captcha_site_key = 'site-123', captcha_secret = NULL, \
+             captcha_widget_url = 'https://cdn.example.com/widget.js', \
+             captcha_wasm_url = 'https://cdn.example.com/cap_wasm_bg.wasm' \
+             WHERE id = 'singleton'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(get_authed("/dashboard/admin", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_string(response).await;
+        for (field, value) in [
+            ("captcha_instance_url", "https://cap.example.com"),
+            ("captcha_site_key", "site-123"),
+            ("captcha_widget_url", "https://cdn.example.com/widget.js"),
+            (
+                "captcha_wasm_url",
+                "https://cdn.example.com/cap_wasm_bg.wasm",
+            ),
+        ] {
+            let input = body
+                .split("<input")
+                .find(|tag| tag.contains(&format!("name=\"{field}\"")))
+                .unwrap_or_else(|| panic!("no {field} input"));
+            // minijinja escapes '/' in attribute values.
+            let escaped = value.replace('/', "&#x2f;");
+            assert!(
+                input.contains(&format!("value=\"{escaped}\"")),
+                "{field} lost its stored value: {input}"
+            );
+        }
     }
 
     #[tokio::test]
