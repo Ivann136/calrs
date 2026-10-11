@@ -17976,25 +17976,15 @@ async fn admin_dashboard(
         version => env!("CARGO_PKG_VERSION"),
     };
 
-    let captcha_cfg = state.captcha_config.read().await;
-    let captcha_configured = captcha_cfg.is_some();
-    let captcha_instance_url = captcha_cfg
-        .as_ref()
-        .map(|c| c.instance_url.clone())
-        .unwrap_or_default();
-    let captcha_site_key = captcha_cfg
-        .as_ref()
-        .map(|c| c.site_key.clone())
-        .unwrap_or_default();
-    let captcha_widget_url = captcha_cfg
-        .as_ref()
-        .map(|c| c.widget_url.clone())
-        .unwrap_or_else(|| captcha::DEFAULT_WIDGET_URL.to_string());
-    let captcha_wasm_url = captcha_cfg
-        .as_ref()
-        .and_then(|c| c.wasm_url.clone())
-        .unwrap_or_default();
-    drop(captcha_cfg);
+    let captcha_configured = state.captcha_config.read().await.is_some();
+    // The form shows what is stored, not the active config, which is `None`
+    // while the configuration is incomplete.
+    let captcha::CaptchaFormValues {
+        instance_url: captcha_instance_url,
+        site_key: captcha_site_key,
+        widget_url: captcha_widget_url,
+        wasm_url: captcha_wasm_url,
+    } = captcha::load_captcha_form_values(&state.pool).await;
 
     let meeting_cfg = state.meeting_config.read().await;
     let jitsi_configured = meeting_cfg.jitsi.is_some();
@@ -20865,7 +20855,7 @@ async fn decline_booking_by_token(
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
-             JOIN users u ON u.id = a.user_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
              WHERE b.confirm_token = ? AND b.status = 'pending'",
     )
     .bind(&token)
@@ -20929,9 +20919,9 @@ async fn decline_booking_by_token(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        // The query above joins the event type's owner; the guest's email
-        // names the host they booked with, which is also its sender and
-        // Reply-To (#221).
+        // The guest's email names the host they booked with, which is also
+        // its sender and Reply-To (#221). The query above (assigned member,
+        // else owner) is only the fallback.
         let booking_uid: Option<String> =
             sqlx::query_scalar("SELECT uid FROM bookings WHERE id = ?")
                 .bind(&bid)
@@ -21040,7 +21030,7 @@ async fn fetch_notice_min_and_host_email(
          FROM bookings b \
          JOIN event_types et ON et.id = b.event_type_id \
          JOIN accounts a ON a.id = et.account_id \
-         JOIN users u ON u.id = a.user_id \
+         JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id) \
          WHERE b.{tok} = ?",
         notice = notice_column,
         tok = booking_token_column
@@ -21222,7 +21212,7 @@ async fn guest_cancel_form(
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
-             JOIN users u ON u.id = a.user_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
              WHERE b.cancel_token = ? AND b.status IN ('confirmed', 'pending')",
     )
     .bind(&token)
@@ -21320,7 +21310,7 @@ async fn guest_cancel_booking(
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
-             JOIN users u ON u.id = a.user_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
              WHERE b.cancel_token = ? AND b.status IN ('confirmed', 'pending')",
         )
         .bind(&token)
@@ -21462,10 +21452,13 @@ async fn guest_cancel_booking(
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
         let details = details.clone();
-        // The query above joins the event type's owner. The guest's copy
-        // names the host they booked with (assigned member, or the joined
-        // roster and ICS organizer for a collective booking), which is also
-        // its sender and Reply-To (#221).
+        // The query above joins the assigned member, or the event type owner
+        // when there is none: that is who gets the host notice, in their
+        // language. A collective booking has no assigned member, so its
+        // notice still goes to the owner alone. The guest's copy names the
+        // host they booked with (assigned member, or the joined roster and
+        // ICS organizer for a collective booking), which is also its sender
+        // and Reply-To (#221).
         let guest_details = match booking_host_identity(&state.pool, &details.uid).await {
             Some((host_name, host_email, _)) => crate::email::CancellationDetails {
                 host_name,
@@ -32880,6 +32873,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_captcha_form_shows_stored_values_while_incomplete() {
+        let (app, pool, session, _) = setup_test_app().await;
+        // No secret, so the captcha is not active, but the URLs are stored.
+        sqlx::query(
+            "UPDATE auth_config SET captcha_instance_url = 'https://cap.example.com', \
+             captcha_site_key = 'site-123', captcha_secret = NULL, \
+             captcha_widget_url = 'https://cdn.example.com/widget.js', \
+             captcha_wasm_url = 'https://cdn.example.com/cap_wasm_bg.wasm' \
+             WHERE id = 'singleton'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(get_authed("/dashboard/admin", &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_string(response).await;
+        for (field, value) in [
+            ("captcha_instance_url", "https://cap.example.com"),
+            ("captcha_site_key", "site-123"),
+            ("captcha_widget_url", "https://cdn.example.com/widget.js"),
+            (
+                "captcha_wasm_url",
+                "https://cdn.example.com/cap_wasm_bg.wasm",
+            ),
+        ] {
+            let input = body
+                .split("<input")
+                .find(|tag| tag.contains(&format!("name=\"{field}\"")))
+                .unwrap_or_else(|| panic!("no {field} input"));
+            // minijinja escapes '/' in attribute values.
+            let escaped = value.replace('/', "&#x2f;");
+            assert!(
+                input.contains(&format!("value=\"{escaped}\"")),
+                "{field} lost its stored value: {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_captcha_inputs_are_labelled() {
+        let (app, _, session, _) = setup_test_app().await;
+        let response = app
+            .oneshot(get_authed("/dashboard/admin", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        for field in [
+            "captcha_instance_url",
+            "captcha_site_key",
+            "captcha_secret",
+            "captcha_widget_url",
+            "captcha_wasm_url",
+        ] {
+            assert_eq!(
+                body.matches(&format!("id=\"{field}\"")).count(),
+                1,
+                "{field} needs exactly one id"
+            );
+            assert!(
+                body.contains(&format!("<label for=\"{field}\">")),
+                "{field} has no label pointing at it"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn admin_non_admin_gets_403() {
         let (app, pool, _, _) = setup_test_app().await;
 
@@ -37572,6 +37635,70 @@ mod tests {
         assert!(!mail.contains("Hi Guest,"), "{mail}");
     }
 
+    /// A guest cancelling a round-robin booking used to notify the event
+    /// type owner, who was not hosting it: the host notice now goes to the
+    /// assigned member, in the member's language, and the cancel page names
+    /// them too.
+    #[tokio::test]
+    async fn guest_cancel_notifies_the_assigned_member_not_the_owner() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+
+        let member_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled, language) \
+             VALUES (?, 'member@test.com', 'Morgan Member', 'user', 'local', 'morgan', 1, 'fr')",
+        )
+        .bind(&member_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cancel_tok = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, assigned_user_id, language) VALUES (?, ?, 'uid-rr-gcancel', 'Guest', 'guest@test.com', 'UTC', '2030-07-02T10:00:00', '2030-07-02T10:30:00', 'confirmed', ?, ?, ?, 'en')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(&cancel_tok)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&member_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get(&format!("/booking/cancel/{}", cancel_tok)))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Morgan Member"), "{body}");
+        assert!(!body.contains("Test User"), "{body}");
+
+        let csrf = "test-csrf-rr-gcancel";
+        let response = app
+            .oneshot(post_form_unauthed(
+                &format!("/booking/cancel/{}", cancel_tok),
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Both emails have arrived once these return.
+        mail_to(&mails, "guest@test.com").await;
+        let host_mail = mail_to(&mails, "member@test.com").await;
+        assert!(host_mail.contains("<html lang=\"fr\">"), "{host_mail}");
+        let to_owner = mails
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.rcpt.iter().any(|r| r.contains("test@example.com")))
+            .count();
+        assert_eq!(to_owner, 0, "the event type owner was not hosting it");
+    }
+
     /// A webhook SMS gateway on a local port that records each request and
     /// accepts it.
     async fn spawn_sms_webhook() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -37981,7 +38108,8 @@ mod tests {
             "{mail}"
         );
 
-        let host_mail = mail_to(&mails, "test@example.com").await;
+        // The host notice goes to Bob too, not to the owner.
+        let host_mail = mail_to(&mails, "bob.bookings@test.com").await;
         assert_eq!(
             mail_header(&host_mail, "From"),
             Some("noreply@test.com"),
