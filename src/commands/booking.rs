@@ -157,13 +157,17 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
             let conflicts: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
                 "SELECT e.start_at, e.end_at, e.summary, e.timezone FROM events e
                  JOIN calendars c ON c.id = e.calendar_id
-                 WHERE c.is_busy = 1
+                 JOIN caldav_sources cs ON cs.id = c.source_id
+                 JOIN accounts a ON a.id = cs.account_id
+                 WHERE a.user_id = (SELECT ha.user_id FROM event_types het
+                                    JOIN accounts ha ON ha.id = het.account_id WHERE het.id = ?)
+                   AND c.is_busy = 1
                    AND (NOT EXISTS (SELECT 1 FROM event_type_calendars WHERE event_type_id = ?)
                         OR c.id IN (SELECT calendar_id FROM event_type_calendars WHERE event_type_id = ?))
                    AND (e.status IS NULL OR e.status != 'CANCELLED')
                    AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')",
             )
-            .bind(&et_id).bind(&et_id)
+            .bind(&et_id).bind(&et_id).bind(&et_id)
             .fetch_all(pool)
             .await?;
 
@@ -185,10 +189,14 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
             }
 
             // Validate: no conflicts with existing bookings
-            let booking_conflicts: Vec<(String, String)> =
-                sqlx::query_as("SELECT CASE time_version WHEN 1 THEN start_at ELSE rtrim(start_at, 'Z') END AS start_at, CASE time_version WHEN 1 THEN end_at ELSE rtrim(end_at, 'Z') END AS end_at FROM bookings WHERE status = 'confirmed'")
-                    .fetch_all(pool)
-                    .await?;
+            // Only the host's own busy bookings, same rule as the web path.
+            let booking_conflicts = crate::commands::event_type::host_busy_bookings(
+                pool,
+                &et_id,
+                &buf_start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                &buf_end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            )
+            .await?;
 
             for (bs, be) in &booking_conflicts {
                 if let Some((s, e)) = crate::booking_time::busy_range(bs, be, host_tz) {
@@ -280,14 +288,14 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
             // Send email notifications if SMTP is configured
             if let Some(smtp_config) = crate::email::load_smtp_config(pool, key).await? {
                 // Fetch host info (name, booking email, timezone)
-                let host: Option<(String, String, Option<String>)> = sqlx::query_as(
-                    "SELECT u.name, COALESCE(u.booking_email, u.email), u.timezone FROM users u JOIN accounts a ON a.user_id = u.id WHERE a.id = (SELECT account_id FROM event_types WHERE id = ?)",
+                let host: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT u.name, COALESCE(u.booking_email, u.email), u.timezone, u.language FROM users u JOIN accounts a ON a.user_id = u.id WHERE a.id = (SELECT account_id FROM event_types WHERE id = ?)",
                 )
                 .bind(&et_id)
                 .fetch_optional(pool)
                 .await?;
 
-                if let Some((host_name, host_email, host_timezone)) = host {
+                if let Some((host_name, host_email, host_timezone, host_language)) = host {
                     let details = crate::email::BookingDetails {
                         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
                         event_title: et_title.clone(),
@@ -308,6 +316,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                         location: None,
                         reminder_minutes: None,
                         additional_attendees: vec![],
+                        host_language: crate::email::supported_language(host_language),
                         host_timezone: host_timezone.unwrap_or_default(),
                         ..Default::default()
                     };
@@ -452,8 +461,9 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
 
                     // Send cancellation emails
                     if let Some(smtp_config) = crate::email::load_smtp_config(pool, key).await? {
-                        let host: Option<(String, String, Option<String>)> = sqlx::query_as(
-                            "SELECT u.name, COALESCE(u.booking_email, u.email), u.timezone FROM users u
+                        let host: Option<(String, String, Option<String>, Option<String>)> =
+                            sqlx::query_as(
+                            "SELECT u.name, COALESCE(u.booking_email, u.email), u.timezone, u.language FROM users u
                              JOIN accounts a ON a.user_id = u.id
                              JOIN event_types et ON et.account_id = a.id
                              JOIN bookings b ON b.event_type_id = et.id
@@ -463,7 +473,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                         .fetch_optional(pool)
                         .await?;
 
-                        if let Some((host_name, host_email, host_timezone)) = host {
+                        if let Some((host_name, host_email, host_timezone, host_language)) = host {
                             let utc_times = crate::booking_time::ics_times(&start_at, &end_at);
                             let (start_at, end_at) = crate::booking_time::wall_strings(
                                 &start_at,
@@ -504,8 +514,8 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                                     pool, &full_id,
                                 )
                                 .await,
+                                host_language: crate::email::supported_language(host_language),
                                 host_timezone: host_timezone.unwrap_or_default(),
-                                ..Default::default()
                             };
 
                             print!(
@@ -825,5 +835,73 @@ mod tests {
             result.is_err(),
             "Double booking at the same time/event_type should be prevented by unique index"
         );
+    }
+
+    /// Give `account_id` a busy calendar holding one timed UTC event.
+    async fn seed_busy_event(pool: &SqlitePool, account_id: &str, start: &str, end: &str) {
+        let source_id = Uuid::new_v4().to_string();
+        let cal_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username) VALUES (?, ?, 'S', 'https://x/dav', 'u')")
+            .bind(&source_id)
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, is_busy) VALUES (?, ?, ?, 'C', 1)")
+            .bind(&cal_id)
+            .bind(&source_id)
+            .bind(format!("/c/{cal_id}/"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at, all_day, timezone, status, transp) VALUES (?, ?, ?, 'Busy', ?, ?, 0, 'UTC', 'CONFIRMED', 'OPAQUE')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&cal_id)
+            .bind(Uuid::new_v4().to_string())
+            .bind(start)
+            .bind(end)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn create_at(time: &str, email: &str) -> BookingCommands {
+        BookingCommands::Create {
+            slug: "test-meeting".into(),
+            date: Some("2030-03-18".into()),
+            time: Some(time.into()),
+            name: Some("Guest".into()),
+            email: Some(email.into()),
+            timezone: "UTC".into(),
+            notes: None,
+        }
+    }
+
+    /// Another user's calendar used to block every host's bookings: the
+    /// conflict check read all busy calendars on the instance.
+    #[tokio::test]
+    async fn create_ignores_other_users_calendar_events() {
+        let pool = setup_db().await;
+        let (_user_id, host_account, _et_id) = seed_event_type(&pool).await;
+        sqlx::raw_sql(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled)
+                 VALUES ('other', 'other@test.com', 'Other', 'user', 'local', 'other', 1);
+             INSERT INTO accounts (id, name, email, timezone, user_id)
+                 VALUES ('acc-other', 'Other', 'other@test.com', 'UTC', 'other');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Monday 2030-03-18: someone else is busy at 10:00, the host at 11:00.
+        seed_busy_event(&pool, "acc-other", "20300318T100000", "20300318T103000").await;
+        seed_busy_event(&pool, &host_account, "20300318T110000", "20300318T113000").await;
+
+        run(&pool, &[0u8; 32], create_at("10:00", "free@test.com"))
+            .await
+            .expect("another user's event must not block the host");
+        let err = run(&pool, &[0u8; 32], create_at("11:00", "busy@test.com"))
+            .await
+            .expect_err("the host's own event still blocks");
+        assert!(err.to_string().contains("Conflict"), "{err}");
     }
 }

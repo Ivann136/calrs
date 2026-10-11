@@ -1014,9 +1014,11 @@ async fn cancel_orphaned_booking(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, COALESCE(b.guest_timezone, 'UTC'), CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.uid,
-                et.title, u.name, COALESCE(u.booking_email, u.email), b.caldav_calendar_href, u.timezone
+                et.title, u.name, COALESCE(u.booking_email, u.email), b.caldav_calendar_href, u.timezone,
+                u.language
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -1050,7 +1052,9 @@ async fn cancel_orphaned_booking(
         host_email,
         caldav_calendar_href,
         host_timezone,
+        host_language,
     ) = booking;
+    let host_language = crate::email::supported_language(host_language);
 
     // Confirm-before-cancel: if we have a client and a stored calendar href for
     // this booking, verify that the resource is actually 404 on the server.
@@ -1120,6 +1124,8 @@ async fn cancel_orphaned_booking(
     let start_time = extract_time(&start_at);
     let end_time = extract_time(&end_at);
 
+    // The guest and the host each read the reason in their own language.
+    let guest_language = crate::email::stored_booking_language(pool, &booking_id).await;
     let details = crate::email::CancellationDetails {
         utc_times,
         event_title,
@@ -1132,11 +1138,20 @@ async fn cancel_orphaned_booking(
         host_name,
         host_email,
         uid: booking_uid,
-        reason: Some("The calendar event was deleted by the host.".to_string()),
+        reason: Some(crate::email::calendar_deleted_reason(
+            guest_language.as_deref(),
+        )),
         cancelled_by_host: true,
-        guest_language: crate::email::stored_booking_language(pool, &booking_id).await,
+        guest_language,
         host_timezone: host_timezone.unwrap_or_default(),
         ..Default::default()
+    };
+    let host_details = crate::email::CancellationDetails {
+        reason: Some(crate::email::calendar_deleted_reason(
+            host_language.as_deref(),
+        )),
+        host_language,
+        ..details.clone()
     };
 
     if let Err(e) = crate::email::send_guest_cancellation(&smtp_config, &details).await {
@@ -1145,7 +1160,7 @@ async fn cancel_orphaned_booking(
             "failed to send external cancellation email to guest"
         );
     }
-    if let Err(e) = crate::email::send_host_cancellation(&smtp_config, &details).await {
+    if let Err(e) = crate::email::send_host_cancellation(&smtp_config, &host_details).await {
         tracing::warn!(
             error = format!("{e:#}"),
             "failed to send external cancellation email to host"

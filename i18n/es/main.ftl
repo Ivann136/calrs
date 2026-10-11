@@ -527,6 +527,11 @@ settings-timezone-help = Tus reglas de disponibilidad y tus horas de reserva se 
 settings-language = Idioma
 settings-language-auto = Automático (idioma del navegador)
 settings-language-help = Elige un idioma de la interfaz, o déjalo en Automático para seguir el ajuste de tu navegador.
+settings-public-page-language = Idioma de las páginas de reserva públicas
+settings-public-page-language-visitor = El idioma de cada visitante
+settings-public-page-language-host = Siempre mi idioma
+settings-public-page-language-help = Idioma de tu perfil público, de tus páginas de reserva y de los correos que reciben tus invitados. «Siempre mi idioma» usa el idioma elegido arriba.
+settings-error-public-page-language = Elige un idioma válido para las páginas de reserva públicas.
 settings-dynamic-group = Permitir que otras personas me incluyan en enlaces de grupo dinámicos
 settings-dynamic-group-help = Si lo activas, otros usuarios pueden crear URL de reunión colectiva improvisadas que te incluyan (p. ej. { $example }).
 settings-lend-resource = Prestar mi acceso al calendario para reservar recursos
@@ -1324,3 +1329,96 @@ dynamic-group-user-not-found = Usuario «{ $username }» no encontrado.
 dynamic-group-user-opted-out = El usuario «{ $username }» no ha activado los enlaces de grupo dinámico.
 
 error-slot-unavailable-member = Este hueco ya no está disponible ({ $username } tiene un conflicto).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Solicitud caducada: { $event }, { $date } a las { $time } ({ $tz }). Sin respuesta a tiempo, elige otra hora.
+email-pending-expired-status = Solicitud caducada
+email-pending-expired-headline = Tu solicitud de reserva ha caducado: el anfitrión no respondió a tiempo. Elige otra hora, por favor.
+email-pending-expired-action = Elegir otra hora
+bae-body-host-busy = El anfitrión (o un miembro necesario del equipo) ya no está libre a esta hora. Pide al invitado que elija otro hueco.
+bookings-error-generic = Algo salió mal.
+troubleshoot-detail-pending-request = { $title } (solicitud pendiente)
+etf-pending-blocks-slot = Las solicitudes pendientes bloquean el hueco
+etf-pending-blocks-slot-help = Mientras una solicitud espera tu respuesta, nadie más puede reservar esa hora, ni en este tipo de evento ni en los demás.
+etf-pending-expiry = Caducidad de las solicitudes
+etf-pending-expiry-help = Una solicitud que no hayas respondido para entonces se rechaza automáticamente y se pide al invitado que elija otra hora. Termina antes si la reunión está demasiado cerca para que otra persona reserve ese hueco. Recibes un recordatorio a mitad de plazo.
+etf-pending-expiry-never = Nunca
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Tras { $hours } hora
+       *[other] Tras { $hours } horas
+    }
+
+# Host, watcher and remaining guest emails (src/email.rs, #209)
+
+email-footer-sent-by = Enviado por
+email-date-at-time = { $date } a las { $time }
+email-detail-phone = Teléfono:
+email-detail-expires = Caduca:
+email-detail-new-date = Nueva fecha:
+email-detail-new-time = Nueva hora:
+email-detail-previous = Anterior:
+email-detail-requested = Solicitada:
+email-detail-originally = Originalmente:
+email-detail-organizer = Organizador:
+email-detail-booked-by = Reservado por:
+email-detail-invited-by = Invitado por:
+email-detail-message = Mensaje:
+email-action-approve = Aprobar
+email-action-decline = Rechazar
+email-action-pick-new-time = Elegir una nueva hora
+email-host-approve-line = Aprobar: { $url }
+email-host-decline-line = Rechazar: { $url }
+email-host-approval-dashboard = Inicia sesión en tu panel para confirmar o rechazar esta reserva.
+email-host-new-subject = Nueva reserva: { $event }, { $guest } ({ $date })
+email-host-new-heading = ¡Nueva reserva!
+email-host-new-message = { $guest } ha reservado una cita contigo.
+email-host-confirmed-subject = Confirmada: { $event }, { $guest } ({ $date })
+email-host-confirmed-heading = Reserva confirmada
+email-host-confirmed-message = Has aprobado la reserva con { $guest }.
+email-host-confirmed-footer = El evento se ha añadido a tu calendario.
+email-host-sync-failure-subject = Acción necesaria: calendario no actualizado para { $event } ({ $date })
+email-host-sync-failure-heading = Tu calendario no se ha actualizado
+email-host-sync-failure-intro = Esta reserva ha cambiado de hora, pero calrs no ha podido actualizar el evento en tu Google Calendar. El invitado tiene la nueva hora; tu calendario sigue mostrando la anterior.
+email-host-sync-failure-action = Abre el evento en Google Calendar y muévelo a la hora indicada arriba. Mueve el evento existente en lugar de crearlo de nuevo, o el enlace de Google Meet que ya tiene el invitado dejará de funcionar.
+email-host-reminder-subject = Recordatorio: { $event }, { $guest } ({ $date })
+email-host-reminder-heading = Próxima reserva
+email-host-reminder-message = Recordatorio: tienes pronto una reserva con { $guest }.
+email-host-cancel-subject = Cancelada: { $event }, { $guest } ({ $date })
+email-host-cancel-message-by-host = Has cancelado esta reserva.
+email-host-cancel-message-by-guest = { $guest } ha cancelado su reserva.
+email-host-approval-subject = Acción necesaria: { $event }, { $guest } ({ $date })
+email-host-approval-heading = Acción necesaria
+email-host-approval-message = { $guest } quiere reservar una cita contigo.
+email-host-approval-reminder-subject = Recordatorio: { $guest } espera tu respuesta ({ $event }, { $date })
+email-host-approval-reminder-heading = Recordatorio: acción necesaria
+email-host-approval-reminder-message = { $guest } sigue esperando tu respuesta. Si no respondes, la solicitud se rechazará automáticamente el { $deadline }.
+email-host-approval-footer = También puedes gestionarlo desde tu panel.
+email-host-expired-subject = Caducada: { $event } con { $guest } ({ $date })
+email-host-expired-heading = Solicitud de reserva caducada
+email-host-expired-message = Nadie respondió a la solicitud de { $guest } antes del plazo, así que se rechazó automáticamente y se pidió al invitado que eligiera otra hora.
+email-host-expired-footer = Puedes cambiar cuánto esperan las solicitudes en la configuración del tipo de evento.
+email-host-reschedule-request-subject = Solicitud de reprogramación: { $event }, { $guest } ({ $email })
+email-host-reschedule-request-message = { $guest } quiere reprogramar su reserva.
+email-watcher-claim-subject = Disponible para asumir: { $event }, { $guest } ({ $date })
+email-watcher-claim-message = Hay una nueva reserva disponible para asumir. Haz clic abajo para unirte como participante.
+email-watcher-claim-link = Asumir esta reserva: { $url }
+email-watcher-claim-footer = También puedes asumirla desde tu panel.
+email-claim-confirmed-subject = Reserva asumida: { $event }, { $guest } ({ $date })
+email-claim-confirmed-footer = Se te añadirá como participante en esta reunión.
+email-attendee-greeting = Hola,
+email-attendee-message = Te han añadido como participante en una reserva.
+email-pick-new-time-subject = Reprogramación: { $event }, elige una nueva hora
+email-pick-new-time-message = { $host } necesita reprogramar tu reserva. Elige una nueva hora, por favor.
+email-pick-new-time-link = Elegir una nueva hora: { $url }
+email-rescheduled-message = { $host } ha reprogramado tu reserva.
+email-rescheduled-ics-attached-plain = Se adjunta una invitación de calendario actualizada.
+email-rescheduled-ics-attached-html = Se adjunta una invitación de calendario actualizada a este correo.
+email-need-to-reschedule = ¿Necesitas reprogramar? { $url }
+email-invite-subject = { $host } te ha invitado a reservar: { $event }
+email-invite-message = { $host } te ha invitado a reservar: { $event }
+email-invite-link = Haz clic en el enlace de abajo para elegir una hora:
+email-invite-action = Elegir una hora
+email-cancel-reason-calendar-deleted = El anfitrión eliminó el evento del calendario.

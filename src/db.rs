@@ -272,6 +272,14 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             "064_booking_time_version",
             include_str!("../migrations/064_booking_time_version.sql"),
         ),
+        (
+            "065_pending_slot_hold",
+            include_str!("../migrations/065_pending_slot_hold.sql"),
+        ),
+        (
+            "066_public_page_language",
+            include_str!("../migrations/066_public_page_language.sql"),
+        ),
     ];
 
     let mut applied_count = 0u32;
@@ -881,7 +889,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 64, "All 64 migrations should be tracked");
+        assert_eq!(count.0, 66, "All 66 migrations should be tracked");
     }
 
     #[tokio::test]
@@ -913,6 +921,59 @@ mod tests {
         );
     }
 
+    /// Upgrading to 065 (#234) must not start expiring requests that were
+    /// already waiting: their deadline stays NULL (never), while event types
+    /// get the slot hold on and no expiry.
+    #[tokio::test]
+    async fn pending_slot_hold_migration_leaves_existing_requests_unexpired() {
+        let pool = memory_pool().await;
+        migrate(&pool).await.unwrap();
+        // Roll the schema back to just before 065.
+        sqlx::raw_sql(
+            "DROP INDEX idx_bookings_pending_expiry;
+             ALTER TABLE bookings DROP COLUMN pending_expires_at;
+             ALTER TABLE bookings DROP COLUMN pending_since;
+             ALTER TABLE bookings DROP COLUMN pending_reminder_sent_at;
+             ALTER TABLE event_types DROP COLUMN pending_blocks_slot;
+             ALTER TABLE event_types DROP COLUMN pending_expiry_hours;
+             DELETE FROM _migrations WHERE name = '065_pending_slot_hold';",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled)
+                 VALUES ('u1', 'h@example.com', 'Host', 'admin', 'local', 'host', 1);
+             INSERT INTO accounts (id, name, email, timezone, user_id)
+                 VALUES ('a1', 'Host', 'h@example.com', 'UTC', 'u1');
+             INSERT INTO event_types (id, account_id, slug, title, duration_min, requires_confirmation)
+                 VALUES ('et1', 'a1', 'demo', 'Demo', 30, 1);
+             INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token)
+                 VALUES ('b1', 'et1', 'uid-b1', 'Guest', 'g@example.com', 'UTC', '2030-03-18T10:00:00', '2030-03-18T10:30:00', 'pending', 'c1', 'r1', 'k1');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        let (expires, since, nudged): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT pending_expires_at, pending_since, pending_reminder_sent_at FROM bookings WHERE id = 'b1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((expires, since, nudged), (None, None, None));
+        let (blocks, hours): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT pending_blocks_slot, pending_expiry_hours FROM event_types WHERE id = 'et1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((blocks, hours), (1, None));
+    }
+
     #[tokio::test]
     async fn migrate_is_idempotent() {
         let pool = memory_pool().await;
@@ -924,7 +985,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 64, "Still 64 migrations after second run");
+        assert_eq!(count.0, 66, "Still 66 migrations after second run");
     }
 
     #[tokio::test]

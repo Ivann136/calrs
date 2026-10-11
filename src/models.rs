@@ -32,6 +32,11 @@ pub struct User {
     pub avatar_path: Option<String>,
     pub allow_dynamic_group: bool,
     pub language: Option<String>,
+    /// Language of the user's public pages (/u/{username} and the legacy /{slug} routes): 'visitor'
+    /// (the visitor's browser language) or 'host' (`language`). See
+    /// `web::user_page_lang`.
+    #[sqlx(default)]
+    pub public_page_language: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

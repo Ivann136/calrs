@@ -527,6 +527,11 @@ settings-timezone-help = Suas regras de disponibilidade e horários de agendamen
 settings-language = Idioma
 settings-language-auto = Automático (idioma do navegador)
 settings-language-help = Escolha um idioma para a interface, ou deixe em Automático para seguir a configuração do navegador.
+settings-public-page-language = Idioma das páginas públicas de agendamento
+settings-public-page-language-visitor = O idioma de cada visitante
+settings-public-page-language-host = Sempre o meu idioma
+settings-public-page-language-help = Idioma do seu perfil público, das suas páginas de agendamento e dos e-mails que seus convidados recebem. "Sempre o meu idioma" usa o idioma escolhido acima.
+settings-error-public-page-language = Escolha um idioma válido para as páginas públicas de agendamento.
 settings-dynamic-group = Permitir que outras pessoas me incluam em links de grupo dinâmicos
 settings-dynamic-group-help = Quando ativado, outros usuários podem criar URLs de reunião coletiva improvisadas que incluem você (ex.: { $example }).
 settings-lend-resource = Emprestar meu acesso à agenda para reservas de recursos
@@ -1324,3 +1329,96 @@ dynamic-group-user-not-found = Usuário “{ $username }” não encontrado.
 dynamic-group-user-opted-out = O usuário “{ $username }” não ativou os links de grupo dinâmico.
 
 error-slot-unavailable-member = Este horário não está mais disponível ({ $username } tem um conflito).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Pedido expirado: { $event }, { $date } às { $time } ({ $tz }). Sem resposta, escolha outro horário.
+email-pending-expired-status = Pedido expirado
+email-pending-expired-headline = Seu pedido de agendamento expirou: o organizador não respondeu a tempo. Escolha outro horário, por favor.
+email-pending-expired-action = Escolher outro horário
+bae-body-host-busy = O organizador (ou um membro necessário da equipe) não está mais livre neste horário. Peça ao convidado para escolher outro horário.
+bookings-error-generic = Algo deu errado.
+troubleshoot-detail-pending-request = { $title } (pedido pendente)
+etf-pending-blocks-slot = Pedidos pendentes bloqueiam o horário
+etf-pending-blocks-slot-help = Enquanto um pedido aguarda sua resposta, ninguém mais pode agendar esse horário, nem neste nem nos seus outros tipos de evento.
+etf-pending-expiry = Expiração dos pedidos
+etf-pending-expiry-help = Um pedido que você não responder até lá é recusado automaticamente e pedimos ao convidado que escolha outro horário. Ele termina antes se a reunião estiver próxima demais para outra pessoa ainda agendar o horário. Você recebe um lembrete na metade do prazo.
+etf-pending-expiry-never = Nunca
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Após { $hours } hora
+       *[other] Após { $hours } horas
+    }
+
+# Host, watcher and remaining guest emails (src/email.rs, #209)
+
+email-footer-sent-by = Enviado por
+email-date-at-time = { $date } às { $time }
+email-detail-phone = Telefone:
+email-detail-expires = Expira:
+email-detail-new-date = Nova data:
+email-detail-new-time = Novo horário:
+email-detail-previous = Anterior:
+email-detail-requested = Solicitado:
+email-detail-originally = Originalmente:
+email-detail-organizer = Organizador:
+email-detail-booked-by = Agendado por:
+email-detail-invited-by = Convidado por:
+email-detail-message = Mensagem:
+email-action-approve = Aprovar
+email-action-decline = Recusar
+email-action-pick-new-time = Escolher um novo horário
+email-host-approve-line = Aprovar: { $url }
+email-host-decline-line = Recusar: { $url }
+email-host-approval-dashboard = Acesse o seu painel para confirmar ou recusar este agendamento.
+email-host-new-subject = Novo agendamento: { $event }, { $guest } ({ $date })
+email-host-new-heading = Novo agendamento!
+email-host-new-message = { $guest } agendou um horário com você.
+email-host-confirmed-subject = Confirmado: { $event }, { $guest } ({ $date })
+email-host-confirmed-heading = Agendamento confirmado
+email-host-confirmed-message = Você aprovou o agendamento com { $guest }.
+email-host-confirmed-footer = O evento foi adicionado à sua agenda.
+email-host-sync-failure-subject = Ação necessária: agenda não atualizada para { $event } ({ $date })
+email-host-sync-failure-heading = Sua agenda não foi atualizada
+email-host-sync-failure-intro = Este agendamento mudou de horário, mas o calrs não conseguiu atualizar o evento no seu Google Agenda. O convidado tem o novo horário; sua agenda ainda mostra o antigo.
+email-host-sync-failure-action = Abra o evento no Google Agenda e mova-o para o horário acima. Mova o evento existente em vez de recriá-lo, senão o link do Google Meet que o convidado já tem deixará de funcionar.
+email-host-reminder-subject = Lembrete: { $event }, { $guest } ({ $date })
+email-host-reminder-heading = Próximo agendamento
+email-host-reminder-message = Lembrete: você tem em breve um agendamento com { $guest }.
+email-host-cancel-subject = Cancelado: { $event }, { $guest } ({ $date })
+email-host-cancel-message-by-host = Você cancelou este agendamento.
+email-host-cancel-message-by-guest = { $guest } cancelou o agendamento.
+email-host-approval-subject = Ação necessária: { $event }, { $guest } ({ $date })
+email-host-approval-heading = Ação necessária
+email-host-approval-message = { $guest } quer agendar um horário com você.
+email-host-approval-reminder-subject = Lembrete: { $guest } está aguardando sua resposta ({ $event }, { $date })
+email-host-approval-reminder-heading = Lembrete: ação necessária
+email-host-approval-reminder-message = { $guest } ainda está aguardando sua resposta. Se você não responder, o pedido será recusado automaticamente em { $deadline }.
+email-host-approval-footer = Você também pode gerenciar isso pelo seu painel.
+email-host-expired-subject = Expirado: { $event } com { $guest } ({ $date })
+email-host-expired-heading = Pedido de agendamento expirado
+email-host-expired-message = Ninguém respondeu ao pedido de { $guest } dentro do prazo, então ele foi recusado automaticamente e o convidado foi orientado a escolher outro horário.
+email-host-expired-footer = Você pode mudar quanto tempo os pedidos aguardam nas configurações do tipo de evento.
+email-host-reschedule-request-subject = Pedido de reagendamento: { $event }, { $guest } ({ $email })
+email-host-reschedule-request-message = { $guest } quer reagendar o agendamento.
+email-watcher-claim-subject = Disponível para assumir: { $event }, { $guest } ({ $date })
+email-watcher-claim-message = Há um novo agendamento disponível para assumir. Clique abaixo para participar como convidado.
+email-watcher-claim-link = Assumir este agendamento: { $url }
+email-watcher-claim-footer = Você também pode assumi-lo pelo seu painel.
+email-claim-confirmed-subject = Agendamento assumido: { $event }, { $guest } ({ $date })
+email-claim-confirmed-footer = Você será adicionado como participante desta reunião.
+email-attendee-greeting = Olá,
+email-attendee-message = Você foi adicionado como participante de um agendamento.
+email-pick-new-time-subject = Reagendamento: { $event }, escolha um novo horário
+email-pick-new-time-message = { $host } precisa reagendar o seu agendamento. Escolha um novo horário, por favor.
+email-pick-new-time-link = Escolher um novo horário: { $url }
+email-rescheduled-message = Seu agendamento foi reagendado por { $host }.
+email-rescheduled-ics-attached-plain = Um convite de calendário atualizado está anexado.
+email-rescheduled-ics-attached-html = Um convite de calendário atualizado está anexado a este e-mail.
+email-need-to-reschedule = Precisa reagendar? { $url }
+email-invite-subject = { $host } convidou você para agendar: { $event }
+email-invite-message = { $host } convidou você para agendar: { $event }
+email-invite-link = Clique no link abaixo para escolher um horário:
+email-invite-action = Escolher um horário
+email-cancel-reason-calendar-deleted = O organizador excluiu o evento da agenda.
