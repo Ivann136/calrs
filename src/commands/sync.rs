@@ -1014,9 +1014,11 @@ async fn cancel_orphaned_booking(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, COALESCE(b.guest_timezone, 'UTC'), CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.uid,
-                et.title, u.name, COALESCE(u.booking_email, u.email), b.caldav_calendar_href, u.timezone
+                et.title, u.name, COALESCE(u.booking_email, u.email), b.caldav_calendar_href, u.timezone,
+                u.language
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -1050,6 +1052,7 @@ async fn cancel_orphaned_booking(
         host_email,
         caldav_calendar_href,
         host_timezone,
+        host_language,
     ) = booking;
 
     // Confirm-before-cancel: if we have a client and a stored calendar href for
@@ -1122,7 +1125,6 @@ async fn cancel_orphaned_booking(
 
     // The guest and the host each read the reason in their own language.
     let guest_language = crate::email::stored_booking_language(pool, &booking_id).await;
-    let host_language = crate::email::user_language_by_email(pool, &host_email).await;
     let details = crate::email::CancellationDetails {
         utc_times,
         event_title,

@@ -66,28 +66,6 @@ pub fn calendar_deleted_reason(lang: Option<&str>) -> String {
     t(lang_or_en(lang), "email-cancel-reason-calendar-deleted")
 }
 
-/// The saved language of the user an email is addressed to, found by the
-/// address calrs sends host emails to (`booking_email`, else `email`). For
-/// the paths that only know the host as the (name, email) pair they write
-/// into `BookingDetails`, such as `booking_host_identity`, where the
-/// recipient can be a team member other than the user acting.
-pub async fn user_language_by_email(pool: &SqlitePool, address: &str) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT language FROM users
-         WHERE COALESCE(booking_email, email) = ?1 OR email = ?1
-         ORDER BY COALESCE(booking_email, email) = ?1 DESC
-         LIMIT 1",
-    )
-    .bind(address)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .map(|l| l.trim().to_string())
-    .filter(|l| crate::i18n::is_supported(l))
-}
-
 /// The language the guest booked in, as stored on the booking row
 /// (`bookings.language`, captured from the booking page).
 ///
