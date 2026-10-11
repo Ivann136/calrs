@@ -20242,12 +20242,19 @@ async fn guest_cancel_booking(
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     if changed == 0 {
-        return render_booking_action_error_keys(
-            &state,
-            &headers,
-            "bae-title-booking-cancelled",
-            "bae-body-was-cancelled",
-        );
+        // Lost the race: report what actually happened, as the GET form does.
+        let status: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
+            .bind(&bid)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+        let (title_key, message_key) = match status {
+            Some((status,)) if status == "declined" => {
+                ("bae-title-booking-declined", "bae-body-declined-by-host")
+            }
+            _ => ("bae-title-already-cancelled", "bae-body-already-cancelled"),
+        };
+        return render_booking_action_error_keys(&state, &headers, title_key, message_key);
     }
 
     tracing::info!(booking_id = %bid, "booking cancelled by guest");
