@@ -3,6 +3,7 @@ use chrono::NaiveDateTime;
 use chrono_tz::Tz;
 use fluent_bundle::{FluentArgs, FluentValue};
 use lettre::message::header::ContentType;
+use lettre::message::MessageBuilder;
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -187,6 +188,119 @@ impl SmtpConfig {
             self.from_email.parse()?,
         ))
     }
+
+    /// Start a message with the From (and, for a host, Reply-To) headers
+    /// `sender` calls for. The address is always the configured one, so
+    /// SPF/DKIM/DMARC keep aligning with the instance domain; a host sender
+    /// only changes the display name and the reply target (#221).
+    fn message_from(&self, sender: Sender<'_>) -> Result<MessageBuilder> {
+        match sender {
+            Sender::Instance => Ok(Message::builder().from(self.mailbox_from()?)),
+            Sender::Host { name, email, lang } => {
+                let display = guest_sender_name(lang, name, self.from_name.as_deref());
+                let mut builder =
+                    Message::builder().from(Mailbox::new(display, self.from_email.parse()?));
+                if let Some(reply_to) = host_reply_to(email) {
+                    builder = builder.reply_to(reply_to);
+                }
+                Ok(builder)
+            }
+        }
+    }
+}
+
+/// Who an email appears to come from.
+#[derive(Clone, Copy)]
+enum Sender<'a> {
+    /// The instance itself, under the configured sender name: host, team
+    /// member, watcher and admin mail.
+    Instance,
+    /// A host writing to a guest (#221): "Host via <sender name>" on the
+    /// instance address, with Reply-To pointing at `email`. `lang` is the
+    /// email's own language, for the translated "via". For multi-host
+    /// bookings `name` is the joined roster and `email` the ICS organizer,
+    /// so replies reach the person the guest's calendar names as organizer.
+    Host {
+        name: &'a str,
+        email: &'a str,
+        lang: &'a str,
+    },
+}
+
+impl<'a> Sender<'a> {
+    /// The host of a booking, writing in the guest's language.
+    fn host_of(details: &'a BookingDetails) -> Self {
+        Sender::Host {
+            name: &details.host_name,
+            email: &details.host_email,
+            lang: guest_lang(details),
+        }
+    }
+
+    /// The host of a cancelled, declined or expired booking, writing in the
+    /// guest's language.
+    fn host_of_cancellation(details: &'a CancellationDetails) -> Self {
+        Sender::Host {
+            name: &details.host_name,
+            email: &details.host_email,
+            lang: lang_or_en(details.guest_language.as_deref()),
+        }
+    }
+}
+
+/// Longest host part of a guest-facing display name. Collective bookings join
+/// every member's name, which would otherwise grow the header without bound.
+const GUEST_SENDER_HOST_MAX_CHARS: usize = 80;
+
+/// Characters dropped from a name before it reaches a header: control
+/// characters (CR/LF are the classic header injection, even though lettre
+/// encodes display names) and the bidirectional formatting marks that can
+/// make one name render as another.
+fn is_header_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Display name for guest-facing mail: the host's name followed by the
+/// configured sender name, joined in the email's language ("Bob via Acme"),
+/// or the host's name alone when no sender name is set. Host names are
+/// user-editable, so unsafe characters are dropped and long collective
+/// rosters truncated. The sender name is admin-set but lands in the same
+/// header, so it is filtered the same way.
+fn guest_sender_name(lang: &str, host_name: &str, from_name: Option<&str>) -> Option<String> {
+    let clean = |s: &str| -> String {
+        let kept: String = s.chars().filter(|c| !is_header_unsafe(*c)).collect();
+        kept.trim().to_string()
+    };
+    let mut host = clean(host_name);
+    if host.chars().count() > GUEST_SENDER_HOST_MAX_CHARS {
+        host = host.chars().take(GUEST_SENDER_HOST_MAX_CHARS - 1).collect();
+        host = format!("{}\u{2026}", host.trim_end());
+    }
+    let from_name = from_name.map(clean).filter(|name| !name.is_empty());
+    match (host.is_empty(), from_name) {
+        (true, from_name) => from_name,
+        (false, Some(instance)) => Some(clean(&ta(
+            lang,
+            "email-sender-via",
+            [("host", &host), ("instance", &instance)],
+        ))),
+        (false, None) => Some(host),
+    }
+}
+
+/// Reply-To for guest-facing mail: the host's address when it is exactly one
+/// bare address, nothing otherwise. A malformed value or an address list
+/// yields no Reply-To rather than a broken or surprising header.
+fn host_reply_to(email: &str) -> Option<Mailbox> {
+    email
+        .trim()
+        .parse::<lettre::Address>()
+        .ok()
+        .map(|address| Mailbox::new(None, address))
 }
 
 #[derive(Clone, Default)]
@@ -959,10 +1073,8 @@ pub async fn send_guest_confirmation_ex(
         [("event", &details.event_title), ("date", &details.date)],
     );
 
-    let from = config.mailbox_from()?;
-
-    let email = Message::builder()
-        .from(from.clone())
+    let email = config
+        .message_from(Sender::host_of(details))?
         .to(to)
         .subject(subject)
         .multipart(
@@ -979,6 +1091,7 @@ pub async fn send_guest_confirmation_ex(
         let ics2 = generate_ics(details, "REQUEST");
         if let Err(e) = send_composed(
             config,
+            Sender::host_of(details),
             to2,
             compose_attendee_confirmation(details),
             Some(("invite.ics", ics2, "REQUEST")),
@@ -1124,15 +1237,13 @@ impl EmailParts<'_> {
 /// calendar attachment.
 async fn send_composed(
     config: &SmtpConfig,
+    sender: Sender<'_>,
     to: Mailbox,
     mail: ComposedEmail,
     ics: Option<(&str, String, &str)>,
 ) -> Result<()> {
     let body = build_multipart_body(&mail.plain, &mail.html);
-    let builder = Message::builder()
-        .from(config.mailbox_from()?)
-        .to(to)
-        .subject(mail.subject);
+    let builder = config.message_from(sender)?.to(to).subject(mail.subject);
     let email = match ics {
         Some((filename, ics, method)) => {
             let attachment = Attachment::new(filename.to_string()).body(
@@ -1192,6 +1303,7 @@ pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetail
     let ics = generate_ics(details, "REQUEST");
     send_composed(
         config,
+        Sender::Instance,
         to,
         compose_host_notification(details),
         Some(("invite.ics", ics, "REQUEST")),
@@ -1270,7 +1382,14 @@ pub async fn send_host_booking_confirmed(
     details: &BookingDetails,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
-    send_composed(config, to, compose_host_booking_confirmed(details), None).await
+    send_composed(
+        config,
+        Sender::Instance,
+        to,
+        compose_host_booking_confirmed(details),
+        None,
+    )
+    .await
 }
 
 fn compose_host_booking_confirmed(details: &BookingDetails) -> ComposedEmail {
@@ -1347,6 +1466,7 @@ pub async fn send_host_calendar_sync_failure(
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
     send_composed(
         config,
+        Sender::Instance,
         to,
         compose_host_calendar_sync_failure(details, reason),
         None,
@@ -1511,8 +1631,8 @@ pub async fn send_guest_reminder(
             ("time", &details.start_time),
         ],
     );
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
+    let email = config
+        .message_from(Sender::host_of(details))?
         .to(to)
         .subject(subject)
         .multipart(body)?;
@@ -1523,7 +1643,14 @@ pub async fn send_guest_reminder(
 /// Send booking reminder to the host
 pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
-    send_composed(config, to, compose_host_reminder(details), None).await
+    send_composed(
+        config,
+        Sender::Instance,
+        to,
+        compose_host_reminder(details),
+        None,
+    )
+    .await
 }
 
 fn compose_host_reminder(details: &BookingDetails) -> ComposedEmail {
@@ -1703,8 +1830,8 @@ pub async fn send_guest_cancellation(
         "email-cancel-subject",
         [("event", &details.event_title), ("date", &details.date)],
     );
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
+    let email = config
+        .message_from(Sender::host_of_cancellation(details))?
         .to(to)
         .subject(subject)
         .multipart(
@@ -1725,6 +1852,7 @@ pub async fn send_host_cancellation(
     let ics = generate_cancel_ics(details);
     send_composed(
         config,
+        Sender::Instance,
         to,
         compose_host_cancellation(details),
         Some(("cancel.ics", ics, "CANCEL")),
@@ -1807,8 +1935,8 @@ pub async fn send_guest_pending_notice_ex(
     let composed = compose_guest_pending_notice(details, cancel_url, reschedule_url);
     let body = build_multipart_body(&composed.plain, &composed.html);
 
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
+    let email = config
+        .message_from(Sender::host_of(details))?
         .to(to)
         .subject(composed.subject)
         .multipart(body)?;
@@ -2007,7 +2135,7 @@ async fn send_host_approval_email(
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
     let mail = compose_host_approval_email(details, confirm_token, base_url, expires);
-    send_composed(config, to, mail, None).await
+    send_composed(config, Sender::Instance, to, mail, None).await
 }
 
 fn compose_host_approval_email(
@@ -2123,8 +2251,8 @@ pub async fn send_guest_decline_notice(
     let composed = compose_guest_decline_notice(details);
     let body = build_multipart_body(&composed.plain, &composed.html);
 
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
+    let email = config
+        .message_from(Sender::host_of_cancellation(details))?
         .to(to)
         .subject(composed.subject)
         .multipart(body)?;
@@ -2238,8 +2366,8 @@ pub async fn send_guest_pending_expired(
     let composed = compose_guest_pending_expired(details, rebook_url);
     let body = build_multipart_body(&composed.plain, &composed.html);
 
-    let email = Message::builder()
-        .from(config.mailbox_from()?)
+    let email = config
+        .message_from(Sender::host_of_cancellation(details))?
         .to(to)
         .subject(composed.subject)
         .multipart(body)?;
@@ -2349,7 +2477,14 @@ pub async fn send_host_pending_expired(
     details: &CancellationDetails,
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
-    send_composed(config, to, compose_host_pending_expired(details), None).await
+    send_composed(
+        config,
+        Sender::Instance,
+        to,
+        compose_host_pending_expired(details),
+        None,
+    )
+    .await
 }
 
 fn compose_host_pending_expired(details: &CancellationDetails) -> ComposedEmail {
@@ -2673,6 +2808,7 @@ pub async fn send_invite_email(
     guest_email: &str,
     event_title: &str,
     host_name: &str,
+    host_email: &str,
     message: Option<&str>,
     invite_url: &str,
     expires_at: Option<&str>,
@@ -2687,7 +2823,12 @@ pub async fn send_invite_email(
         invite_url,
         expires_at,
     );
-    send_composed(config, to, mail, None).await
+    let sender = Sender::Host {
+        name: host_name,
+        email: host_email,
+        lang,
+    };
+    send_composed(config, sender, to, mail, None).await
 }
 
 fn compose_invite_email(
@@ -2863,7 +3004,7 @@ pub async fn send_guest_pick_new_time(
 ) -> Result<()> {
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
     let mail = compose_guest_pick_new_time(details, reschedule_url, cancel_url);
-    send_composed(config, to, mail, None).await
+    send_composed(config, Sender::host_of(details), to, mail, None).await
 }
 
 fn compose_guest_pick_new_time(
@@ -2960,7 +3101,19 @@ pub async fn send_guest_reschedule_notification(
 
     let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
     let mail = compose_guest_reschedule_notification(details, cancel_url, reschedule_url);
-    send_composed(config, to, mail, Some(("invite.ics", ics, "REQUEST"))).await
+    let sender = Sender::Host {
+        name: &details.host_name,
+        email: &details.host_email,
+        lang: lang_or_en(details.guest_language.as_deref()),
+    };
+    send_composed(
+        config,
+        sender,
+        to,
+        mail,
+        Some(("invite.ics", ics, "REQUEST")),
+    )
+    .await
 }
 
 fn compose_guest_reschedule_notification(
@@ -3052,7 +3205,7 @@ pub async fn send_host_reschedule_request(
 ) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
     let mail = compose_host_reschedule_request(details, confirm_token, base_url);
-    send_composed(config, to, mail, None).await
+    send_composed(config, Sender::Instance, to, mail, None).await
 }
 
 fn compose_host_reschedule_request(
@@ -3154,7 +3307,7 @@ pub async fn send_watcher_claim_notification(
         assigned_to_name,
         claim_url,
     );
-    send_composed(config, to, mail, None).await
+    send_composed(config, Sender::Instance, to, mail, None).await
 }
 
 fn compose_watcher_claim_notification(
@@ -3221,7 +3374,7 @@ pub async fn send_claim_confirmation(
 ) -> Result<()> {
     let to = format!("{} <{}>", claimant_name, claimant_email).parse()?;
     let mail = compose_claim_confirmation(details, claimant_name, lang);
-    send_composed(config, to, mail, None).await
+    send_composed(config, Sender::Instance, to, mail, None).await
 }
 
 fn compose_claim_confirmation(
@@ -3372,6 +3525,185 @@ mod tests {
             ),
             "from email with name"
         );
+    }
+
+    #[test]
+    fn guest_sender_name_puts_host_ahead_of_configured_name() {
+        let name = |host: &str, from: Option<&str>| guest_sender_name("en", host, from);
+        assert_eq!(
+            name("Bob Smith", Some("Vates Scheduling")).as_deref(),
+            Some("Bob Smith via Vates Scheduling")
+        );
+        assert_eq!(name("Bob Smith", None).as_deref(), Some("Bob Smith"));
+        assert_eq!(name("Bob Smith", Some("  ")).as_deref(), Some("Bob Smith"));
+        assert_eq!(
+            name("", Some("Vates Scheduling")).as_deref(),
+            Some("Vates Scheduling")
+        );
+        assert_eq!(name(" ", None), None);
+        assert_eq!(
+            name("Bob\r\nBcc: evil@example.com", None).as_deref(),
+            Some("BobBcc: evil@example.com")
+        );
+        // Bidi overrides and isolates are dropped, from either part.
+        assert_eq!(
+            name("\u{202E}ecilA\u{202C}", Some("Acme\u{2066}\u{200F}")).as_deref(),
+            Some("ecilA via Acme")
+        );
+
+        // A large collective roster is truncated rather than growing the header.
+        let roster = vec!["Łukasz Kowalski"; 20].join(" & ");
+        let full = name(&roster, Some("Vates")).unwrap();
+        let host = full.strip_suffix(" via Vates").unwrap();
+        assert!(host.chars().count() <= GUEST_SENDER_HOST_MAX_CHARS);
+        assert!(host.ends_with('\u{2026}'));
+        let exact = "a".repeat(GUEST_SENDER_HOST_MAX_CHARS);
+        assert_eq!(name(&exact, None), Some(exact));
+    }
+
+    #[test]
+    fn guest_sender_name_joins_in_the_email_language() {
+        let via = |lang: &str| guest_sender_name(lang, "Bob", Some("Acme")).unwrap();
+        assert_eq!(via("de"), "Bob über Acme");
+        assert_eq!(via("et"), "Bob Acme kaudu");
+        assert_eq!(via("pl"), "Bob przez Acme");
+        // Every shipped locale keeps both names, so no translation can drop
+        // the host or the instance from the header.
+        for (lang, _) in crate::i18n::supported_with_labels() {
+            let name = via(lang);
+            assert!(
+                name.contains("Bob") && name.contains("Acme"),
+                "{lang}: {name}"
+            );
+        }
+    }
+
+    fn header_test_config(from_name: Option<&str>) -> SmtpConfig {
+        SmtpConfig {
+            host: "host".to_string(),
+            port: 587,
+            username: String::new(),
+            password: String::new(),
+            from_name: from_name.map(str::to_string),
+            from_email: "noreply@example.com".to_string(),
+            tls_mode: SmtpTlsMode::StartTls,
+        }
+    }
+
+    /// The headers a message started by `sender` goes out with.
+    fn wire_headers(config: &SmtpConfig, sender: Sender<'_>) -> String {
+        let email = config
+            .message_from(sender)
+            .unwrap()
+            .to("guest@example.org".parse().unwrap())
+            .subject("s")
+            .body(String::from("b"))
+            .unwrap();
+        String::from_utf8(email.formatted()).unwrap()
+    }
+
+    #[test]
+    fn host_sender_sets_display_name_and_reply_to() {
+        let config = header_test_config(Some("Vates Scheduling"));
+        let host = |email| Sender::Host {
+            name: "Bob Smith",
+            email,
+            lang: "en",
+        };
+
+        let wire = wire_headers(&config, host("bob@example.com"));
+        assert!(
+            wire.contains("From: \"Bob Smith via Vates Scheduling\" <noreply@example.com>"),
+            "{wire}"
+        );
+        assert!(wire.contains("Reply-To: bob@example.com"), "{wire}");
+
+        // A host without a usable address still gets the display name, and
+        // no Reply-To rather than a malformed or multi-address one.
+        for bad in [
+            "",
+            "not an address",
+            "a@example.com, b@example.com",
+            "Mallory <m@evil.example>",
+            "bob@example.com\r\nBcc: x@evil.example",
+        ] {
+            let wire = wire_headers(&config, host(bad));
+            assert!(
+                wire.contains("From: \"Bob Smith via Vates Scheduling\""),
+                "{bad:?}: {wire}"
+            );
+            assert!(!wire.contains("Reply-To"), "{bad:?}: {wire}");
+            assert!(!wire.contains("Bcc"), "{bad:?}: {wire}");
+        }
+
+        // The instance sender is untouched: configured name, no Reply-To.
+        let wire = wire_headers(&config, Sender::Instance);
+        assert!(
+            wire.contains("From: \"Vates Scheduling\" <noreply@example.com>"),
+            "{wire}"
+        );
+        assert!(!wire.contains("Reply-To"), "{wire}");
+    }
+
+    #[test]
+    fn host_sender_name_with_non_ascii_or_specials_is_encoded() {
+        // A translated joiner or a host name with non-ASCII, quotes or an
+        // address-looking part must reach the wire RFC 2047-encoded, never
+        // as a second address in From.
+        let config = header_test_config(Some("Acme"));
+        for (name, lang) in [
+            ("Jürgen", "de"),
+            ("\"Support\" <it@evil.example>", "en"),
+            ("Alice, Bob", "en"),
+        ] {
+            let wire = wire_headers(
+                &config,
+                Sender::Host {
+                    name,
+                    email: "host@example.com",
+                    lang,
+                },
+            );
+            let from = wire
+                .split("\r\n")
+                .find(|l| l.starts_with("From: "))
+                .unwrap();
+            assert!(from.ends_with("<noreply@example.com>"), "{from}");
+            assert!(!from.contains("it@evil.example"), "{from}");
+            assert!(from.is_ascii(), "{from}");
+        }
+    }
+
+    /// Every guest-facing sender must go out under the host's name with a
+    /// Reply-To (#221), and no host, member, watcher or admin email may. A
+    /// guard over the sources, so a new `send_guest_*` cannot quietly fall
+    /// back to the instance sender.
+    #[test]
+    fn guest_emails_use_the_host_sender_and_host_emails_do_not() {
+        let src = include_str!("email.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let mut seen_guest = 0;
+        for chunk in src.split("\npub async fn ").skip(1) {
+            let name = &chunk[..chunk.find('(').unwrap()];
+            let body = &chunk[..chunk.find("\n}\n").unwrap()];
+            let uses_host = body.contains("Sender::Host") || body.contains("Sender::host_of");
+            let guest = name.starts_with("send_guest_") || name == "send_invite_email";
+            if guest {
+                seen_guest += 1;
+                // Thin wrappers delegate to the `_ex` variant.
+                let delegates = body.contains(&format!("{name}_ex("));
+                assert!(
+                    uses_host || delegates,
+                    "{name} is guest-facing but not sent as the host"
+                );
+            } else {
+                assert!(
+                    !uses_host,
+                    "{name} is not guest-facing but sent as the host"
+                );
+            }
+        }
+        assert!(seen_guest >= 10, "only {seen_guest} guest senders found");
     }
 
     // --- sanitize_ics ---
