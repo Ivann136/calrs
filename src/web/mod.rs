@@ -1,5 +1,6 @@
 pub mod captcha;
 pub mod meeting;
+pub(crate) mod writeback;
 
 use crate::utils::{convert_event_to_tz, parse_ical_datetime};
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -1212,6 +1213,10 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
         // due, no channel configured) used to `continue` this loop and skip
         // the background sync below on almost every tick.
         send_due_reminders(pool.clone(), secret_key).await;
+
+        // Calendar write-backs that failed earlier and are due another try
+        // (#162).
+        writeback::retry_failed_writebacks(&pool, &secret_key, Utc::now()).await;
 
         // Background sync: pick the stalest enabled source and sync it.
         // With ctag + sync-token this is very cheap for unchanged calendars.
@@ -23205,9 +23210,17 @@ async fn caldav_push_booking(
     booking_uid: &str,
     details: &crate::email::BookingDetails,
 ) {
-    for target in booking_write_targets(pool, booking_uid, user_id).await {
-        let _ = caldav_push_booking_for_user(pool, key, &target, booking_uid, details).await;
-    }
+    // Records the outcome on the booking: a failure is retried from the
+    // background loop and shown to the host (#162).
+    writeback::push_and_record(
+        pool,
+        key,
+        user_id,
+        booking_uid,
+        details,
+        writeback::PushKind::Fresh,
+    )
+    .await;
 }
 
 /// Email the host when the Google Meet time patch failed for good.
@@ -37393,6 +37406,7 @@ mod tests {
     }
     include!("booking_time_tests.rs");
     include!("pending_hold_tests.rs");
+    include!("writeback_tests.rs");
 
     // --- #209: guest emails sent on someone else's request keep the guest's language ---
 

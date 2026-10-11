@@ -284,6 +284,10 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             "067_captcha_wasm_url",
             include_str!("../migrations/067_captcha_wasm_url.sql"),
         ),
+        (
+            "068_writeback_failures",
+            include_str!("../migrations/068_writeback_failures.sql"),
+        ),
     ];
 
     let mut applied_count = 0u32;
@@ -893,7 +897,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 67, "All 67 migrations should be tracked");
+        assert_eq!(count.0, 68, "All 68 migrations should be tracked");
     }
 
     #[tokio::test]
@@ -989,7 +993,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 67, "Still 67 migrations after second run");
+        assert_eq!(count.0, 68, "Still 68 migrations after second run");
     }
 
     #[tokio::test]
