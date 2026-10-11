@@ -1174,3 +1174,228 @@ async fn group_booking_post_rejects_beyond_horizon() {
         "NULL horizon must leave the team route unblocked"
     );
 }
+
+// --- Submit-time slot check: a POST must name a slot the page offers ---
+//
+// The red-team run booked a day blocked by an availability override, and a
+// time outside an override's custom hours, by POSTing straight to the
+// booking route. The page hid both; the server took them.
+
+/// The four public booking routes a guest can POST to.
+#[derive(Clone, Copy, Debug)]
+enum BookRoute {
+    User,
+    Legacy,
+    Team,
+    DynamicGroup,
+}
+
+const ALL_BOOK_ROUTES: [BookRoute; 4] = [
+    BookRoute::User,
+    BookRoute::Legacy,
+    BookRoute::Team,
+    BookRoute::DynamicGroup,
+];
+
+/// A fresh app for `route`: (app, pool, POST uri, event type it books).
+async fn app_for_route(route: BookRoute) -> (Router, SqlitePool, &'static str, String) {
+    let (app, pool, _, et_id) = setup_test_app().await;
+    match route {
+        BookRoute::User => (app, pool, "/u/testuser/test-meeting/book", et_id),
+        BookRoute::Legacy => (app, pool, "/test-meeting/book", et_id),
+        BookRoute::Team => {
+            let (_, team_et_id) = seed_team_event_type(&pool).await;
+            (app, pool, "/team/horizon-team/team-sync/book", team_et_id)
+        }
+        BookRoute::DynamicGroup => {
+            let other_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'second@example.com', 'Second User', 'user', 'local', 'seconduser', 1)")
+                .bind(&other_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, 'Second User', 'second@example.com', 'UTC', ?)")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&other_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            (app, pool, "/u/testuser+seconduser/test-meeting/book", et_id)
+        }
+    }
+}
+
+async fn add_override(pool: &SqlitePool, et_id: &str, date: &str, hours: Option<(&str, &str)>) {
+    sqlx::query(
+        "INSERT INTO availability_overrides (id, event_type_id, date, start_time, end_time, is_blocked) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(et_id)
+    .bind(date)
+    .bind(hours.map(|(s, _)| s))
+    .bind(hours.map(|(_, e)| e))
+    .bind(hours.is_none() as i32)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// POST a booking for `date` at `time` (guest-local in `tz`); returns the page.
+async fn post_slot(app: &Router, uri: &str, date: &str, time: &str, tz: &str) -> String {
+    let csrf = "csrf-offered-slot";
+    let body = format!(
+        "_csrf={csrf}&date={date}&time={}&name=Guest&email=guest%40test.com&tz={}",
+        time.replace(':', "%3A"),
+        tz.replace('/', "%2F")
+    );
+    let response = app
+        .clone()
+        .oneshot(post_form_unauthed(uri, csrf, &body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    body_string(response).await
+}
+
+#[tokio::test]
+async fn booking_on_a_blocked_override_day_is_refused_on_every_route() {
+    for route in ALL_BOOK_ROUTES {
+        let (app, pool, uri, et_id) = app_for_route(route).await;
+        let monday = far_future_monday();
+        add_override(&pool, &et_id, &monday, None).await;
+
+        let page = post_slot(&app, uri, &monday, "10:00", "UTC").await;
+        assert_eq!(
+            booking_count(&pool, &et_id).await,
+            0,
+            "{route:?}: a day blocked by an override must not be bookable"
+        );
+        assert!(
+            page.contains("no longer available"),
+            "{route:?}: the guest must be told the slot is unavailable"
+        );
+
+        // Control: the same POST once the override is gone, so the refusal
+        // above is the override and not a dead route.
+        sqlx::query("DELETE FROM availability_overrides WHERE event_type_id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        post_slot(&app, uri, &monday, "10:00", "UTC").await;
+        assert_eq!(
+            booking_count(&pool, &et_id).await,
+            1,
+            "{route:?}: without the override the slot must be bookable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn booking_outside_override_custom_hours_is_refused_and_inside_accepted() {
+    for route in ALL_BOOK_ROUTES {
+        let (app, pool, uri, et_id) = app_for_route(route).await;
+        let monday = far_future_monday();
+        // Custom hours replace the Mon-Fri 09:00-17:00 rule for that day.
+        add_override(&pool, &et_id, &monday, Some(("13:00", "15:00"))).await;
+
+        post_slot(&app, uri, &monday, "10:00", "UTC").await;
+        assert_eq!(
+            booking_count(&pool, &et_id).await,
+            0,
+            "{route:?}: 10:00 is inside the weekly rule but outside the override's hours"
+        );
+
+        post_slot(&app, uri, &monday, "13:00", "UTC").await;
+        assert_eq!(
+            booking_count(&pool, &et_id).await,
+            1,
+            "{route:?}: 13:00 is inside the override's custom hours"
+        );
+    }
+}
+
+#[tokio::test]
+async fn booking_outside_rules_or_off_the_slot_grid_is_refused() {
+    let (app, pool, uri, et_id) = app_for_route(BookRoute::User).await;
+    let monday = far_future_monday();
+    let saturday = (NaiveDate::parse_from_str(&monday, "%Y-%m-%d").unwrap() + Duration::days(5))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    for (date, time, why) in [
+        (&monday, "20:00", "after the weekly window"),
+        (&monday, "16:45", "would end after the window closes"),
+        (&monday, "10:10", "not on the 30-minute slot grid"),
+        (&saturday, "10:00", "no rule on Saturdays"),
+    ] {
+        post_slot(&app, uri, date, time, "UTC").await;
+        assert_eq!(
+            booking_count(&pool, &et_id).await,
+            0,
+            "{time} on {date}: {why}"
+        );
+    }
+}
+
+/// A guest in another timezone submits their own wall clock: the check has
+/// to convert it exactly as the slot page did.
+#[tokio::test]
+async fn booking_check_converts_the_guest_timezone() {
+    let (app, pool, uri, et_id) = app_for_route(BookRoute::User).await;
+    let monday = NaiveDate::parse_from_str(&far_future_monday(), "%Y-%m-%d").unwrap();
+    let paris: Tz = "Europe/Paris".parse().unwrap();
+    // 16:30 UTC is the last slot of the host's 09:00-17:00 day.
+    let guest = Utc
+        .from_utc_datetime(&monday.and_hms_opt(16, 30, 0).unwrap())
+        .with_timezone(&paris);
+
+    post_slot(
+        &app,
+        uri,
+        &guest.format("%Y-%m-%d").to_string(),
+        &guest.format("%H:%M").to_string(),
+        "Europe/Paris",
+    )
+    .await;
+    assert_eq!(
+        booking_count(&pool, &et_id).await,
+        1,
+        "the host's 16:30 UTC slot, submitted as Paris wall time, must be accepted"
+    );
+}
+
+/// `first_slot_only` offers the earliest free slot of the day: refused for
+/// any other time, but the next slot becomes the offered one once the first
+/// is taken, and must then be accepted.
+#[tokio::test]
+async fn booking_with_first_slot_only_follows_the_first_free_slot() {
+    let (app, pool, uri, et_id) = app_for_route(BookRoute::User).await;
+    sqlx::query("UPDATE event_types SET first_slot_only = 1 WHERE id = ?")
+        .bind(&et_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let monday = far_future_monday();
+
+    post_slot(&app, uri, &monday, "09:30", "UTC").await;
+    assert_eq!(
+        booking_count(&pool, &et_id).await,
+        0,
+        "09:30 is not offered"
+    );
+
+    post_slot(&app, uri, &monday, "09:00", "UTC").await;
+    assert_eq!(
+        booking_count(&pool, &et_id).await,
+        1,
+        "09:00 is the first slot"
+    );
+
+    post_slot(&app, uri, &monday, "09:30", "UTC").await;
+    assert_eq!(
+        booking_count(&pool, &et_id).await,
+        2,
+        "with 09:00 taken, 09:30 is the first free slot and must be accepted"
+    );
+}

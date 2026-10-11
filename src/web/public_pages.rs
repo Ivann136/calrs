@@ -439,54 +439,28 @@ pub(super) async fn show_group_slots(
     let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
     let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
 
-    let busy = {
-        let tid = &team_id;
-        let members: Vec<(String,)> = sqlx::query_as(
-            "SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id \
-             LEFT JOIN event_type_member_weights etw ON etw.user_id = u.id AND etw.event_type_id = ? \
-             WHERE tm.team_id = ? AND u.enabled = 1 \
-             AND COALESCE(etw.weight, 1) > 0",
-        ).bind(&et_id).bind(tid).fetch_all(&state.pool).await.unwrap_or_default();
-        // Sync all group members' calendars if stale. sync_if_stale holds
-        // a per-source mutex and re-checks staleness inside the lock, so
-        // even with this fan-out at most one CalDAV fetch per source is in
-        // flight at a time.
-        let mut sync_tasks = tokio::task::JoinSet::new();
-        for (uid,) in &members {
-            let pool = state.pool.clone();
-            let key = state.secret_key;
-            let uid = uid.clone();
-            sync_tasks.spawn(async move {
-                crate::commands::sync::sync_if_stale(&pool, &key, &uid).await;
-            });
-        }
-        while sync_tasks.join_next().await.is_some() {}
-        let mut member_busy = HashMap::new();
-        for (uid,) in &members {
-            let mut busy = fetch_busy_times_for_user(
-                &state.pool,
-                uid,
-                now_host,
-                window_end,
-                host_tz,
-                Some(&et_id),
-            )
-            .await;
-            // Constrain each member to their personal working hours, converted
-            // from their own timezone into host_tz. Members without explicit
-            // hours in user_availability_rules are returned unconstrained
-            // (user_avail_as_busy short-circuits to an empty Vec), so we never
-            // plant surprise 9-17 defaults — only respect hours users actually
-            // set on the settings page.
-            busy.extend(user_avail_as_busy(&state.pool, uid, now_host, window_end, host_tz).await);
-            member_busy.insert(uid.clone(), busy);
-        }
-        if scheduling_mode == "collective" {
-            BusySource::Team(member_busy)
-        } else {
-            BusySource::Group(member_busy)
-        }
-    };
+    // Sync all team members' calendars if stale. sync_if_stale holds a
+    // per-source mutex and re-checks staleness inside the lock, so even with
+    // this fan-out at most one CalDAV fetch per source is in flight at a time.
+    let mut sync_tasks = tokio::task::JoinSet::new();
+    for uid in team_member_ids(&state.pool, &et_id, &team_id).await {
+        let pool = state.pool.clone();
+        let key = state.secret_key;
+        sync_tasks.spawn(async move {
+            crate::commands::sync::sync_if_stale(&pool, &key, &uid).await;
+        });
+    }
+    while sync_tasks.join_next().await.is_some() {}
+    let busy = team_busy_source(
+        &state.pool,
+        &et_id,
+        &team_id,
+        scheduling_mode == "collective",
+        now_host,
+        window_end,
+        host_tz,
+    )
+    .await;
 
     let slot_days = compute_slots(
         &state.pool,
@@ -1038,28 +1012,16 @@ async fn show_dynamic_group_slots(
         let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
         let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
 
-        let mut member_busy = HashMap::new();
-        for (i, (uid, _, _, _, _)) in dg_users.iter().enumerate() {
-            let et_filter = if i == 0 { Some(et_id.as_str()) } else { None };
-            let mut busy_times = fetch_busy_times_for_user(
-                &state.pool,
-                uid,
-                now_host,
-                window_end,
-                host_tz,
-                et_filter,
-            )
-            .await;
-            // For non-owner participants, apply their default availability as constraints
-            if i > 0 {
-                ensure_user_avail_seeded(&state.pool, uid).await;
-                let avail_busy =
-                    user_avail_as_busy(&state.pool, uid, now_host, window_end, host_tz).await;
-                busy_times.extend(avail_busy);
-            }
-            member_busy.insert(uid.clone(), busy_times);
-        }
-        let busy = BusySource::Team(member_busy);
+        let user_ids: Vec<String> = dg_users.iter().map(|(uid, ..)| uid.clone()).collect();
+        let busy = dynamic_group_busy_source(
+            &state.pool,
+            &et_id,
+            &user_ids,
+            now_host,
+            window_end,
+            host_tz,
+        )
+        .await;
 
         compute_slots(
             &state.pool,

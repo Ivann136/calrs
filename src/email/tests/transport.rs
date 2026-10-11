@@ -191,10 +191,96 @@ fn host_sender_name_with_non_ascii_or_specials_is_encoded() {
     }
 }
 
-/// Every guest-facing sender must go out under the host's name with a
+/// Every async function in `src`, as (name, body), outside the tests module.
+/// A function starts at a column-0 line holding `async fn` and ends at the
+/// next column-0 `}`.
+fn async_fns(src: &str) -> Vec<(&str, &str)> {
+    let src = src.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(src);
+    let mut fns = Vec::new();
+    let mut offset = 0;
+    for line in src.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let Some(rest) = line
+            .strip_prefix("pub async fn ")
+            .or_else(|| line.strip_prefix("pub(super) async fn "))
+            .or_else(|| line.strip_prefix("pub(crate) async fn "))
+            .or_else(|| line.strip_prefix("async fn "))
+        else {
+            continue;
+        };
+        let name = &rest[..rest.find('(').unwrap()];
+        let end = src[start..].find("\n}\n").map_or(src.len(), |e| start + e);
+        fns.push((name, &src[start..end]));
+    }
+    fns
+}
+
+/// The top-level arguments of every call to `call` (e.g. `"send_composed("`)
+/// in `body`.
+fn call_args<'a>(body: &'a str, call: &str) -> Vec<Vec<&'a str>> {
+    let mut calls = Vec::new();
+    for (pos, _) in body.match_indices(call) {
+        let start = pos + call.len();
+        let (mut depth, mut arg_start, mut args) = (1, start, Vec::new());
+        for (i, c) in body[start..].char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        args.push(body[arg_start..start + i].trim());
+                        break;
+                    }
+                }
+                ',' if depth == 1 => {
+                    args.push(body[arg_start..start + i].trim());
+                    arg_start = start + i + 1;
+                }
+                _ => {}
+            }
+        }
+        calls.push(args);
+    }
+    calls
+}
+
+#[derive(Debug, PartialEq)]
+enum SenderKind {
+    Host,
+    Instance,
+}
+
+/// What a sender argument evaluates to: a `Sender::...` expression, or a
+/// local bound to one with `let name = Sender::...;` earlier in the body.
+fn sender_kind(fn_name: &str, body: &str, arg: &str) -> SenderKind {
+    let expr = if arg.starts_with("Sender::") {
+        arg
+    } else {
+        let binding = format!("let {arg} = ");
+        let at = body
+            .find(&binding)
+            .unwrap_or_else(|| panic!("{fn_name}: cannot tell what sender `{arg}` is"));
+        body[at + binding.len()..].trim_start()
+    };
+    if expr.starts_with("Sender::Host") || expr.starts_with("Sender::host_of") {
+        SenderKind::Host
+    } else if expr.starts_with("Sender::Instance") {
+        SenderKind::Instance
+    } else {
+        panic!("{fn_name}: unknown sender `{arg}`")
+    }
+}
+
+/// Every guest-facing email must go out under the host's name with a
 /// Reply-To (#221), and no host, member, watcher or admin email may. A
 /// guard over the sources, so a new `send_guest_*` cannot quietly fall
 /// back to the instance sender.
+///
+/// It checks every message a function builds, not just that a host sender
+/// appears somewhere: `send_guest_confirmation_ex` sends the guest's copy
+/// and one per additional attendee, and switching either one to
+/// `Sender::Instance` has to fail here.
 #[test]
 fn guest_emails_use_the_host_sender_and_host_emails_do_not() {
     let files = [
@@ -204,32 +290,73 @@ fn guest_emails_use_the_host_sender_and_host_emails_do_not() {
         include_str!("../render.rs"),
         include_str!("../transport.rs"),
     ];
-    let mut seen_guest = 0;
-    for chunk in files
-        .iter()
-        .flat_map(|src| src.split("\n#[cfg(test)]\nmod tests").next())
-        .flat_map(|src| src.split("\npub async fn ").skip(1))
-    {
-        let name = &chunk[..chunk.find('(').unwrap()];
-        let body = &chunk[..chunk.find("\n}\n").unwrap()];
-        let uses_host = body.contains("Sender::Host") || body.contains("Sender::host_of");
+    let (mut seen_guest, mut seen_senders) = (0, 0);
+    for (name, body) in files.iter().flat_map(|src| async_fns(src)) {
+        // The plumbing itself: its sender is whatever the caller passed.
+        if name == "send_composed" {
+            continue;
+        }
+        let senders: Vec<SenderKind> = call_args(body, "message_from(")
+            .iter()
+            .map(|args| args[0])
+            .chain(call_args(body, "send_composed(").iter().map(|args| args[1]))
+            .map(|arg| sender_kind(name, body, arg))
+            .collect();
+        seen_senders += senders.len();
         let guest = name.starts_with("send_guest_") || name == "send_invite_email";
         if guest {
             seen_guest += 1;
+            assert!(
+                !body.contains("Sender::Instance") && !body.contains("Message::builder"),
+                "{name} is guest-facing but can build a message not sent as the host"
+            );
             // Thin wrappers delegate to the `_ex` variant.
             let delegates = body.contains(&format!("{name}_ex("));
             assert!(
-                uses_host || delegates,
-                "{name} is guest-facing but not sent as the host"
+                !senders.is_empty() || delegates,
+                "{name} is guest-facing but sends nothing as the host"
             );
+            for kind in &senders {
+                assert_eq!(
+                    *kind,
+                    SenderKind::Host,
+                    "{name} is guest-facing but sends a message as the instance"
+                );
+            }
         } else {
-            assert!(
-                !uses_host,
-                "{name} is not guest-facing but sent as the host"
-            );
+            for kind in &senders {
+                assert_eq!(
+                    *kind,
+                    SenderKind::Instance,
+                    "{name} is not guest-facing but sent as the host"
+                );
+            }
         }
     }
     assert!(seen_guest >= 10, "only {seen_guest} guest senders found");
+    assert!(seen_senders >= 20, "only {seen_senders} sender uses found");
+}
+
+#[test]
+fn sender_guard_sees_every_message_of_a_function() {
+    let body = "pub async fn send_guest_x() {\n    \
+                let sender = Sender::Host { name, email, lang };\n    \
+                config.message_from(Sender::host_of(d))?.to(to);\n    \
+                send_composed(config, sender, to, mail, None).await?;\n    \
+                send_composed(\n        config,\n        Sender::Instance,\n        to,\n        mail,\n        Some((\"a\", b, \"c\")),\n    )\n    .await\n}\n";
+    let fns = async_fns(body);
+    assert_eq!(fns.len(), 1);
+    let (name, body) = fns[0];
+    assert_eq!(name, "send_guest_x");
+    let composed: Vec<SenderKind> = call_args(body, "send_composed(")
+        .iter()
+        .map(|args| sender_kind(name, body, args[1]))
+        .collect();
+    assert_eq!(composed, [SenderKind::Host, SenderKind::Instance]);
+    assert_eq!(
+        sender_kind(name, body, call_args(body, "message_from(")[0][0]),
+        SenderKind::Host
+    );
 }
 
 // --- sanitize_ics ---
