@@ -1,5 +1,7 @@
 # Architecture
 
+This page gives the big picture. For a file-by-file map of the source (what each module under `src/web/` and `src/email/` owns, the key concepts and where to add a page, an email, a string or a migration), see [`ARCHITECTURE.md`](https://github.com/olivierlambert/calrs/blob/main/ARCHITECTURE.md) in the repository.
+
 ## Project structure
 
 ```
@@ -7,7 +9,7 @@ calrs/
 ├── Cargo.toml              Package manifest
 ├── Dockerfile              Multi-stage Docker build
 ├── calrs.service           systemd unit file
-├── migrations/             SQLite schema (35 incremental migrations, see migrations/ dir)
+├── migrations/             SQLite schema (incremental migrations, registered in src/db.rs)
 ├── templates/              Minijinja HTML templates
 │   ├── base.html           Base layout + CSS (light/dark mode)
 │   ├── auth/               Login, registration
