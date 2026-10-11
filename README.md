@@ -590,13 +590,15 @@ calrs/
     ├── db.rs                SQLite connection + migrations
     ├── models.rs            Domain types
     ├── auth.rs              Authentication (local + OIDC)
-    ├── email.rs             SMTP email with .ics invites + HTML templates
+    ├── email/               SMTP email with .ics invites + HTML templates
     ├── rrule.rs             Recurring event expansion (RRULE)
     ├── utils.rs             Shared utilities (iCal splitting/parsing)
     ├── caldav/mod.rs        CalDAV client (RFC 4791) + write-back
-    ├── web/mod.rs           Axum web server + all handlers
+    ├── web/                 Axum web server, one file per area
     └── commands/            CLI subcommands
 ```
+
+Contributing code? Start with [ARCHITECTURE.md](ARCHITECTURE.md): which file owns what, the main concepts, and where to add a route, an email, a translatable string or a migration.
 
 **Storage:** SQLite (WAL mode). Single file, zero ops.
 
