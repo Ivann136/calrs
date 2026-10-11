@@ -492,6 +492,115 @@ async fn due_reminders(pool: &SqlitePool, now: chrono::DateTime<Utc>) -> Vec<Due
                AND datetime(b.start_at) > datetime(?1)",).bind(now.to_rfc3339()).fetch_all(pool).await.unwrap_or_default()
 }
 
+/// Log a failed email send with enough context to find the booking again.
+/// Email is best-effort everywhere in the booking flow, but a failure that
+/// leaves no trace is how #236 went unnoticed: `send_email` logs the SMTP
+/// error, this adds which message it was and for which booking. `booking` is
+/// the booking's iCal uid, or its row id where the uid is not at hand.
+fn log_email_result(result: anyhow::Result<()>, email: &'static str, booking: &str) {
+    if let Err(e) = result {
+        tracing::warn!(email, booking = %booking, error = %e, "email send failed");
+    }
+}
+
+/// Send booking-flow emails after the HTTP response instead of before it.
+/// The booking (or its cancellation, approval, ...) is already committed when
+/// this is called, so the guest must not wait on SMTP to see the result: a
+/// slow or dead relay used to stall the request until the reverse proxy gave
+/// up with a 504, and guests retried a booking that existed (#236). The
+/// future owns everything it needs; failures are logged via
+/// `log_email_result` inside it.
+fn spawn_emails<F>(task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(task);
+}
+
+/// Everything the new-booking emails need, owned so it can outlive the
+/// request. Shared by the four guest booking handlers (personal, user-scoped,
+/// dynamic group, team), which used to repeat the same send sequence inline.
+struct NewBookingEmails {
+    smtp_config: crate::email::SmtpConfig,
+    details: crate::email::BookingDetails,
+    /// Host-side recipients as (name, email). Collective team bookings list
+    /// every member; everything else lists the single host from `details`.
+    host_recipients: Vec<(String, String)>,
+    booking_id: String,
+    needs_approval: bool,
+    confirm_token: Option<String>,
+    base_url: Option<String>,
+    guest_cancel_url: Option<String>,
+    guest_reschedule_url: Option<String>,
+    cancel_notice_min: Option<i32>,
+    reschedule_notice_min: Option<i32>,
+}
+
+/// Send the guest and host emails for a just-committed booking in the
+/// background (see `spawn_emails`).
+fn send_new_booking_emails(m: NewBookingEmails) {
+    spawn_emails(async move {
+        let uid = m.details.uid.as_str();
+        let host_details = |name: &str, email: &str| crate::email::BookingDetails {
+            host_name: name.to_string(),
+            host_email: email.to_string(),
+            ..m.details.clone()
+        };
+        if m.needs_approval {
+            for (name, email) in &m.host_recipients {
+                log_email_result(
+                    crate::email::send_host_approval_request(
+                        &m.smtp_config,
+                        &host_details(name, email),
+                        &m.booking_id,
+                        m.confirm_token.as_deref(),
+                        m.base_url.as_deref(),
+                    )
+                    .await,
+                    "host_approval_request",
+                    uid,
+                );
+            }
+            log_email_result(
+                crate::email::send_guest_pending_notice_ex(
+                    &m.smtp_config,
+                    &m.details,
+                    m.guest_cancel_url.as_deref(),
+                    m.guest_reschedule_url.as_deref(),
+                )
+                .await,
+                "guest_pending_notice",
+                uid,
+            );
+        } else {
+            log_email_result(
+                crate::email::send_guest_confirmation_ex(
+                    &m.smtp_config,
+                    &m.details,
+                    m.guest_cancel_url.as_deref(),
+                    m.guest_reschedule_url.as_deref(),
+                    m.cancel_notice_min,
+                    m.reschedule_notice_min,
+                )
+                .await,
+                "guest_confirmation",
+                uid,
+            );
+            for (name, email) in &m.host_recipients {
+                log_email_result(
+                    crate::email::send_host_notification(
+                        &m.smtp_config,
+                        &host_details(name, email),
+                    )
+                    .await,
+                    "host_notification",
+                    uid,
+                );
+            }
+        }
+    });
+}
+
 /// Background task that sends booking reminders on a 60-second tick. Also
 /// piggybacks an hourly sweep of expired sessions so the `sessions` table
 /// doesn't accumulate dead rows indefinitely.
@@ -611,13 +720,23 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             let mut notified = false;
 
             if let Some(smtp_config) = &smtp_config {
-                let _ = crate::email::send_guest_reminder(
-                    smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                )
-                .await;
-                let _ = crate::email::send_host_reminder(smtp_config, &details).await;
+                // Inline on purpose: this loop is already off the request
+                // path, and `send_email` bounds each attempt.
+                log_email_result(
+                    crate::email::send_guest_reminder(
+                        smtp_config,
+                        &details,
+                        guest_cancel_url.as_deref(),
+                    )
+                    .await,
+                    "guest_reminder",
+                    uid,
+                );
+                log_email_result(
+                    crate::email::send_host_reminder(smtp_config, &details).await,
+                    "host_reminder",
+                    uid,
+                );
                 notified = true;
             }
 
@@ -4535,12 +4654,27 @@ async fn cancel_booking(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        if was_pending {
-            let _ = crate::email::send_guest_decline_notice(&smtp_config, &details).await;
-        } else {
-            let _ = crate::email::send_guest_cancellation(&smtp_config, &details).await;
-            let _ = crate::email::send_host_cancellation(&smtp_config, &details).await;
-        }
+        let details = details.clone();
+        spawn_emails(async move {
+            if was_pending {
+                log_email_result(
+                    crate::email::send_guest_decline_notice(&smtp_config, &details).await,
+                    "guest_decline_notice",
+                    &details.uid,
+                );
+            } else {
+                log_email_result(
+                    crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                    "guest_cancellation",
+                    &details.uid,
+                );
+                log_email_result(
+                    crate::email::send_host_cancellation(&smtp_config, &details).await,
+                    "host_cancellation",
+                    &details.uid,
+                );
+            }
+        });
     }
 
     // Cancellation SMS to the guest, independent of SMTP. Declines
@@ -4761,20 +4895,28 @@ async fn confirm_booking(
         });
         let (cancel_notice_min, reschedule_notice_min) =
             fetch_event_type_notice_minutes(&state.pool, &et_id).await;
-        let _ = crate::email::send_guest_confirmation_ex(
-            &smtp_config,
-            &details,
-            guest_cancel_url.as_deref(),
-            guest_reschedule_url.as_deref(),
-            cancel_notice_min,
-            reschedule_notice_min,
-        )
-        .await;
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_confirmation_ex(
+                    &smtp_config,
+                    &details,
+                    guest_cancel_url.as_deref(),
+                    guest_reschedule_url.as_deref(),
+                    cancel_notice_min,
+                    reschedule_notice_min,
+                )
+                .await,
+                "guest_confirmation",
+                &details.uid,
+            );
 
-        // Also send host a confirmation email (no ICS, event pushed via CalDAV)
-        if let Err(e) = crate::email::send_host_booking_confirmed(&smtp_config, &details).await {
-            tracing::error!(error = %e, host_email = %details.host_email, "host confirmation email failed");
-        }
+            // Also send host a confirmation email (no ICS, event pushed via CalDAV)
+            log_email_result(
+                crate::email::send_host_booking_confirmed(&smtp_config, &details).await,
+                "host_booking_confirmed",
+                &details.uid,
+            );
+        });
     }
 
     Redirect::to("/dashboard/bookings").into_response()
@@ -7915,8 +8057,8 @@ async fn send_invite_bulk(
                     expires_at.as_deref(),
                 )
                 .await;
-                if send_res.is_err() {
-                    tracing::warn!(email = %email, "bulk invite SMTP send failed");
+                if let Err(e) = send_res {
+                    tracing::warn!(email = %email, error = %e, "bulk invite SMTP send failed");
                     result.failed.push(email);
                     continue;
                 }
@@ -10867,48 +11009,19 @@ async fn handle_group_booking(
             vec![(details.host_name.clone(), details.host_email.clone())]
         };
 
-        if needs_approval {
-            for (name, email) in &host_recipients {
-                let member_details = crate::email::BookingDetails {
-                    host_name: name.clone(),
-                    host_email: email.clone(),
-                    ..details.clone()
-                };
-                let _ = crate::email::send_host_approval_request(
-                    &smtp_config,
-                    &member_details,
-                    &id,
-                    confirm_token.as_deref(),
-                    base_url.as_deref(),
-                )
-                .await;
-            }
-            let _ = crate::email::send_guest_pending_notice_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
-        } else {
-            let _ = crate::email::send_guest_confirmation_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-                cancel_notice_min,
-                reschedule_notice_min,
-            )
-            .await;
-            for (name, email) in &host_recipients {
-                let member_details = crate::email::BookingDetails {
-                    host_name: name.clone(),
-                    host_email: email.clone(),
-                    ..details.clone()
-                };
-                let _ = crate::email::send_host_notification(&smtp_config, &member_details).await;
-            }
-        }
+        send_new_booking_emails(NewBookingEmails {
+            smtp_config,
+            details,
+            host_recipients,
+            booking_id: id.clone(),
+            needs_approval,
+            confirm_token: confirm_token.clone(),
+            base_url,
+            guest_cancel_url,
+            guest_reschedule_url,
+            cancel_notice_min,
+            reschedule_notice_min,
+        });
     }
 
     // Send booking SMS independently of the email/host notification path.
@@ -11914,34 +12027,20 @@ async fn handle_dynamic_group_booking(
             )
         });
 
-        if needs_approval {
-            let _ = crate::email::send_host_approval_request(
-                &smtp_config,
-                &details,
-                &id,
-                confirm_token.as_deref(),
-                base_url.as_deref(),
-            )
-            .await;
-            let _ = crate::email::send_guest_pending_notice_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
-        } else {
-            let _ = crate::email::send_guest_confirmation_ex(
-                &smtp_config,
-                &details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-                cancel_notice_min,
-                reschedule_notice_min,
-            )
-            .await;
-            let _ = crate::email::send_host_notification(&smtp_config, &details).await;
-        }
+        let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+        send_new_booking_emails(NewBookingEmails {
+            smtp_config,
+            details,
+            host_recipients,
+            booking_id: id.clone(),
+            needs_approval,
+            confirm_token: confirm_token.clone(),
+            base_url,
+            guest_cancel_url,
+            guest_reschedule_url,
+            cancel_notice_min,
+            reschedule_notice_min,
+        });
     }
 
     let host_display = dg_users
@@ -12880,34 +12979,20 @@ async fn handle_booking_for_user(
                 )
             });
 
-            if needs_approval {
-                let _ = crate::email::send_host_approval_request(
-                    &smtp_config,
-                    &details,
-                    &id,
-                    confirm_token.as_deref(),
-                    base_url.as_deref(),
-                )
-                .await;
-                let _ = crate::email::send_guest_pending_notice_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                )
-                .await;
-            } else {
-                let _ = crate::email::send_guest_confirmation_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                    cancel_notice_min,
-                    reschedule_notice_min,
-                )
-                .await;
-                let _ = crate::email::send_host_notification(&smtp_config, &details).await;
-            }
+            let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+            send_new_booking_emails(NewBookingEmails {
+                smtp_config,
+                details,
+                host_recipients,
+                booking_id: id.clone(),
+                needs_approval,
+                confirm_token: confirm_token.clone(),
+                base_url,
+                guest_cancel_url,
+                guest_reschedule_url,
+                cancel_notice_min,
+                reschedule_notice_min,
+            });
         }
     }
 
@@ -15539,34 +15624,20 @@ async fn handle_booking(
                 )
             });
 
-            if needs_approval {
-                let _ = crate::email::send_host_approval_request(
-                    &smtp_config,
-                    &details,
-                    &id,
-                    confirm_token.as_deref(),
-                    base_url.as_deref(),
-                )
-                .await;
-                let _ = crate::email::send_guest_pending_notice_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                )
-                .await;
-            } else {
-                let _ = crate::email::send_guest_confirmation_ex(
-                    &smtp_config,
-                    &details,
-                    guest_cancel_url.as_deref(),
-                    guest_reschedule_url.as_deref(),
-                    cancel_notice_min,
-                    reschedule_notice_min,
-                )
-                .await;
-                let _ = crate::email::send_host_notification(&smtp_config, &details).await;
-            }
+            let host_recipients = vec![(details.host_name.clone(), details.host_email.clone())];
+            send_new_booking_emails(NewBookingEmails {
+                smtp_config,
+                details,
+                host_recipients,
+                booking_id: id.clone(),
+                needs_approval,
+                confirm_token: confirm_token.clone(),
+                base_url,
+                guest_cancel_url,
+                guest_reschedule_url,
+                cancel_notice_min,
+                reschedule_notice_min,
+            });
         }
     }
 
@@ -19340,20 +19411,29 @@ async fn approve_booking_by_token(
         });
         let (cancel_notice_min, reschedule_notice_min) =
             fetch_event_type_notice_minutes(&state.pool, &event_type_id).await;
-        let _ = crate::email::send_guest_confirmation_ex(
-            &smtp_config,
-            &details,
-            guest_cancel_url.as_deref(),
-            guest_reschedule_url.as_deref(),
-            cancel_notice_min,
-            reschedule_notice_min,
-        )
-        .await;
+        let details = details.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_confirmation_ex(
+                    &smtp_config,
+                    &details,
+                    guest_cancel_url.as_deref(),
+                    guest_reschedule_url.as_deref(),
+                    cancel_notice_min,
+                    reschedule_notice_min,
+                )
+                .await,
+                "guest_confirmation",
+                &details.uid,
+            );
 
-        // Also send host a confirmation email (no ICS, event pushed via CalDAV)
-        if let Err(e) = crate::email::send_host_booking_confirmed(&smtp_config, &details).await {
-            tracing::error!(error = %e, host_email = %details.host_email, "host confirmation email failed");
-        }
+            // Also send host a confirmation email (no ICS, event pushed via CalDAV)
+            log_email_result(
+                crate::email::send_host_booking_confirmed(&smtp_config, &details).await,
+                "host_booking_confirmed",
+                &details.uid,
+            );
+        });
     }
 
     // Confirmation SMS to the guest, now that the booking is confirmed. This
@@ -19544,7 +19624,14 @@ async fn decline_booking_by_token(
             host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
-        let _ = crate::email::send_guest_decline_notice(&smtp_config, &details).await;
+        let bid = bid.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_decline_notice(&smtp_config, &details).await,
+                "guest_decline_notice",
+                &bid,
+            );
+        });
     }
 
     let tmpl = match state.templates.get_template("booking_declined.html") {
@@ -19988,8 +20075,19 @@ async fn guest_cancel_booking(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        let _ = crate::email::send_guest_cancellation(&smtp_config, &details).await;
-        let _ = crate::email::send_host_cancellation(&smtp_config, &details).await;
+        let details = details.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                "guest_cancellation",
+                &details.uid,
+            );
+            log_email_result(
+                crate::email::send_host_cancellation(&smtp_config, &details).await,
+                "host_cancellation",
+                &details.uid,
+            );
+        });
     }
 
     // Cancellation SMS to the guest, independent of SMTP.
@@ -20789,13 +20887,6 @@ async fn guest_reschedule_booking(
                 location: loc_value.clone(),
                 host_timezone: host_tz.name().to_string(),
             };
-            let _ = crate::email::send_host_reschedule_request(
-                &smtp_config,
-                &reschedule_details,
-                Some(&new_confirm_token),
-                base_url.as_deref(),
-            )
-            .await;
 
             // Send guest pending notice with new tokens
             let guest_cancel_url = base_url.as_ref().map(|base| {
@@ -20832,13 +20923,32 @@ async fn guest_reschedule_booking(
                 resource_name: booking_resource_label(&state.pool, &uid).await,
                 ..Default::default()
             };
-            let _ = crate::email::send_guest_pending_notice_ex(
-                &smtp_config,
-                &pending_details,
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
+            let new_confirm_token = new_confirm_token.clone();
+            spawn_emails(async move {
+                let uid = reschedule_details.uid.as_str();
+                log_email_result(
+                    crate::email::send_host_reschedule_request(
+                        &smtp_config,
+                        &reschedule_details,
+                        Some(&new_confirm_token),
+                        base_url.as_deref(),
+                    )
+                    .await,
+                    "host_reschedule_request",
+                    uid,
+                );
+                log_email_result(
+                    crate::email::send_guest_pending_notice_ex(
+                        &smtp_config,
+                        &pending_details,
+                        guest_cancel_url.as_deref(),
+                        guest_reschedule_url.as_deref(),
+                    )
+                    .await,
+                    "guest_pending_notice",
+                    uid,
+                );
+            });
         }
     } else {
         // Confirmed reschedule (host-initiated or guest on non-confirmation event)
@@ -20891,35 +21001,47 @@ async fn guest_reschedule_booking(
                 )
             });
 
-            // Notify guest with confirmation + ICS
-            let _ = crate::email::send_guest_reschedule_notification(
-                &smtp_config,
-                &crate::email::RescheduleDetails {
-                    old_utc_times: crate::booking_time::ics_times(&old_start_at, &old_end_at),
-                    utc_times: crate::booking_time::ics_times(&new_start_at, &new_end_at),
-                    event_title: et_title.clone(),
-                    old_date,
-                    old_start_time,
-                    old_end_time,
-                    new_date: form.date.clone(),
-                    new_start_time: form.time.clone(),
-                    new_end_time: guest_end_time.clone(),
-                    guest_name: guest_name.clone(),
-                    guest_email: guest_email.clone(),
-                    guest_timezone: new_guest_timezone,
-                    host_name: host_name.clone(),
-                    host_email: host_email.clone(),
+            let reschedule_details = crate::email::RescheduleDetails {
+                old_utc_times: crate::booking_time::ics_times(&old_start_at, &old_end_at),
+                utc_times: crate::booking_time::ics_times(&new_start_at, &new_end_at),
+                event_title: et_title.clone(),
+                old_date,
+                old_start_time,
+                old_end_time,
+                new_date: form.date.clone(),
+                new_start_time: form.time.clone(),
+                new_end_time: guest_end_time.clone(),
+                guest_name: guest_name.clone(),
+                guest_email: guest_email.clone(),
+                guest_timezone: new_guest_timezone,
+                host_name: host_name.clone(),
+                host_email: host_email.clone(),
+                uid,
+                location: loc_value,
+                host_timezone: host_tz.name().to_string(),
+            };
+            spawn_emails(async move {
+                let uid = reschedule_details.uid.as_str();
+                // Notify guest with confirmation + ICS
+                log_email_result(
+                    crate::email::send_guest_reschedule_notification(
+                        &smtp_config,
+                        &reschedule_details,
+                        guest_cancel_url.as_deref(),
+                        guest_reschedule_url.as_deref(),
+                    )
+                    .await,
+                    "guest_reschedule_notification",
                     uid,
-                    location: loc_value,
-                    host_timezone: host_tz.name().to_string(),
-                },
-                guest_cancel_url.as_deref(),
-                guest_reschedule_url.as_deref(),
-            )
-            .await;
+                );
 
-            // Notify host
-            let _ = crate::email::send_host_booking_confirmed(&smtp_config, &push_details).await;
+                // Notify host
+                log_email_result(
+                    crate::email::send_host_booking_confirmed(&smtp_config, &push_details).await,
+                    "host_booking_confirmed",
+                    uid,
+                );
+            });
         }
     }
 
@@ -21160,14 +21282,21 @@ async fn host_reschedule_booking(
             ..Default::default()
         };
 
-        if let Some(url) = &reschedule_url {
-            let _ = crate::email::send_guest_pick_new_time(
-                &smtp_config,
-                &details,
-                url,
-                cancel_url.as_deref(),
-            )
-            .await;
+        if let Some(url) = reschedule_url {
+            let bid = bid.clone();
+            spawn_emails(async move {
+                log_email_result(
+                    crate::email::send_guest_pick_new_time(
+                        &smtp_config,
+                        &details,
+                        &url,
+                        cancel_url.as_deref(),
+                    )
+                    .await,
+                    "guest_pick_new_time",
+                    &bid,
+                );
+            });
         }
     }
 
@@ -22428,6 +22557,10 @@ async fn notify_watchers(
         }
     };
 
+    // Claim tokens are written here, in the request; the emails carrying them
+    // go out in the background so a slow relay cannot stall the booking.
+    let mut outgoing: Vec<(String, String, String)> = Vec::new();
+
     for (team_id,) in &watcher_team_ids {
         // Get all members of the watcher team
         let members: Vec<(String, String, String)> = sqlx::query_as(
@@ -22463,19 +22596,36 @@ async fn notify_watchers(
                 token
             );
 
-            let _ = crate::email::send_watcher_claim_notification(
-                &smtp_config,
-                details,
-                user_name,
-                user_email,
-                assigned_to_name,
-                &claim_url,
-            )
-            .await;
+            outgoing.push((user_name.clone(), user_email.clone(), claim_url));
         }
     }
 
-    tracing::info!(booking_id = %booking_id, event_type_id = %event_type_id, "watcher claim notifications sent");
+    tracing::info!(
+        booking_id = %booking_id,
+        event_type_id = %event_type_id,
+        recipients = outgoing.len(),
+        "watcher claim notifications queued"
+    );
+
+    let details = details.clone();
+    let assigned_to_name = assigned_to_name.to_string();
+    spawn_emails(async move {
+        for (user_name, user_email, claim_url) in &outgoing {
+            log_email_result(
+                crate::email::send_watcher_claim_notification(
+                    &smtp_config,
+                    &details,
+                    user_name,
+                    user_email,
+                    &assigned_to_name,
+                    claim_url,
+                )
+                .await,
+                "watcher_claim_notification",
+                &details.uid,
+            );
+        }
+    });
 }
 
 // --- Claim endpoints ---
@@ -22872,13 +23022,22 @@ async fn claim_booking(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        let _ = crate::email::send_claim_confirmation(
-            &smtp_config,
-            &details,
-            &claimant_name,
-            &claimant_email,
-        )
-        .await;
+        let details = details.clone();
+        let claimant_name = claimant_name.clone();
+        let claimant_email = claimant_email.clone();
+        spawn_emails(async move {
+            log_email_result(
+                crate::email::send_claim_confirmation(
+                    &smtp_config,
+                    &details,
+                    &claimant_name,
+                    &claimant_email,
+                )
+                .await,
+                "claim_confirmation",
+                &details.uid,
+            );
+        });
     }
 
     // Render success page
@@ -29853,6 +30012,78 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 1, "Booking should be created in DB");
+    }
+
+    /// #236: an SMTP relay that accepts the connection and then never answers
+    /// used to hold the booking request until the reverse proxy gave up with
+    /// a 504, although the booking was already committed. The confirmation
+    /// page must come back without waiting on SMTP at all.
+    #[tokio::test]
+    async fn booking_does_not_wait_on_a_stalled_smtp_relay() {
+        let (app, pool, _, _) = setup_test_app().await;
+        let csrf = "test-csrf-stalled-smtp";
+
+        // A relay that accepts and then stays silent: no 220 greeting ever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = connected_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(sock);
+        });
+
+        sqlx::query(
+            "INSERT INTO smtp_config (id, host, port, username, password_enc, from_email, tls_mode, enabled) \
+             VALUES (?, '127.0.0.1', ?, '', ?, 'noreply@test.com', 'none', 1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(port as i64)
+        .bind(crate::crypto::encrypt_password(&[0u8; 32], "").unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut next_monday = now.date() + Duration::days(1);
+        while next_monday.weekday() != chrono::Weekday::Mon {
+            next_monday += Duration::days(1);
+        }
+        let date_str = next_monday.format("%Y-%m-%d").to_string();
+        let body = format!(
+            "_csrf={}&date={}&time=10%3A00&name=Jane+Doe&email=jane%40example.com&notes=",
+            csrf, date_str
+        );
+
+        // Well under SMTP_SEND_TIMEOUT: only a non-blocking send passes this.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &body,
+            )),
+        )
+        .await
+        .expect("booking response waited on the stalled SMTP relay")
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM bookings WHERE guest_email = 'jane@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "Booking should be created in DB");
+
+        // The email path did run (in the background), so the test is not
+        // passing merely because SMTP was never reached.
+        tokio::time::timeout(std::time::Duration::from_secs(5), connected_rx)
+            .await
+            .expect("the background email task never reached the relay")
+            .unwrap();
+        relay.abort();
     }
 
     #[tokio::test]

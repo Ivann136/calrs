@@ -33,6 +33,7 @@ fn host_lang(details: &BookingDetails) -> &str {
     details.host_language.as_deref().unwrap_or("en")
 }
 
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub host: String,
     pub port: u16,
@@ -168,7 +169,7 @@ pub struct BookingDetails {
     pub resource_name: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CancellationDetails {
     /// Exact UTC endpoints for new bookings; legacy records use wall-clock fields.
     pub utc_times: Option<(String, String)>,
@@ -2398,7 +2399,27 @@ pub async fn send_invite_email(
     send_email(config, email).await
 }
 
+/// How long to wait for the TCP (and implicit TLS) connection to the SMTP
+/// server. lettre's async transport only applies its timeout to the connect
+/// step, so this alone cannot bound a server that accepts and then stalls.
+pub const SMTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Hard ceiling on one whole delivery: connect, greeting, EHLO, STARTTLS,
+/// AUTH, envelope and DATA. A relay that accepts the connection and then goes
+/// quiet would otherwise hold the caller forever (#236), which on the booking
+/// path meant the reverse proxy answering 504 for a booking that existed.
+pub const SMTP_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
+    send_email_with_timeouts(config, email, SMTP_CONNECT_TIMEOUT, SMTP_SEND_TIMEOUT).await
+}
+
+async fn send_email_with_timeouts(
+    config: &SmtpConfig,
+    email: Message,
+    connect_timeout: std::time::Duration,
+    send_timeout: std::time::Duration,
+) -> Result<()> {
     let builder = match config.tls_mode {
         SmtpTlsMode::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.host)?,
         SmtpTlsMode::StartTls => {
@@ -2421,7 +2442,8 @@ async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
             AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.host)
         }
     }
-    .port(config.port);
+    .port(config.port)
+    .timeout(Some(connect_timeout));
 
     // An empty username means "no SMTP AUTH". lettre only skips authentication
     // when the transport carries no credentials at all: given empty ones it
@@ -2447,21 +2469,36 @@ async fn send_email(config: &SmtpConfig, email: Message) -> Result<()> {
         .map(|a| a.to_string())
         .collect();
     let to_display = to_addrs.join(", ");
-    match mailer.send(email).await {
-        Ok(_) => {
+    match tokio::time::timeout(send_timeout, mailer.send(email)).await {
+        Ok(Ok(_)) => {
             tracing::debug!(to = %to_display, "email delivered");
             Ok(())
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(to = %to_display, error = %e, "email delivery failed");
             Err(e.into())
+        }
+        Err(_) => {
+            tracing::error!(
+                to = %to_display,
+                host = %config.host,
+                port = config.port,
+                timeout_secs = send_timeout.as_secs(),
+                "email delivery timed out"
+            );
+            anyhow::bail!(
+                "SMTP server {}:{} did not complete the delivery within {}s",
+                config.host,
+                config.port,
+                send_timeout.as_secs_f32()
+            )
         }
     }
 }
 
 // --- Reschedule emails ---
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RescheduleDetails {
     pub old_utc_times: Option<(String, String)>,
     /// Exact UTC endpoints for new bookings; legacy records use wall-clock fields.
@@ -3335,6 +3372,50 @@ mod tests {
             .expect("server timed out")
             .unwrap();
         assert!(!seen.iter().any(|c| c.starts_with("MAIL FROM")), "{seen:?}");
+    }
+
+    /// #236: a relay that accepts the TCP connection and then never speaks
+    /// must not hold the caller. lettre's own timeout only covers connect, so
+    /// this exercises the outer deadline around the whole delivery.
+    #[tokio::test]
+    async fn stalled_relay_times_out_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept, hold the socket open, and never send the 220 greeting.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(sock);
+        });
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_email_with_timeouts(
+                &plaintext_config(port, ""),
+                test_message(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("send_email ignored its deadline")
+        .expect_err("a silent relay cannot deliver");
+        assert!(
+            err.to_string().contains("within"),
+            "unexpected error: {err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        server.abort();
+    }
+
+    #[test]
+    fn smtp_timeouts_fit_under_a_reverse_proxy() {
+        // nginx and most proxies give up on an upstream after 60s. The admin
+        // "send test email" call is still synchronous, so a dead relay must
+        // fail well before that.
+        assert!(SMTP_CONNECT_TIMEOUT <= SMTP_SEND_TIMEOUT);
+        assert!(SMTP_SEND_TIMEOUT < std::time::Duration::from_secs(60));
     }
 
     #[test]
