@@ -384,25 +384,25 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   </div>
   <form method="post" action="/dashboard/admin/captcha">
     <div class="form-group">
-      <label>{{ t("admin-instance-url") }}</label>
-      <input type="url" name="captcha_instance_url" value="{{ captcha_instance_url }}" placeholder="https://captcha.example.com">
+      <label for="captcha_instance_url">{{ t("admin-instance-url") }}</label>
+      <input type="url" id="captcha_instance_url" name="captcha_instance_url" value="{{ captcha_instance_url }}" placeholder="https://captcha.example.com">
     </div>
     <div class="form-group">
-      <label>{{ t("admin-site-key") }}</label>
-      <input type="text" name="captcha_site_key" value="{{ captcha_site_key }}" placeholder="your-site-key">
+      <label for="captcha_site_key">{{ t("admin-site-key") }}</label>
+      <input type="text" id="captcha_site_key" name="captcha_site_key" value="{{ captcha_site_key }}" placeholder="your-site-key">
     </div>
     <div class="form-group">
-      <label>{{ t("admin-secret") }} <span class="hint">{{ t("admin-keep-current-hint") }}</span></label>
-      <input type="password" name="captcha_secret" value="" placeholder="{{ t('admin-keep-unchanged') }}">
+      <label for="captcha_secret">{{ t("admin-secret") }} <span class="hint">{{ t("admin-keep-current-hint") }}</span></label>
+      <input type="password" id="captcha_secret" name="captcha_secret" value="" placeholder="{{ t('admin-keep-unchanged') }}">
     </div>
     <div class="form-group">
-      <label>{{ t("admin-widget-url") }} <span class="hint">{{ t("team-form-optional") }}</span></label>
-      <input type="url" name="captcha_widget_url" value="{{ captcha_widget_url }}" placeholder="https://cdn.jsdelivr.net/npm/cap-widget">
+      <label for="captcha_widget_url">{{ t("admin-widget-url") }} <span class="hint">{{ t("team-form-optional") }}</span></label>
+      <input type="url" id="captcha_widget_url" name="captcha_widget_url" value="{{ captcha_widget_url }}" placeholder="https://cdn.jsdelivr.net/npm/cap-widget">
       <span style="font-size: 0.8rem; color: var(--text-muted);">{{ t("admin-widget-url-help") }}</span>
     </div>
     <div class="form-group">
-      <label>{{ t("admin-wasm-url") }} <span class="hint">{{ t("team-form-optional") }}</span></label>
-      <input type="url" name="captcha_wasm_url" value="{{ captcha_wasm_url }}" placeholder="https://captcha.example.com/assets/cap_wasm_bg.wasm">
+      <label for="captcha_wasm_url">{{ t("admin-wasm-url") }} <span class="hint">{{ t("team-form-optional") }}</span></label>
+      <input type="url" id="captcha_wasm_url" name="captcha_wasm_url" value="{{ captcha_wasm_url }}" placeholder="https://captcha.example.com/assets/cap_wasm_bg.wasm">
       <span style="font-size: 0.8rem; color: var(--text-muted);">{{ t("admin-wasm-url-help") }}</span>
     </div>
     <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">{{ t("admin-captcha-disable-help") }}</p>

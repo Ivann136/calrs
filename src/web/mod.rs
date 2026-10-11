@@ -32913,6 +32913,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_captcha_inputs_are_labelled() {
+        let (app, _, session, _) = setup_test_app().await;
+        let response = app
+            .oneshot(get_authed("/dashboard/admin", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        for field in [
+            "captcha_instance_url",
+            "captcha_site_key",
+            "captcha_secret",
+            "captcha_widget_url",
+            "captcha_wasm_url",
+        ] {
+            assert_eq!(
+                body.matches(&format!("id=\"{field}\"")).count(),
+                1,
+                "{field} needs exactly one id"
+            );
+            assert!(
+                body.contains(&format!("<label for=\"{field}\">")),
+                "{field} has no label pointing at it"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn admin_non_admin_gets_403() {
         let (app, pool, _, _) = setup_test_app().await;
 
