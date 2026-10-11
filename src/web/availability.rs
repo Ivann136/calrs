@@ -899,6 +899,164 @@ pub(super) async fn compute_slots(
     result
 }
 
+/// The span a submit-time [`is_offered_slot`] check recomputes slots over:
+/// the target's host-local day, two days either side (a guest's calendar day
+/// can straddle up to three host days, and `first_slot_only` keeps the first
+/// slot per guest day), never before today. `busy_start`/`busy_end` is the
+/// window the caller fetches busy times for, padded by a day so buffers at
+/// the edges see the same events the slot page does.
+pub(super) struct OfferedSlotWindow {
+    pub(super) start_offset: i32,
+    pub(super) days_ahead: i32,
+    pub(super) busy_start: NaiveDateTime,
+    pub(super) busy_end: NaiveDateTime,
+}
+
+pub(super) fn offered_slot_window(host_tz: Tz, slot_start: NaiveDateTime) -> OfferedSlotWindow {
+    let today = Utc::now().with_timezone(&host_tz).naive_local().date();
+    // Booking forms cap the date at a year ahead before this runs, so the
+    // day count always fits.
+    let target = (slot_start.date() - today).num_days().clamp(-1, 100_000) as i32;
+    let start_offset = (target - 2).max(0);
+    let end_offset = (target + 2).max(start_offset);
+    let day = |offset: i32| today + Duration::days(offset as i64);
+    OfferedSlotWindow {
+        start_offset,
+        days_ahead: end_offset - start_offset + 1,
+        busy_start: day(start_offset - 1).and_time(NaiveTime::MIN),
+        busy_end: day(end_offset + 1)
+            .and_hms_opt(23, 59, 59)
+            .unwrap_or_else(|| day(end_offset + 1).and_time(NaiveTime::MIN)),
+    }
+}
+
+/// Whether `slot_start` (host-local) is a slot the booking page would offer,
+/// recomputed with [`compute_slots`] itself: weekly rules, date overrides
+/// (blocked days and custom hours), minimum notice, horizon, slot interval
+/// alignment, frequency limits, resources, `first_slot_only`, and the busy
+/// times in `busy` (fetched by the caller over `window`, with the same
+/// [`BusySource`] shape as the slot page for that URL). A submitted time is
+/// only ever a claim about what the page showed; this is what makes the
+/// server hold the page to it.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn is_offered_slot(
+    pool: &SqlitePool,
+    et_id: &str,
+    duration: i32,
+    buffer_before: i32,
+    buffer_after: i32,
+    min_notice: i32,
+    host_tz: Tz,
+    guest_tz: Tz,
+    window: &OfferedSlotWindow,
+    busy: BusySource,
+    exclude_booking_id: Option<&str>,
+    slot_start: NaiveDateTime,
+) -> bool {
+    let horizon = get_booking_horizon(pool, et_id).await;
+    let days = compute_slots(
+        pool,
+        et_id,
+        duration,
+        buffer_before,
+        buffer_after,
+        min_notice,
+        window.start_offset,
+        window.days_ahead,
+        horizon,
+        host_tz,
+        guest_tz,
+        busy,
+        exclude_booking_id,
+    )
+    .await;
+    let date = slot_start.format("%Y-%m-%d").to_string();
+    let time = slot_start.format("%H:%M").to_string();
+    days.iter()
+        .flat_map(|d| &d.slots)
+        .any(|s| s.host_date == date && s.host_time == time)
+}
+
+/// Busy times of a team event type's members over a window, as the team slot
+/// page and the team booking check both see them: every enabled member not
+/// excluded by a zero weight, constrained to their own working hours.
+/// Collective needs every member free, round robin any one.
+pub(super) async fn team_busy_source(
+    pool: &SqlitePool,
+    et_id: &str,
+    team_id: &str,
+    collective: bool,
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    host_tz: Tz,
+) -> BusySource {
+    let mut member_busy = HashMap::new();
+    for user_id in team_member_ids(pool, et_id, team_id).await {
+        let mut busy = fetch_busy_times_for_user(
+            pool,
+            &user_id,
+            window_start,
+            window_end,
+            host_tz,
+            Some(et_id),
+        )
+        .await;
+        // Members without explicit hours in user_availability_rules come back
+        // unconstrained (user_avail_as_busy short-circuits to an empty Vec),
+        // so this never plants a surprise 9-17 default.
+        busy.extend(user_avail_as_busy(pool, &user_id, window_start, window_end, host_tz).await);
+        member_busy.insert(user_id, busy);
+    }
+    if collective {
+        BusySource::Team(member_busy)
+    } else {
+        BusySource::Group(member_busy)
+    }
+}
+
+/// The members a team event type can be booked with: enabled, and not
+/// excluded from this event type by a zero weight.
+pub(super) async fn team_member_ids(pool: &SqlitePool, et_id: &str, team_id: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id \
+         LEFT JOIN event_type_member_weights etw ON etw.user_id = u.id AND etw.event_type_id = ? \
+         WHERE tm.team_id = ? AND u.enabled = 1 \
+         AND COALESCE(etw.weight, 1) > 0",
+    )
+    .bind(et_id)
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Busy times of a dynamic group link (`/u/alice+bob/slug`) over a window.
+/// The first user owns the event type, so only their calendars are filtered
+/// by its calendar selection; the others are constrained to their default
+/// working hours. Everyone must be free.
+pub(super) async fn dynamic_group_busy_source(
+    pool: &SqlitePool,
+    et_id: &str,
+    user_ids: &[String],
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    host_tz: Tz,
+) -> BusySource {
+    let mut member_busy = HashMap::new();
+    for (i, user_id) in user_ids.iter().enumerate() {
+        let et_filter = if i == 0 { Some(et_id) } else { None };
+        let mut busy =
+            fetch_busy_times_for_user(pool, user_id, window_start, window_end, host_tz, et_filter)
+                .await;
+        if i > 0 {
+            ensure_user_avail_seeded(pool, user_id).await;
+            busy.extend(user_avail_as_busy(pool, user_id, window_start, window_end, host_tz).await);
+        }
+        member_busy.insert(user_id.clone(), busy);
+    }
+    BusySource::Team(member_busy)
+}
+
 /// Remove slots that fall inside a host-local period already at/over a
 /// configured booking-frequency cap, so the picker doesn't surface times
 /// that the submit-time check would reject.
