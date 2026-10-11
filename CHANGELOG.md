@@ -164,8 +164,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 | Eight complete locales | 1.17.0 | English, French, German, Spanish, Italian, Polish, Brazilian Portuguese and Estonian at 100%, held there by a test |
 | Google Meet auto-links | 1.18.0 | Host-owned Google Meet conference per confirmed booking, using existing Google Calendar OAuth2 tokens (#45 phase 3) |
 | UTC booking storage | 1.18.0 | New bookings are stored in UTC, so reminders, cancellations and the dashboard no longer depend on the server's OS timezone |
+| Pending requests hold their slot | 1.19.0 | A request awaiting approval blocks its time like a confirmed booking, and can expire (declined, never accepted) with a host nudge halfway (#234) |
+| Every email in its reader's language | 1.19.0 | Host, member and watcher emails follow each recipient's saved language; guest emails, pages and SMS follow the language the guest booked in (#209) |
+| Guest emails from the host | 1.19.0 | "Host via Instance" sender name and Reply-To the host, on the instance address so SPF/DKIM/DMARC still align (#221) |
+| Write-back verified and retried | 1.19.0 | Events are read back after writing; failures are retried with backoff, flagged on the dashboard and emailed to the host; failing sources alert their owner (#162) |
+| Dutch locale | 1.19.0 | Ninth shipped language, contributed by @mdbraber |
+| `ARCHITECTURE.md` | 1.19.0 | Map of the code for contributors after `src/web` and `src/email` were split into feature modules |
 
-## [Unreleased]
+## [1.19.0] - 2026-10-11
+
+Minor release, mostly about reliability and language. **Pending requests now hold their slot** and can expire, so two guests can no longer request the same time (#234). **Calendar write-back is verified**: an event that never reached the host's calendar is retried, flagged on the dashboard and emailed to the host, and a calendar source that keeps failing alerts its owner (#162). **Every email is written in its reader's language**, and guest emails come from the host's name with a Reply-To to them (#209, #221). Dutch joins as the ninth locale. A red-team pass closed a booking-form bypass (a request sent straight to the booking URL could book a day the host had blocked), the last-admin lockout and missing server-side validation on event types, alongside some twenty other fixes. Six migrations (065 to 070), no required configuration change. **Back up your database before upgrading** and read the upgrade notes: `/u/` pages now follow the visitor's language by default, and log targets are more specific.
+
+Thanks to everyone who reported, tested and contributed to this one: @mdbraber, @Morthor, @Piergeek, @Nosochek, @hugo-fasone, @mkspflug, @joelgombin, @aburg, @gitwittidbit, @kosssi, @Fr0zenSide, @k00b0ld and @jptrmn.
 
 ### Added
 
@@ -188,6 +198,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Upgrade notes
 
+- **Back up the database before upgrading.** Migrations 065 to 070 add columns and settings; none rewrites existing data, but an older binary does not know them, so to roll back restore the pre-upgrade backup along with the old binary.
 - **`/u/{username}` pages now follow the visitor's language by default.** Since #76 they used the host's saved language. Migration 066 starts everyone, existing users included, on the visitor's language; hosts who want the previous behaviour can pick "Always my language" under "Public booking page language" in Profile & Settings.
 - Migration 065 adds the new settings. Existing event types get the slot hold on and **no expiry**, so requests that are already waiting are never declined by the upgrade; pick an expiry in the event type form to opt in.
 - Migration 067 adds the optional captcha WASM URL. Nothing changes until it is set.
