@@ -11176,6 +11176,11 @@ async fn handle_group_booking(
         return resp;
     }
     let lang = crate::i18n::detect_from_headers(&headers);
+    // The guest's own language (#209): their saved preference when logged
+    // in, else their browser's. Stored on the booking and used for every
+    // guest email and SMS. Not `lang`, which on a user's booking page follows
+    // the host's preference (#76).
+    let guest_lang = crate::auth::visitor_lang(&state.pool, &headers).await;
     let captcha_cfg = state.captcha_config.read().await;
     if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
         .await
@@ -11607,7 +11612,7 @@ async fn handle_group_booking(
     .bind(&reschedule_token)
     .bind(&assigned_user_id)
     .bind(&confirm_token)
-    .bind(lang)
+    .bind(guest_lang)
     .bind(&assigned_resource_id)
     .bind(&phone_to_store)
     .execute(&mut *tx)
@@ -11693,7 +11698,7 @@ async fn handle_group_booking(
         location: location_display.clone(),
         reminder_minutes: reminder_min,
         additional_attendees: additional_attendees.clone(),
-        guest_language: Some(lang.to_string()),
+        guest_language: Some(guest_lang.to_string()),
         host_language: match assigned_user_id.as_deref() {
             Some(member) => crate::email::user_language(&state.pool, member).await,
             None => None,
@@ -11796,7 +11801,7 @@ async fn handle_group_booking(
         &form.date,
         &form.time,
         &guest_timezone,
-        lang,
+        guest_lang,
     )
     .await;
 
@@ -12349,6 +12354,11 @@ async fn handle_dynamic_group_booking(
     form: &BookForm,
 ) -> Response {
     let lang = crate::i18n::detect_from_headers(headers);
+    // The guest's own language (#209): their saved preference when logged
+    // in, else their browser's. Stored on the booking and used for every
+    // guest email and SMS. Not `lang`, which on a user's booking page follows
+    // the host's preference (#76).
+    let guest_lang = crate::auth::visitor_lang(&state.pool, headers).await;
     // Rate limit by IP
     let client_ip = client_ip_for_rate_limit(headers);
     if state.booking_limiter.check_limited(&client_ip).await {
@@ -12656,7 +12666,7 @@ async fn handle_dynamic_group_booking(
     .bind(&cancel_token)
     .bind(&reschedule_token)
     .bind(&confirm_token)
-    .bind(lang)
+    .bind(guest_lang)
     .bind(&assigned_resource_id)
     .bind(&phone_to_store)
     .execute(&mut *tx)
@@ -12750,7 +12760,7 @@ async fn handle_dynamic_group_booking(
         location: location_display.clone(),
         reminder_minutes: reminder_min,
         additional_attendees: all_additional.clone(),
-        guest_language: Some(lang.to_string()),
+        guest_language: Some(guest_lang.to_string()),
         host_language: crate::email::user_language(&state.pool, &owner_user_id).await,
         host_timezone: host_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
@@ -13373,6 +13383,11 @@ async fn handle_booking_for_user(
     };
 
     let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
+    // The guest's own language (#209): their saved preference when logged
+    // in, else their browser's. Stored on the booking and used for every
+    // guest email and SMS. Not `lang`, which on a user's booking page follows
+    // the host's preference (#76).
+    let guest_lang = crate::auth::visitor_lang(&state.pool, &headers).await;
     let needs_approval = requires_confirmation != 0;
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
     let phone_to_store = match resolve_guest_phone(
@@ -13615,7 +13630,7 @@ async fn handle_booking_for_user(
     .bind(&cancel_token)
     .bind(&reschedule_token)
     .bind(&confirm_token)
-    .bind(lang)
+    .bind(guest_lang)
     .bind(&assigned_resource_id)
     .bind(&phone_to_store)
     .execute(&mut *tx)
@@ -13717,7 +13732,7 @@ async fn handle_booking_for_user(
             location: location_display.clone(),
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
-            guest_language: Some(lang.to_string()),
+            guest_language: Some(guest_lang.to_string()),
             host_language: match host_user_id.as_deref() {
                 Some(id) => crate::email::user_language(&state.pool, id).await,
                 None => None,
@@ -13789,7 +13804,7 @@ async fn handle_booking_for_user(
         &form.date,
         &form.time,
         &guest_timezone,
-        lang,
+        guest_lang,
     )
     .await;
 
@@ -16125,6 +16140,11 @@ async fn handle_booking(
         return resp;
     }
     let lang = crate::i18n::detect_from_headers(&headers);
+    // The guest's own language (#209): their saved preference when logged
+    // in, else their browser's. Stored on the booking and used for every
+    // guest email and SMS. Not `lang`, which on a user's booking page follows
+    // the host's preference (#76).
+    let guest_lang = crate::auth::visitor_lang(&state.pool, &headers).await;
     let captcha_cfg = state.captcha_config.read().await;
     if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
         .await
@@ -16431,7 +16451,7 @@ async fn handle_booking(
     .bind(&cancel_token)
     .bind(&reschedule_token)
     .bind(&confirm_token)
-    .bind(lang)
+    .bind(guest_lang)
     .bind(&assigned_resource_id)
     .bind(&phone_to_store)
     .execute(&mut *tx)
@@ -16522,7 +16542,7 @@ async fn handle_booking(
             location: location_display,
             reminder_minutes: reminder_min,
             additional_attendees: additional_attendees.clone(),
-            guest_language: Some(lang.to_string()),
+            guest_language: Some(guest_lang.to_string()),
             host_language: match host_user_id.as_deref() {
                 Some(id) => crate::email::user_language(&state.pool, id).await,
                 None => None,
@@ -16594,7 +16614,7 @@ async fn handle_booking(
         &form.date,
         &form.time,
         &guest_timezone,
-        lang,
+        guest_lang,
     )
     .await;
 
@@ -37390,5 +37410,112 @@ mod tests {
         assert!(host.contains("Réservation confirmée"), "{host}");
         assert!(host.contains("<html lang=\"fr\">"), "{host}");
         assert!(!host.contains("Buchung"), "{host}");
+    }
+
+    // --- Guest language on a user's booking page is the guest's, not the host's ---
+
+    fn book_request(
+        uri: &str,
+        csrf: &str,
+        cookie_extra: &str,
+        accept: &str,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(
+                "cookie",
+                format!("__Host-calrs_csrf={}{}", csrf, cookie_extra),
+            )
+            .header("accept-language", accept)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(book_body(csrf)))
+            .unwrap()
+    }
+
+    async fn stored_language(pool: &SqlitePool, guest_email: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT language FROM bookings WHERE guest_email = ?")
+            .bind(guest_email)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A French-speaking host, an English-speaking guest: the booking stores
+    /// the guest's language, the guest is emailed in English, the host in
+    /// French.
+    #[tokio::test]
+    async fn user_booking_stores_the_guest_language_not_the_host_one() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        set_user_language(&pool, "test@example.com", "fr").await;
+
+        let csrf = "csrf-guest-lang-en";
+        let response = app
+            .oneshot(book_request(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                "",
+                "en-US,en;q=0.9",
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+
+        assert_eq!(
+            stored_language(&pool, "guest@test.com").await.as_deref(),
+            Some("en")
+        );
+        let guest = mail_to(&mails, "guest@test.com").await;
+        assert!(guest.contains("Hi Guest,"), "{guest}");
+        assert!(guest.contains("<html lang=\"en\">"), "{guest}");
+        assert!(!guest.contains("Bonjour"), "{guest}");
+        let host = mail_to(&mails, "test@example.com").await;
+        assert!(host.contains("Nouvelle réservation !"), "{host}");
+        assert!(host.contains("<html lang=\"fr\">"), "{host}");
+    }
+
+    /// A logged-in visitor's own saved language wins over their browser's.
+    #[tokio::test]
+    async fn logged_in_visitor_books_in_their_saved_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        set_user_language(&pool, "test@example.com", "fr").await;
+        let visitor = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled, language) VALUES (?, 'visitor@test.com', 'Visitor', 'user', 'local', 'visitor', 1, 'de')")
+            .bind(&visitor)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
+            .bind(&session)
+            .bind(&visitor)
+            .bind(
+                (Utc::now() + Duration::days(1))
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "csrf-guest-lang-de";
+        let response = app
+            .oneshot(book_request(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &format!("; __Host-calrs_session={}", session),
+                "en-US,en;q=0.9",
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+        assert_eq!(
+            stored_language(&pool, "guest@test.com").await.as_deref(),
+            Some("de")
+        );
     }
 }
