@@ -157,13 +157,17 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
             let conflicts: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
                 "SELECT e.start_at, e.end_at, e.summary, e.timezone FROM events e
                  JOIN calendars c ON c.id = e.calendar_id
-                 WHERE c.is_busy = 1
+                 JOIN caldav_sources cs ON cs.id = c.source_id
+                 JOIN accounts a ON a.id = cs.account_id
+                 WHERE a.user_id = (SELECT ha.user_id FROM event_types het
+                                    JOIN accounts ha ON ha.id = het.account_id WHERE het.id = ?)
+                   AND c.is_busy = 1
                    AND (NOT EXISTS (SELECT 1 FROM event_type_calendars WHERE event_type_id = ?)
                         OR c.id IN (SELECT calendar_id FROM event_type_calendars WHERE event_type_id = ?))
                    AND (e.status IS NULL OR e.status != 'CANCELLED')
                    AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')",
             )
-            .bind(&et_id).bind(&et_id)
+            .bind(&et_id).bind(&et_id).bind(&et_id)
             .fetch_all(pool)
             .await?;
 
@@ -829,5 +833,73 @@ mod tests {
             result.is_err(),
             "Double booking at the same time/event_type should be prevented by unique index"
         );
+    }
+
+    /// Give `account_id` a busy calendar holding one timed UTC event.
+    async fn seed_busy_event(pool: &SqlitePool, account_id: &str, start: &str, end: &str) {
+        let source_id = Uuid::new_v4().to_string();
+        let cal_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username) VALUES (?, ?, 'S', 'https://x/dav', 'u')")
+            .bind(&source_id)
+            .bind(account_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, is_busy) VALUES (?, ?, ?, 'C', 1)")
+            .bind(&cal_id)
+            .bind(&source_id)
+            .bind(format!("/c/{cal_id}/"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at, all_day, timezone, status, transp) VALUES (?, ?, ?, 'Busy', ?, ?, 0, 'UTC', 'CONFIRMED', 'OPAQUE')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&cal_id)
+            .bind(Uuid::new_v4().to_string())
+            .bind(start)
+            .bind(end)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn create_at(time: &str, email: &str) -> BookingCommands {
+        BookingCommands::Create {
+            slug: "test-meeting".into(),
+            date: Some("2030-03-18".into()),
+            time: Some(time.into()),
+            name: Some("Guest".into()),
+            email: Some(email.into()),
+            timezone: "UTC".into(),
+            notes: None,
+        }
+    }
+
+    /// Another user's calendar used to block every host's bookings: the
+    /// conflict check read all busy calendars on the instance.
+    #[tokio::test]
+    async fn create_ignores_other_users_calendar_events() {
+        let pool = setup_db().await;
+        let (_user_id, host_account, _et_id) = seed_event_type(&pool).await;
+        sqlx::raw_sql(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled)
+                 VALUES ('other', 'other@test.com', 'Other', 'user', 'local', 'other', 1);
+             INSERT INTO accounts (id, name, email, timezone, user_id)
+                 VALUES ('acc-other', 'Other', 'other@test.com', 'UTC', 'other');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Monday 2030-03-18: someone else is busy at 10:00, the host at 11:00.
+        seed_busy_event(&pool, "acc-other", "20300318T100000", "20300318T103000").await;
+        seed_busy_event(&pool, &host_account, "20300318T110000", "20300318T113000").await;
+
+        run(&pool, &[0u8; 32], create_at("10:00", "free@test.com"))
+            .await
+            .expect("another user's event must not block the host");
+        let err = run(&pool, &[0u8; 32], create_at("11:00", "busy@test.com"))
+            .await
+            .expect_err("the host's own event still blocks");
+        assert!(err.to_string().contains("Conflict"), "{err}");
     }
 }

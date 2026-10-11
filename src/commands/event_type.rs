@@ -109,7 +109,9 @@ pub(crate) async fn host_busy_bookings(
 }
 
 /// Fetch non-recurring, busy (non-cancelled, OPAQUE) events for `et_id` whose
-/// stored time range overlaps `[window_start, window_end]`.
+/// stored time range overlaps `[window_start, window_end]`. Only the event
+/// type owner's calendars count (and, when the event type selects calendars,
+/// only those), like `fetch_busy_times_for_user_ex` on the web side.
 ///
 /// Events are stored in compact iCal form ("YYYYMMDDTHHMMSS" for timed,
 /// "YYYYMMDD" for all-day), so both overlap bounds are formatted compact *with
@@ -129,7 +131,11 @@ async fn fetch_nonrecurring_busy_events(
     let rows = sqlx::query_as(
         "SELECT e.start_at, e.end_at, e.timezone FROM events e
          JOIN calendars c ON c.id = e.calendar_id
-         WHERE c.is_busy = 1
+         JOIN caldav_sources cs ON cs.id = c.source_id
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE a.user_id = (SELECT ha.user_id FROM event_types het
+                            JOIN accounts ha ON ha.id = het.account_id WHERE het.id = ?)
+           AND c.is_busy = 1
            AND (NOT EXISTS (SELECT 1 FROM event_type_calendars WHERE event_type_id = ?)
                 OR c.id IN (SELECT calendar_id FROM event_type_calendars WHERE event_type_id = ?))
            AND (e.rrule IS NULL OR e.rrule = '')
@@ -137,6 +143,7 @@ async fn fetch_nonrecurring_busy_events(
            AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')
            AND e.start_at <= ? AND e.end_at >= ?",
     )
+    .bind(et_id)
     .bind(et_id)
     .bind(et_id)
     .bind(&end_compact)
@@ -317,14 +324,18 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
             let recurring: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
                 "SELECT e.start_at, e.end_at, e.rrule, e.raw_ical, e.timezone FROM events e
                  JOIN calendars c ON c.id = e.calendar_id
-                 WHERE c.is_busy = 1
+                 JOIN caldav_sources cs ON cs.id = c.source_id
+                 JOIN accounts a ON a.id = cs.account_id
+                 WHERE a.user_id = (SELECT ha.user_id FROM event_types het
+                                    JOIN accounts ha ON ha.id = het.account_id WHERE het.id = ?)
+                   AND c.is_busy = 1
                    AND (NOT EXISTS (SELECT 1 FROM event_type_calendars WHERE event_type_id = ?)
                         OR c.id IN (SELECT calendar_id FROM event_type_calendars WHERE event_type_id = ?))
                    AND (e.status IS NULL OR e.status != 'CANCELLED')
                    AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')
                    AND e.rrule IS NOT NULL AND e.rrule != '' AND (e.start_at <= ? OR e.start_at <= ?)",
             )
-            .bind(&et_id).bind(&et_id)
+            .bind(&et_id).bind(&et_id).bind(&et_id)
             .bind(&end_iso)
             .bind(&end_compact_rrule)
             .fetch_all(pool)
@@ -762,6 +773,47 @@ mod tests {
         .await
         .unwrap();
         assert!(busy.is_empty(), "TRANSPARENT events must not block");
+    }
+
+    /// Another user's busy calendar must not block this host's slots: the
+    /// query used to read every busy calendar on the instance.
+    #[tokio::test]
+    async fn slots_busy_query_ignores_other_users_calendars() {
+        let pool = setup_db().await;
+        let (_user_id, account_id) = seed_account(&pool).await;
+        sqlx::raw_sql(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled)
+                 VALUES ('other', 'other@test.com', 'Other', 'user', 'local', 'other', 1);
+             INSERT INTO accounts (id, name, email, timezone, user_id)
+                 VALUES ('acc-other', 'Other', 'other@test.com', 'UTC', 'other');
+             INSERT INTO caldav_sources (id, account_id, name, url, username)
+                 VALUES ('src-other', 'acc-other', 'S', 'https://x/dav', 'u');
+             INSERT INTO calendars (id, source_id, href, display_name, is_busy)
+                 VALUES ('cal-other', 'src-other', '/c/', 'C', 1);
+             INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at, all_day, timezone, status, transp)
+                 VALUES ('ev-other', 'cal-other', 'u-other', 'Busy', '20300318T100000', '20300318T110000', 0, 'UTC', 'CONFIRMED', 'OPAQUE');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let et_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO event_types (id, account_id, slug, title, duration_min) VALUES (?, ?, 'demo', 'Demo', 60)")
+            .bind(&et_id)
+            .bind(&account_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let day = chrono::NaiveDate::from_ymd_opt(2030, 3, 18).unwrap();
+        let busy = fetch_nonrecurring_busy_events(
+            &pool,
+            &et_id,
+            day.and_hms_opt(0, 0, 0).unwrap(),
+            day.and_hms_opt(23, 59, 59).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(busy.is_empty(), "{busy:?}");
     }
 
     // --- Rolling booking horizon (migration 063) ---
