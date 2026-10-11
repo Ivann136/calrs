@@ -1989,11 +1989,18 @@ fn build_csp(captcha: &Option<captcha::CaptchaConfig>) -> String {
         Some(c) => {
             let widget_origin = c.widget_script_origin();
             let instance_origin = c.instance_origin();
+            // A custom WASM URL is fetched by the widget, so its origin joins
+            // connect-src (and only connect-src: it is never a script).
+            let wasm_origin = c
+                .wasm_origin()
+                .filter(|o| *o != widget_origin && *o != instance_origin)
+                .map(|o| format!(" {o}"))
+                .unwrap_or_default();
             (
                 " 'wasm-unsafe-eval'",
                 "worker-src blob:; ",
                 format!(" {}", widget_origin),
-                format!(" {} {}", instance_origin, widget_origin),
+                format!(" {} {}{}", instance_origin, widget_origin, wasm_origin),
             )
         }
         None => ("", "", String::new(), String::new()),
@@ -4280,7 +4287,9 @@ async fn settings_save(
         return render_error(&msg, sidebar);
     };
 
-    // Validate and update username if provided
+    // Validate the username if provided. It is written by the single UPDATE
+    // below, together with every other field, so a later validation failure
+    // cannot leave a half-saved row behind.
     if let Some(ref uname) = new_username {
         if uname.len() < 2 {
             let msg =
@@ -4301,11 +4310,6 @@ async fn settings_save(
                     crate::i18n::translate(auth_user.lang, "settings-error-username-taken", None);
                 return render_error(&msg, sidebar);
             }
-            let _ = sqlx::query("UPDATE users SET username = ? WHERE id = ?")
-                .bind(uname)
-                .bind(&user.id)
-                .execute(&state.pool)
-                .await;
         }
     }
 
@@ -4323,9 +4327,10 @@ async fn settings_save(
     }
 
     let result = sqlx::query(
-        "UPDATE users SET name = ?, title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE users SET name = ?, username = COALESCE(?, username), title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&name)
+    .bind(&new_username)
     .bind(&title)
     .bind(&bio)
     .bind(&booking_email)
@@ -11187,6 +11192,7 @@ async fn show_group_book_form(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
             embed => embed.is_embedded(),
             embed_brand => embed.brand_css().unwrap_or_default(),
@@ -12379,6 +12385,7 @@ async fn show_dynamic_group_book_form(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e)),
@@ -13425,6 +13432,7 @@ async fn show_book_form_for_user(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
             embed => embed.is_embedded(),
             embed_brand => embed.brand_css().unwrap_or_default(),
@@ -16067,6 +16075,7 @@ async fn show_book_form(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e));
@@ -17961,6 +17970,10 @@ async fn admin_dashboard(
         .as_ref()
         .map(|c| c.widget_url.clone())
         .unwrap_or_else(|| captcha::DEFAULT_WIDGET_URL.to_string());
+    let captcha_wasm_url = captcha_cfg
+        .as_ref()
+        .and_then(|c| c.wasm_url.clone())
+        .unwrap_or_default();
     drop(captcha_cfg);
 
     let meeting_cfg = state.meeting_config.read().await;
@@ -18066,6 +18079,7 @@ async fn admin_dashboard(
             captcha_instance_url => captcha_instance_url,
             captcha_site_key => captcha_site_key,
             captcha_widget_url => captcha_widget_url,
+            captcha_wasm_url => captcha_wasm_url,
             jitsi_configured => jitsi_configured,
             jitsi_base_url => jitsi_base_url,
             jitsi_pattern => jitsi_pattern,
@@ -19084,6 +19098,7 @@ struct AdminCaptchaForm {
     captcha_site_key: Option<String>,
     captcha_secret: Option<String>,
     captcha_widget_url: Option<String>,
+    captcha_wasm_url: Option<String>,
 }
 
 // --- General / system runtime settings (base URL, private-host allowlist) ---
@@ -19186,6 +19201,18 @@ async fn admin_update_captcha(
     let instance_url = form.captcha_instance_url.filter(|s| !s.trim().is_empty());
     let site_key = form.captcha_site_key.filter(|s| !s.trim().is_empty());
     let widget_url = form.captcha_widget_url.filter(|s| !s.trim().is_empty());
+    let wasm_url = form
+        .captcha_wasm_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if wasm_url
+        .as_deref()
+        .is_some_and(|u| !captcha::is_http_url(u))
+    {
+        let msg = crate::i18n::translate(_admin.lang, "admin-captcha-wasm-url-invalid", None);
+        let encoded = urlencoding::encode(&msg).into_owned();
+        return Redirect::to(&format!("/dashboard/admin?error={}", encoded)).into_response();
+    }
 
     let secret_provided = form
         .captcha_secret
@@ -19200,12 +19227,13 @@ async fn admin_update_captcha(
             Err(e) => return internal_error_response("encrypt captcha secret", &e),
         };
         if let Err(e) = sqlx::query(
-            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_secret = ?, captcha_widget_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_secret = ?, captcha_widget_url = ?, captcha_wasm_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
         )
         .bind(&instance_url)
         .bind(&site_key)
         .bind(&encrypted)
         .bind(&widget_url)
+        .bind(&wasm_url)
         .execute(&state.pool)
         .await
         {
@@ -19213,11 +19241,12 @@ async fn admin_update_captcha(
         }
     } else {
         if let Err(e) = sqlx::query(
-            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_widget_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_widget_url = ?, captcha_wasm_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
         )
         .bind(&instance_url)
         .bind(&site_key)
         .bind(&widget_url)
+        .bind(&wasm_url)
         .execute(&state.pool)
         .await
         {
@@ -32451,6 +32480,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_failed_save_does_not_write_the_username() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let csrf = "test-csrf-settings-208";
+        let body = format!(
+            "_csrf={}&name=Test+User&username=brand-new-name&booking_email=not-an-email",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let resp_body = body_string(response).await;
+        assert!(
+            !resp_body.contains("Settings saved"),
+            "a rejected booking email must not report a save"
+        );
+
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "the username must not be written by a failed save"
+        );
+        assert_ne!(after.as_deref(), Some("brand-new-name"));
+    }
+
+    #[tokio::test]
+    async fn settings_save_writes_the_username_with_the_rest() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-settings-208-ok";
+        let body = format!(
+            "_csrf={}&name=Test+User&username=brand-new-name&booking_email=",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.as_deref(), Some("brand-new-name"));
+    }
+
+    #[tokio::test]
     async fn settings_save_confirms_language_change_in_the_new_language() {
         let (app, _pool, session, _) = setup_test_app().await;
         let csrf = "test-csrf-settings-lang";
@@ -32659,6 +32745,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(domains.unwrap(), "example.com");
+    }
+
+    #[tokio::test]
+    async fn admin_captcha_wasm_url_is_validated_and_stored() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let stored = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT captcha_wasm_url FROM auth_config WHERE id = 'singleton'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        let csrf = "test-csrf-captcha-wasm";
+        let body = format!("_csrf={}&captcha_wasm_url=javascript%3Aalert(1)", csrf);
+        let response = app
+            .clone()
+            .oneshot(post_form("/dashboard/admin/captcha", &session, csrf, &body))
+            .await
+            .unwrap();
+        let location = response.headers()["location"].to_str().unwrap().to_string();
+        assert!(
+            location.starts_with("/dashboard/admin?error="),
+            "{location}"
+        );
+        assert_eq!(stored().await, None, "an invalid URL must not be saved");
+
+        let body = format!(
+            "_csrf={}&captcha_wasm_url=https%3A%2F%2Fcap.example.com%2Fassets%2Fcap_wasm_bg.wasm",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/admin/captcha", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["location"], "/dashboard/admin");
+        assert_eq!(
+            stored().await.as_deref(),
+            Some("https://cap.example.com/assets/cap_wasm_bg.wasm")
+        );
     }
 
     #[tokio::test]
@@ -36343,7 +36470,92 @@ mod tests {
             site_key: "testkey".to_string(),
             secret: "secret".to_string(),
             widget_url: widget_url.to_string(),
+            wasm_url: None,
         }
+    }
+
+    #[test]
+    fn build_csp_with_custom_wasm_url_adds_its_origin_to_connect_src() {
+        let mut cfg = make_captcha_config("https://cap.example.com", captcha::DEFAULT_WIDGET_URL);
+        cfg.wasm_url = Some("https://assets.example.org/cap/cap_wasm_bg.wasm".to_string());
+        let with_wasm = build_csp(&Some(cfg));
+        let connect = with_wasm
+            .split("; ")
+            .find(|d| d.starts_with("connect-src"))
+            .expect("connect-src directive");
+        assert_eq!(
+            connect,
+            "connect-src 'self' https://cap.example.com https://cdn.jsdelivr.net https://assets.example.org"
+        );
+        let script = with_wasm
+            .split("; ")
+            .find(|d| d.starts_with("script-src"))
+            .expect("script-src directive");
+        assert!(
+            !script.contains("assets.example.org"),
+            "the WASM origin must not be allowed to serve scripts: {script}"
+        );
+
+        // Everything else is the policy without a WASM URL plus that origin.
+        let without = build_csp(&Some(make_captcha_config(
+            "https://cap.example.com",
+            captcha::DEFAULT_WIDGET_URL,
+        )));
+        assert_eq!(
+            with_wasm.replace(" https://assets.example.org", ""),
+            without
+        );
+    }
+
+    #[test]
+    fn build_csp_does_not_repeat_a_wasm_origin_already_allowed() {
+        let mut cfg = make_captcha_config("https://cap.example.com", captcha::DEFAULT_WIDGET_URL);
+        cfg.wasm_url = Some("https://cap.example.com/assets/cap_wasm_bg.wasm".to_string());
+        let csp = build_csp(&Some(cfg));
+        assert_eq!(csp.matches("https://cap.example.com").count(), 1, "{csp}");
+    }
+
+    #[test]
+    fn book_template_sets_the_custom_wasm_url_before_the_widget() {
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        env.set_loader(minijinja::path_loader("templates"));
+        crate::i18n::register(&mut env);
+        let tmpl = env
+            .get_template("book.html")
+            .expect("book.html should load");
+        let render = |wasm_url: &str| {
+            tmpl.render(context! {
+                event_type => context! { slug => "intro", title => "Intro Call", duration_min => 30 },
+                sms_phone_mode => "off",
+                host_name => "Alice",
+                username => "alice",
+                captcha_enabled => true,
+                captcha_api_endpoint => "https://cap.example.com/key/",
+                captcha_widget_url => "https://cap.example.com/assets/widget.js",
+                captcha_wasm_url => wasm_url,
+            })
+            .expect("book.html should render")
+        };
+
+        let set = render("https://cap.example.com/assets/cap_wasm_bg.wasm");
+        let assignment =
+            r#"window.CAP_CUSTOM_WASM_URL = "https://cap.example.com/assets/cap_wasm_bg.wasm";"#;
+        let at = set.find(assignment).expect("the WASM URL should be set");
+        let widget = set
+            .find("widget.js")
+            .expect("the widget script should be referenced");
+        assert!(
+            at < widget,
+            "the WASM URL must be set before the widget loads"
+        );
+
+        // A value that tries to close the script is JSON-escaped, not emitted raw.
+        let hostile = render("https://x.example.com/</script><script>alert(1)</script>");
+        assert!(!hostile.contains("</script><script>alert(1)"));
+
+        let unset = render("");
+        assert!(!unset.contains("CAP_CUSTOM_WASM_URL"));
     }
 
     #[test]

@@ -104,7 +104,8 @@ calrs/
 │   ├── 063_booking_horizon.sql   ← booking_horizon_days on event_types (NULL = unlimited)
 │   ├── 064_booking_time_version.sql ← time_version on bookings (0 = legacy wall clock, 1 = UTC)
 │   ├── 065_pending_slot_hold.sql ← pending_blocks_slot + pending_expiry_hours on event_types; pending_expires_at, pending_since, pending_reminder_sent_at on bookings
-│   └── 066_public_page_language.sql ← public_page_language on users ('visitor' default / 'host') for /u/{username} and legacy /{slug} pages
+│   ├── 066_public_page_language.sql ← public_page_language on users ('visitor' default / 'host') for /u/{username} and legacy /{slug} pages
+│   └── 067_captcha_wasm_url.sql ← captcha_wasm_url on auth_config (self-hosted Cap WASM, #164)
 ├── templates/
 │   ├── base.html                 ← base layout + CSS (light/dark mode)
 │   ├── dashboard_base.html       ← sidebar layout (extends base.html, all dashboard pages extend this)
@@ -356,7 +357,7 @@ The chosen provider is [Cap](https://trycap.dev) — self-hosted, no GAFAM, no t
 
 ### Configuration (admin panel)
 
-Configured at `/dashboard/admin` → **Captcha** section. Four fields:
+Configured at `/dashboard/admin` → **Captcha** section. Five fields:
 
 | Field | Required | Description |
 |---|---|---|
@@ -364,12 +365,13 @@ Configured at `/dashboard/admin` → **Captcha** section. Four fields:
 | Site key | Yes | Site key from the Cap dashboard |
 | Secret | Yes | Secret key for server-to-server verification (encrypted at rest with AES-256-GCM, same pattern as OIDC client secret) |
 | Widget script URL | No | Override the JS bundle URL. Defaults to `https://cdn.jsdelivr.net/npm/cap-widget`. Useful for air-gapped deployments. Changes take effect immediately after saving (CSP is rebuilt in memory). |
+| Widget WASM URL | No | Where the widget fetches its WASM solver. When set, `book.html` emits `window.CAP_CUSTOM_WASM_URL` (via `tojson`) before the widget script, so a self-hosted Cap stops pulling the WASM from cdn.jsdelivr.net (#164). Must be an absolute http(s) URL; the admin handler refuses anything else. Its origin is added to `connect-src`. |
 
 Leaving all three main fields empty disables the captcha. The secret uses the keep-current pattern: leaving the password field empty on save preserves the stored value.
 
 ### How it works end-to-end
 
-**GET (booking form):** The handler reads `state.captcha_config` (a `RwLock<Option<CaptchaConfig>>`). If `Some`, it passes `captcha_enabled = true`, `captcha_api_endpoint`, and `captcha_widget_url` to the template. The `<cap-widget>` element is rendered conditionally in `templates/book.html` with all i18n attributes pre-filled via the Fluent `t()` helper.
+**GET (booking form):** The handler reads `state.captcha_config` (a `RwLock<Option<CaptchaConfig>>`). If `Some`, it passes `captcha_enabled = true`, `captcha_api_endpoint`, `captcha_widget_url` and `captcha_wasm_url` (empty when unset) to the template. The `<cap-widget>` element is rendered conditionally in `templates/book.html` with all i18n attributes pre-filled via the Fluent `t()` helper.
 
 **POST (booking submit):** The `BookForm` struct has a `captcha_token: Option<String>` field with `#[serde(rename = "cap-token")]` — the field name the Cap widget submits. After the CSRF check, `captcha::verify(&captcha_cfg, form.captcha_token.as_deref()).await` is called:
 - `config = None` → `Ok(())` immediately (pass-through)
@@ -385,8 +387,9 @@ The verification is implemented in `src/web/captcha.rs` and applies to **3 handl
 | `src/web/captcha.rs` | Self-contained module: `CaptchaConfig` struct, `load_captcha_config()`, `verify()`, `extract_origin()` helper, unit tests |
 | `src/web/mod.rs` | `AppState.captcha_config: RwLock<Option<CaptchaConfig>>`, `build_csp()`, `csp_middleware()`, `admin_update_captcha()` handler, wiring in the 4 GET form handlers and 3 POST booking handlers |
 | `migrations/053_captcha.sql` | Adds `captcha_instance_url`, `captcha_site_key`, `captcha_secret`, `captcha_widget_url` columns to `auth_config` |
-| `templates/admin.html` | Captcha configuration section (status badge, 4 inputs, save button) |
-| `templates/book.html` | Conditional `<cap-widget>` with all `data-cap-i18n-*` attributes |
+| `migrations/067_captcha_wasm_url.sql` | Adds `captcha_wasm_url` to `auth_config` |
+| `templates/admin.html` | Captcha configuration section (status badge, 5 inputs, save button) |
+| `templates/book.html` | Conditional `<cap-widget>` with all `data-cap-i18n-*` attributes, preceded by the `CAP_CUSTOM_WASM_URL` assignment when a WASM URL is set |
 | `templates/base.html` | CSS custom property overrides for `cap-widget` theming |
 
 ### Content-Security-Policy
@@ -408,9 +411,11 @@ object-src 'none'; base-uri 'self'; frame-ancestors 'self'
 default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline';
 script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' <widget-origin>;
 worker-src blob:;
-connect-src 'self' <instance-origin> <widget-origin>;
+connect-src 'self' <instance-origin> <widget-origin> [<wasm-origin>];
 object-src 'none'; base-uri 'self'; frame-ancestors 'self'
 ```
+
+`<wasm-origin>` appears only when a Widget WASM URL is configured and its origin is not already one of the other two.
 
 The three extra directives and why they are needed:
 - **`'wasm-unsafe-eval'` in `script-src`** — Cap's proof-of-work solver runs as a WASM module. Without this, browsers block `WebAssembly.instantiate()` under a strict CSP. Falls back to a JS solver if blocked, but WASM is much faster.

@@ -1076,6 +1076,9 @@ admin-site-key = Sitesleutel
 admin-secret = Secret
 admin-widget-url = URL van widgetscript
 admin-widget-url-help = Overschrijf dit als het CDN geblokkeerd is. Wijzigingen gaan direct na opslaan in.
+admin-wasm-url = URL van widget-WASM
+admin-wasm-url-help = Waar de widget zijn oplosser vandaan laadt. Vul het WASM-bestand van je Cap-server in, zodat boekingspagina's geen contact meer maken met cdn.jsdelivr.net. Laat leeg voor de standaardwaarde.
+admin-captcha-wasm-url-invalid = De URL van de widget-WASM moet een absolute http(s)-URL zijn.
 admin-captcha-disable-help = Laat instantie-URL, sitesleutel en secret leeg om captcha op boekingspagina's uit te schakelen.
 admin-save-captcha = Captcha-instellingen opslaan
 admin-resources = Faciliteiten
@@ -1182,7 +1185,7 @@ admin-show-fewer = Minder tonen
 admin-delete-user-confirm = Gebruiker { $email } definitief verwijderen?{"\u000A"}{"\u000A"}Hiermee worden het gebruikersrecord, het planningsaccount, de agendabronnen, de afspraaktypes en alle gegevens die alleen van deze gebruiker zijn verwijderd. Eerdere boekingen worden samen met hun afspraaktypes verwijderd.{"\u000A"}{"\u000A"}Voor OIDC/SSO-gebruikers: als automatisch registreren is ingeschakeld, wordt deze persoon bij de volgende keer inloggen opnieuw aangemaakt.{"\u000A"}{"\u000A"}Dit kan niet ongedaan worden gemaakt.
 admin-system-settings-help = Openbare URL en netwerkbeveiligingsinstellingen. Deze kun je ook instellen met de omgevingsvariabelen <code>CALRS_BASE_URL</code> en <code>CALRS_ALLOW_PRIVATE_HOSTS</code>. Als een omgevingsvariabele is ingesteld, <strong>heeft die voorrang</strong> op de waarde hieronder.
 admin-set-by-env = — ingesteld via omgevingsvariabele ({ $var }), overschrijft de opgeslagen waarde
-admin-google-help = Om de koppeling met Google Agenda in te schakelen, maak je OAuth2-inloggegevens aan in de <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>. Schakel de <strong>Google Calendar API</strong> in en voeg daarna { $redirect_uri } toe als geautoriseerde redirect-URI.
+admin-google-help = Om de koppeling met Google Agenda in te schakelen, maak je OAuth2-inloggegevens aan in de <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>. Schakel de <strong>CalDAV API</strong> (bezette tijden lezen en boekingen terugschrijven) en de <strong>Google Calendar API</strong> (Google Meet-links) in en voeg daarna { $redirect_uri } toe als geautoriseerde redirect-URI.
 admin-room-pattern-help = Beschikbare tokens: <code>{"{"}username{"}"}</code> (organisator), <code>{"{"}event{"}"}</code> (slug van het afspraaktype), <code>{"{"}date{"}"}</code> (JJJJMMDD), <code>{"{"}random{"}"}</code> (8 tekens). Standaard: { $default }.
 admin-room-pattern-warning = Zonder <code>{"{"}random{"}"}</code> is de ruimtenaam voorspelbaar: twee gasten die op dezelfde dag hetzelfde afspraaktype boeken, delen dan een ruimte en kunnen elkaars vergadering zien. Vaste ruimtes zijn toegestaan (bijv. één persoonlijke ruimte per organisator), maar schakel dit alleen in als je de afweging begrijpt.
 admin-meeting-webhook-help = Als de locatie van een afspraaktype is ingesteld op "Webhook (eigen provider)", stuurt calrs bij bevestiging de boekingsgegevens via een POST naar deze URL en verwacht een JSON-body <code>{"{"}"url": "https://..."{"}"}</code> terug.

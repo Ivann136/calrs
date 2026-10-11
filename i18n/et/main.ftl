@@ -1075,6 +1075,9 @@ admin-site-key = Saidi võti
 admin-secret = Saladus
 admin-widget-url = Vidina skripti aadress
 admin-widget-url-help = Muuda, kui CDN on blokeeritud. Muudatused jõustuvad kohe pärast salvestamist.
+admin-wasm-url = Vidina WASM-faili aadress
+admin-wasm-url-help = Koht, kust vidin oma lahendaja laadib. Määra oma Cap-serveri pakutav WASM-fail, et broneerimislehed ei pöörduks enam cdn.jsdelivr.net poole. Jäta tühjaks vaikeväärtuse jaoks.
+admin-captcha-wasm-url-invalid = Vidina WASM-faili aadress peab olema täielik http(s) aadress.
 admin-captcha-disable-help = Jäta paigalduse aadress, saidi võti ja saladus tühjaks, et captcha broneerimislehtedel välja lülitada.
 admin-save-captcha = Salvesta captcha seaded
 admin-resources = Ressursid
@@ -1181,7 +1184,7 @@ admin-show-fewer = Näita vähem
 admin-delete-user-confirm = Kas kustutada kasutaja { $email } jäädavalt?{"\u000A"}{"\u000A"}See eemaldab tema kasutajakonto, ajaplaneerimise profiili, kalendriallikad, sündmuse tüübid ja kõik andmed, mis kuuluvad ainult temale. Varasemad broneeringud kustutatakse koos tema sündmuse tüüpidega.{"\u000A"}{"\u000A"}OIDC/SSO kasutajate puhul: kui automaatne registreerumine on sees, luuakse see inimene järgmisel sisselogimisel uuesti.{"\u000A"}{"\u000A"}Seda ei saa tagasi võtta.
 admin-system-settings-help = Avalik aadress ja võrguturbe seaded. Neid saab määrata ka keskkonnamuutujatega <code>CALRS_BASE_URL</code> ja <code>CALRS_ALLOW_PRIVATE_HOSTS</code>. Kui keskkonnamuutuja on määratud, <strong>on sellel eelis</strong> allpool oleva väärtuse ees.
 admin-set-by-env = — määratud keskkonnast ({ $var }), tühistab salvestatud väärtuse
-admin-google-help = Google’i kalendri sidumiseks loo OAuth2 pääsuandmed <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console’is</a>. Luba <strong>Google Calendar API</strong> ja lisa seejärel { $redirect_uri } lubatud ümbersuunamisaadressiks.
+admin-google-help = Google’i kalendri sidumiseks loo OAuth2 pääsuandmed <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console’is</a>. Luba <strong>CalDAV API</strong> (hõivatud aegade lugemiseks ja broneeringute kirjutamiseks) ning <strong>Google Calendar API</strong> (Google Meeti linkide jaoks) ja lisa seejärel { $redirect_uri } lubatud ümbersuunamisaadressiks.
 admin-room-pattern-help = Saadaolevad kohatäited: <code>{"{"}username{"}"}</code> (korraldaja), <code>{"{"}event{"}"}</code> (sündmuse tüübi identifikaator), <code>{"{"}date{"}"}</code> (AAAAKKPP), <code>{"{"}random{"}"}</code> (8 märki). Vaikimisi: { $default }.
 admin-room-pattern-warning = Ilma kohatäiteta <code>{"{"}random{"}"}</code> on ruumi nimi ettearvatav: kaks külalist, kes broneerivad sama sündmuse tüübi samal päeval, satuvad ühte ruumi ja näevad teineteise kohtumist. Püsivad ruumid on lubatud (näiteks üks isiklik ruum korraldaja kohta), kuid lülita see sisse ainult siis, kui mõistad tagajärgi.
 admin-meeting-webhook-help = Kui sündmuse tüübi asukohaks on „Webhook (oma teenusepakkuja)“, saadab calrs kinnitamisel broneeringu andmed POST-päringuga sellele aadressile ja ootab vastuseks JSON-keha <code>{"{"}"url": "https://..."{"}"}</code>.

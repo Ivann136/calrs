@@ -1076,6 +1076,9 @@ admin-site-key = Site key
 admin-secret = Secret
 admin-widget-url = Widget script URL
 admin-widget-url-help = Override if the CDN is blocked. Changes take effect immediately after saving.
+admin-wasm-url = Widget WASM URL
+admin-wasm-url-help = Where the widget loads its solver from. Set it to the WASM file your Cap server serves to keep booking pages from contacting cdn.jsdelivr.net. Leave empty for the default.
+admin-captcha-wasm-url-invalid = The widget WASM URL must be an absolute http(s) URL.
 admin-captcha-disable-help = Leave instance URL, site key and secret empty to disable captcha on booking pages.
 admin-save-captcha = Save captcha settings
 admin-resources = Resources
@@ -1182,7 +1185,7 @@ admin-show-fewer = Show fewer
 admin-delete-user-confirm = Permanently delete user { $email }?{"\u000A"}{"\u000A"}This removes their user record, scheduling account, calendar sources, event types, and all data uniquely owned by them. Past bookings will be deleted with their event types.{"\u000A"}{"\u000A"}For OIDC/SSO users: if auto-register is enabled, this person will be re-created on their next login.{"\u000A"}{"\u000A"}This cannot be undone.
 admin-system-settings-help = Public URL and network-security settings. These can also be set with the environment variables <code>CALRS_BASE_URL</code> and <code>CALRS_ALLOW_PRIVATE_HOSTS</code>. When an environment variable is set it <strong>takes precedence</strong> over the value below.
 admin-set-by-env = — set by environment ({ $var }), overriding the stored value
-admin-google-help = To enable Google Calendar integration, create OAuth2 credentials at <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>. Enable the <strong>Google Calendar API</strong>, then add { $redirect_uri } as an authorized redirect URI.
+admin-google-help = To enable Google Calendar integration, create OAuth2 credentials at <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>. Enable the <strong>CalDAV API</strong> (reading busy times and write-back) and the <strong>Google Calendar API</strong> (Google Meet links), then add { $redirect_uri } as an authorized redirect URI.
 admin-room-pattern-help = Available tokens: <code>{"{"}username{"}"}</code> (host), <code>{"{"}event{"}"}</code> (event type slug), <code>{"{"}date{"}"}</code> (YYYYMMDD), <code>{"{"}random{"}"}</code> (8 chars). Default: { $default }.
 admin-room-pattern-warning = Without <code>{"{"}random{"}"}</code> the room name is predictable: two guests booking the same event type on the same day end up sharing a room and can see each other's meeting. Stable rooms are allowed (e.g. one personal room per host), but only enable this if you understand the trade-off.
 admin-meeting-webhook-help = When an event type's location is set to "Webhook (custom provider)", calrs POSTs the booking payload to this URL on confirmation and expects a JSON body <code>{"{"}"url": "https://..."{"}"}</code> back.

@@ -401,6 +401,7 @@ Go to **Admin panel → Captcha** and fill in:
 | Site key | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | From the Cap dashboard |
 | Secret | `your-secret-key` | Encrypted at rest with AES-256-GCM |
 | Widget script URL | *(leave empty)* | Defaults to `https://cdn.jsdelivr.net/npm/cap-widget`. Override for air-gapped deployments. |
+| Widget WASM URL | *(leave empty)* | Where the widget loads its WASM solver from. By default the widget fetches it from cdn.jsdelivr.net even when everything else is self-hosted; point it at the WASM file your Cap server serves (see Cap's [asset server](https://trycap.dev/guide/standalone/options.html#asset-server) docs) to keep booking pages fully self-hosted. |
 
 Click **Save captcha settings**. All changes — including the widget script URL — take effect immediately, no restart required.
 
@@ -421,7 +422,7 @@ calrs sets a strict CSP on all responses. When Cap is configured, the following 
 |---|---|---|
 | `script-src` | `'wasm-unsafe-eval' <widget-origin>` | The widget JS loads from an external origin; `wasm-unsafe-eval` allows the WASM proof-of-work solver |
 | `worker-src` | `blob:` | The widget spawns a Web Worker via a blob URL to run the solver off the main thread |
-| `connect-src` | `<instance-origin> <widget-origin>` | The browser fetches the WASM binary from the widget CDN and sends the solved token to the Cap server |
+| `connect-src` | `<instance-origin> <widget-origin> [<wasm-origin>]` | The browser fetches the WASM binary (from the widget CDN, or from the Widget WASM URL's origin when one is set) and sends the solved token to the Cap server |
 
 When captcha is disabled, none of these directives are present — the CSP reverts to its strict baseline immediately after saving.
 

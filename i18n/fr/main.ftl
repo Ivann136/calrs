@@ -1075,6 +1075,9 @@ admin-site-key = Clé de site
 admin-secret = Secret
 admin-widget-url = URL du script du widget
 admin-widget-url-help = À remplacer si le CDN est bloqué. Les modifications prennent effet dès l'enregistrement.
+admin-wasm-url = URL du WASM du widget
+admin-wasm-url-help = Adresse d'où le widget charge son solveur. Indiquez le fichier WASM servi par votre serveur Cap pour que les pages de réservation ne contactent plus cdn.jsdelivr.net. Laissez vide pour la valeur par défaut.
+admin-captcha-wasm-url-invalid = L'URL du WASM du widget doit être une URL http(s) absolue.
 admin-captcha-disable-help = Laissez l'URL de l'instance, la clé de site et le secret vides pour désactiver le captcha sur les pages de réservation.
 admin-save-captcha = Enregistrer les paramètres du captcha
 admin-resources = Ressources
@@ -1181,7 +1184,7 @@ admin-show-fewer = Afficher moins
 admin-delete-user-confirm = Supprimer définitivement l'utilisateur { $email } ?{"\u000A"}{"\u000A"}Cela efface son compte, son profil de planification, ses sources d'agenda, ses types d'événement et toutes les données dont il est le seul propriétaire. Les réservations passées seront supprimées avec leurs types d'événement.{"\u000A"}{"\u000A"}Pour les utilisateurs OIDC/SSO : si l'inscription automatique est activée, la personne sera recréée à sa prochaine connexion.{"\u000A"}{"\u000A"}Cette action est irréversible.
 admin-system-settings-help = URL publique et paramètres de sécurité réseau. Ils peuvent aussi être définis par les variables d'environnement <code>CALRS_BASE_URL</code> et <code>CALRS_ALLOW_PRIVATE_HOSTS</code>. Lorsqu'une variable d'environnement est définie, elle <strong>prime</strong> sur la valeur ci-dessous.
 admin-set-by-env = — défini par l'environnement ({ $var }), prioritaire sur la valeur enregistrée
-admin-google-help = Pour activer l'intégration Google Agenda, créez des identifiants OAuth2 sur la <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>. Activez l'<strong>API Google Calendar</strong>, puis ajoutez { $redirect_uri } comme URI de redirection autorisée.
+admin-google-help = Pour activer l'intégration Google Agenda, créez des identifiants OAuth2 sur la <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: var(--accent);">Google Cloud Console</a>. Activez la <strong>CalDAV API</strong> (lecture des disponibilités et écriture des réservations) et la <strong>Google Calendar API</strong> (liens Google Meet), puis ajoutez { $redirect_uri } comme URI de redirection autorisée.
 admin-room-pattern-help = Jetons disponibles : <code>{"{"}username{"}"}</code> (hôte), <code>{"{"}event{"}"}</code> (identifiant du type d'événement), <code>{"{"}date{"}"}</code> (AAAAMMJJ), <code>{"{"}random{"}"}</code> (8 caractères). Par défaut : { $default }.
 admin-room-pattern-warning = Sans <code>{"{"}random{"}"}</code>, le nom du salon est prévisible : deux invités réservant le même type d'événement le même jour se retrouvent dans le même salon et peuvent voir la réunion de l'autre. Les salons fixes restent possibles (par exemple un salon personnel par hôte), mais n'activez cela qu'en connaissance de cause.
 admin-meeting-webhook-help = Lorsque le lieu d'un type d'événement est « Webhook (fournisseur personnalisé) », calrs envoie la réservation en POST à cette URL à la confirmation et attend en retour un corps JSON <code>{"{"}"url": "https://..."{"}"}</code>.

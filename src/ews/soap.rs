@@ -63,6 +63,11 @@ pub fn http_client(timeout: Duration) -> Result<Client> {
         .context("failed to build HTTP client")
 }
 
+/// Prefix of the error [`post_soap`] raises for a SOAP fault, followed by the
+/// text [`extract_soap_fault`] returns (`<Code>: <MessageText>` for a
+/// per-message error). Callers that react to a specific fault code match on it.
+pub const SOAP_FAULT_PREFIX: &str = "EWS SOAP fault: ";
+
 /// Send a SOAP request and return the response body. The caller passes the
 /// inner SOAP body; this function adds the envelope, headers, and basic auth.
 pub async fn post_soap(
@@ -106,7 +111,7 @@ pub async fn post_soap(
     }
 
     if let Some(fault) = extract_soap_fault(&text) {
-        bail!("EWS SOAP fault: {fault}");
+        bail!("{SOAP_FAULT_PREFIX}{fault}");
     }
 
     Ok(text)
