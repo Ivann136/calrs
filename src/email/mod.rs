@@ -3812,10 +3812,13 @@ mod tests {
     /// back to the instance sender.
     #[test]
     fn guest_emails_use_the_host_sender_and_host_emails_do_not() {
-        let src = include_str!("email.rs");
-        let src = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let files = [include_str!("mod.rs")];
         let mut seen_guest = 0;
-        for chunk in src.split("\npub async fn ").skip(1) {
+        for chunk in files
+            .iter()
+            .flat_map(|src| src.split("\n#[cfg(test)]\nmod tests").next())
+            .flat_map(|src| src.split("\npub async fn ").skip(1))
+        {
             let name = &chunk[..chunk.find('(').unwrap()];
             let body = &chunk[..chunk.find("\n}\n").unwrap()];
             let uses_host = body.contains("Sender::Host") || body.contains("Sender::host_of");
