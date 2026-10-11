@@ -20855,7 +20855,7 @@ async fn decline_booking_by_token(
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
-             JOIN users u ON u.id = a.user_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
              WHERE b.confirm_token = ? AND b.status = 'pending'",
     )
     .bind(&token)
@@ -20919,9 +20919,9 @@ async fn decline_booking_by_token(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
-        // The query above joins the event type's owner; the guest's email
-        // names the host they booked with, which is also its sender and
-        // Reply-To (#221).
+        // The guest's email names the host they booked with, which is also
+        // its sender and Reply-To (#221). The query above (assigned member,
+        // else owner) is only the fallback.
         let booking_uid: Option<String> =
             sqlx::query_scalar("SELECT uid FROM bookings WHERE id = ?")
                 .bind(&bid)
@@ -21030,7 +21030,7 @@ async fn fetch_notice_min_and_host_email(
          FROM bookings b \
          JOIN event_types et ON et.id = b.event_type_id \
          JOIN accounts a ON a.id = et.account_id \
-         JOIN users u ON u.id = a.user_id \
+         JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id) \
          WHERE b.{tok} = ?",
         notice = notice_column,
         tok = booking_token_column
@@ -21212,7 +21212,7 @@ async fn guest_cancel_form(
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
-             JOIN users u ON u.id = a.user_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
              WHERE b.cancel_token = ? AND b.status IN ('confirmed', 'pending')",
     )
     .bind(&token)
@@ -21310,7 +21310,7 @@ async fn guest_cancel_booking(
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
-             JOIN users u ON u.id = a.user_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
              WHERE b.cancel_token = ? AND b.status IN ('confirmed', 'pending')",
         )
         .bind(&token)
@@ -21452,10 +21452,13 @@ async fn guest_cancel_booking(
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
         let details = details.clone();
-        // The query above joins the event type's owner. The guest's copy
-        // names the host they booked with (assigned member, or the joined
-        // roster and ICS organizer for a collective booking), which is also
-        // its sender and Reply-To (#221).
+        // The query above joins the assigned member, or the event type owner
+        // when there is none: that is who gets the host notice, in their
+        // language. A collective booking has no assigned member, so its
+        // notice still goes to the owner alone. The guest's copy names the
+        // host they booked with (assigned member, or the joined roster and
+        // ICS organizer for a collective booking), which is also its sender
+        // and Reply-To (#221).
         let guest_details = match booking_host_identity(&state.pool, &details.uid).await {
             Some((host_name, host_email, _)) => crate::email::CancellationDetails {
                 host_name,
@@ -37632,6 +37635,70 @@ mod tests {
         assert!(!mail.contains("Hi Guest,"), "{mail}");
     }
 
+    /// A guest cancelling a round-robin booking used to notify the event
+    /// type owner, who was not hosting it: the host notice now goes to the
+    /// assigned member, in the member's language, and the cancel page names
+    /// them too.
+    #[tokio::test]
+    async fn guest_cancel_notifies_the_assigned_member_not_the_owner() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+
+        let member_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled, language) \
+             VALUES (?, 'member@test.com', 'Morgan Member', 'user', 'local', 'morgan', 1, 'fr')",
+        )
+        .bind(&member_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cancel_tok = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, assigned_user_id, language) VALUES (?, ?, 'uid-rr-gcancel', 'Guest', 'guest@test.com', 'UTC', '2030-07-02T10:00:00', '2030-07-02T10:30:00', 'confirmed', ?, ?, ?, 'en')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&et_id)
+            .bind(&cancel_tok)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&member_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get(&format!("/booking/cancel/{}", cancel_tok)))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Morgan Member"), "{body}");
+        assert!(!body.contains("Test User"), "{body}");
+
+        let csrf = "test-csrf-rr-gcancel";
+        let response = app
+            .oneshot(post_form_unauthed(
+                &format!("/booking/cancel/{}", cancel_tok),
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Both emails have arrived once these return.
+        mail_to(&mails, "guest@test.com").await;
+        let host_mail = mail_to(&mails, "member@test.com").await;
+        assert!(host_mail.contains("<html lang=\"fr\">"), "{host_mail}");
+        let to_owner = mails
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.rcpt.iter().any(|r| r.contains("test@example.com")))
+            .count();
+        assert_eq!(to_owner, 0, "the event type owner was not hosting it");
+    }
+
     /// A webhook SMS gateway on a local port that records each request and
     /// accepts it.
     async fn spawn_sms_webhook() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -38041,7 +38108,8 @@ mod tests {
             "{mail}"
         );
 
-        let host_mail = mail_to(&mails, "test@example.com").await;
+        // The host notice goes to Bob too, not to the owner.
+        let host_mail = mail_to(&mails, "bob.bookings@test.com").await;
         assert_eq!(
             mail_header(&host_mail, "From"),
             Some("noreply@test.com"),
