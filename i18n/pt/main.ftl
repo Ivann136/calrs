@@ -1324,3 +1324,24 @@ dynamic-group-user-not-found = Usuário “{ $username }” não encontrado.
 dynamic-group-user-opted-out = O usuário “{ $username }” não ativou os links de grupo dinâmico.
 
 error-slot-unavailable-member = Este horário não está mais disponível ({ $username } tem um conflito).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Pedido expirado: { $event }, { $date } às { $time } ({ $tz }). Sem resposta, escolha outro horário.
+email-pending-expired-status = Pedido expirado
+email-pending-expired-headline = Seu pedido de agendamento expirou: o organizador não respondeu a tempo. Escolha outro horário, por favor.
+email-pending-expired-action = Escolher outro horário
+bae-body-host-busy = O organizador (ou um membro necessário da equipe) não está mais livre neste horário. Peça ao convidado para escolher outro horário.
+bookings-error-generic = Algo deu errado.
+troubleshoot-detail-pending-request = { $title } (pedido pendente)
+etf-pending-blocks-slot = Pedidos pendentes bloqueiam o horário
+etf-pending-blocks-slot-help = Enquanto um pedido aguarda sua resposta, ninguém mais pode agendar esse horário, nem neste nem nos seus outros tipos de evento.
+etf-pending-expiry = Expiração dos pedidos
+etf-pending-expiry-help = Um pedido que você não responder até lá é recusado automaticamente e pedimos ao convidado que escolha outro horário. Ele termina antes se a reunião estiver próxima demais para outra pessoa ainda agendar o horário. Você recebe um lembrete na metade do prazo.
+etf-pending-expiry-never = Nunca
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Após { $hours } hora
+       *[other] Após { $hours } horas
+    }

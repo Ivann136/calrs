@@ -1325,3 +1325,24 @@ dynamic-group-user-not-found = User "{ $username }" not found.
 dynamic-group-user-opted-out = User "{ $username }" has not enabled dynamic group links.
 
 error-slot-unavailable-member = This slot is no longer available ({ $username } has a conflict).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Request expired: { $event }, { $date } at { $time } ({ $tz }). The host did not reply, please book another time.
+email-pending-expired-status = Request expired
+email-pending-expired-headline = Your booking request has expired: the host did not respond in time. Please pick another time.
+email-pending-expired-action = Pick another time
+bae-body-host-busy = The host (or a required team member) is no longer free at this time. Ask the guest to pick another slot.
+bookings-error-generic = Something went wrong.
+troubleshoot-detail-pending-request = { $title } (pending request)
+etf-pending-blocks-slot = Pending requests block the time slot
+etf-pending-blocks-slot-help = While a request waits for your answer, nobody else can book that time, on this event type or any of your others.
+etf-pending-expiry = Request expiry
+etf-pending-expiry-help = A request you have not answered by then is declined automatically and the guest is asked to pick another time. It comes sooner when the meeting gets too close for anyone else to book the slot. You get one reminder halfway.
+etf-pending-expiry-never = Never
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] After { $hours } hour
+       *[other] After { $hours } hours
+    }

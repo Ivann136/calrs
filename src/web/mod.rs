@@ -492,6 +492,501 @@ async fn due_reminders(pool: &SqlitePool, now: chrono::DateTime<Utc>) -> Vec<Due
                AND datetime(b.start_at) > datetime(?1)",).bind(now.to_rfc3339()).fetch_all(pool).await.unwrap_or_default()
 }
 
+/// Request expiry choices offered by the event type form, in hours. `None`
+/// (stored as NULL) means a pending request never expires.
+const PENDING_EXPIRY_CHOICES: [i32; 4] = [4, 24, 48, 72];
+
+/// Expiry given to event types created from the web form when the form does
+/// not say otherwise.
+const DEFAULT_PENDING_EXPIRY_HOURS: i32 = 24;
+
+/// Deadline for a pending request created (or put back to pending) at `now`
+/// for a meeting starting at `start`. `None` when the event type's requests
+/// never expire.
+///
+/// Expiring a request is only useful while releasing its slot helps another
+/// guest, i.e. until `release = start - min_notice`, the last moment the slot
+/// can still be booked. So:
+/// - `release` still ahead: `min(now + expiry, release)`.
+/// - `release` already passed (the request was made, or rescheduled, inside
+///   the notice window, where nobody else could book the slot anyway):
+///   `min(now + expiry, start)`, which leaves the host until the meeting
+///   instead of expiring the request minutes after it was made.
+///
+/// Never earlier than `now`.
+fn pending_expiry_deadline(
+    now: chrono::DateTime<Utc>,
+    start: chrono::DateTime<Utc>,
+    expiry_hours: Option<i32>,
+    min_notice_min: i32,
+) -> Option<chrono::DateTime<Utc>> {
+    let hours = expiry_hours.filter(|h| *h > 0)?;
+    let by_expiry = now + Duration::hours(hours.into());
+    let release = start - Duration::minutes(min_notice_min.max(0).into());
+    let cap = if release > now { release } else { start };
+    Some(by_expiry.min(cap).max(now))
+}
+
+/// Store the expiry deadline of a just-inserted booking, inside the insert's
+/// transaction, computed from its event type. A booking that is not pending (or a legacy row without a UTC start)
+/// gets NULL, which never expires. Best-effort: a failure only means the
+/// request does not expire, which is the pre-#234 behaviour, so it is logged
+/// rather than failing the booking.
+/// `(pending_expires_at, pending_since)` for a booking entering pending at
+/// `now` with UTC start `start_at`, from its event type's `expiry_hours` and
+/// `min_notice_min`. Both `None` when requests never expire (or the start is
+/// not a UTC instant). `pending_since` anchors the halfway host nudge, so a
+/// request put back to pending by a reschedule is nudged halfway through its
+/// new window.
+fn pending_window(
+    now: chrono::DateTime<Utc>,
+    start_at: &str,
+    expiry_hours: Option<i32>,
+    min_notice_min: i32,
+) -> (Option<String>, Option<String>) {
+    let deadline = chrono::DateTime::parse_from_rfc3339(start_at)
+        .ok()
+        .and_then(|start| {
+            pending_expiry_deadline(now, start.with_timezone(&Utc), expiry_hours, min_notice_min)
+        });
+    match deadline {
+        Some(d) => (
+            Some(d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        ),
+        None => (None, None),
+    }
+}
+
+async fn stamp_pending_deadline(conn: &mut sqlx::SqliteConnection, booking_id: &str) {
+    let row: Option<(String, Option<i32>, i32)> = match sqlx::query_as(
+        "SELECT b.start_at, et.pending_expiry_hours, et.min_notice_min
+         FROM bookings b JOIN event_types et ON et.id = b.event_type_id
+         WHERE b.id = ? AND b.status = 'pending' AND b.time_version = 1",
+    )
+    .bind(booking_id)
+    .fetch_optional(&mut *conn)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(booking_id, error = %e, "cannot read pending request expiry settings");
+            return;
+        }
+    };
+    let (deadline, since) = row
+        .map(|(start, hours, min_notice)| pending_window(Utc::now(), &start, hours, min_notice))
+        .unwrap_or_default();
+    if let Err(e) = sqlx::query(
+        "UPDATE bookings SET pending_expires_at = ?, pending_since = ?, pending_reminder_sent_at = NULL WHERE id = ?",
+    )
+    .bind(&deadline)
+    .bind(&since)
+    .bind(booking_id)
+    .execute(&mut *conn)
+    .await
+    {
+        tracing::warn!(booking_id, error = %e, "cannot store pending request deadline");
+    }
+}
+
+/// What one pass of [`sweep_pending_requests`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PendingSweep {
+    expired: usize,
+    nudged: usize,
+}
+
+/// The pending-request step of the background loop (#234):
+///
+/// 1. A pending request past `pending_expires_at` is declined, never
+///    accepted. The flip is guarded on `status = 'pending'` and on the
+///    deadline, so an approval (or a reschedule that moved the deadline) that
+///    lands first wins and nothing is sent. The guest gets an email (and an
+///    SMS when the event type collects phones) asking them to pick another
+///    time, and the host a short notice.
+/// 2. A request still unanswered halfway between `pending_since` and its
+///    deadline gets one host reminder with the Approve/Decline links. It is
+///    deferred, not dropped, while SMTP is unconfigured.
+///
+/// The status flips and claims are inline; the emails and SMS they trigger
+/// are spawned (see [`spawn_emails`]) so the reminders that follow in the
+/// same tick are never held up by SMTP. Nothing needs cleaning up on expiry:
+/// meeting links, resource reservations and CalDAV write-back only happen on
+/// confirmation.
+async fn sweep_pending_requests(
+    pool: &SqlitePool,
+    secret_key: &[u8; 32],
+    now: chrono::DateTime<Utc>,
+) -> PendingSweep {
+    let mut sweep = PendingSweep::default();
+    let now_s = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let smtp_config = crate::email::load_smtp_config(pool, secret_key)
+        .await
+        .ok()
+        .flatten();
+
+    let due: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM bookings
+         WHERE status = 'pending' AND pending_expires_at IS NOT NULL AND pending_expires_at <= ?",
+    )
+    .bind(&now_s)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for (bid,) in &due {
+        let flipped = sqlx::query(
+            "UPDATE bookings SET status = 'declined'
+             WHERE id = ? AND status = 'pending' AND pending_expires_at IS NOT NULL AND pending_expires_at <= ?",
+        )
+        .bind(bid)
+        .bind(&now_s)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+        if flipped == 0 {
+            continue;
+        }
+        // Declines do not store a reason (the host's optional one only rides
+        // in the guest email); the log line is the record of why.
+        tracing::info!(
+            booking_id = %bid,
+            reason = "expired: the host did not respond before the deadline",
+            "pending request declined"
+        );
+        // Notifications go out in the background, like the booking flow's
+        // (`spawn_emails`): a slow relay or a burst of expiries must not hold
+        // up the reminders this loop sends next. The decline above is
+        // already committed.
+        let (pool, key, smtp, bid) = (pool.clone(), *secret_key, smtp_config.clone(), bid.clone());
+        spawn_emails(async move {
+            notify_pending_expired(&pool, &key, smtp.as_ref(), &bid).await;
+        });
+        sweep.expired += 1;
+    }
+
+    let Some(smtp_config) = smtp_config else {
+        return sweep;
+    };
+    let candidates: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, pending_since, pending_expires_at FROM bookings
+         WHERE status = 'pending' AND pending_reminder_sent_at IS NULL
+           AND pending_since IS NOT NULL AND pending_expires_at IS NOT NULL
+           AND pending_expires_at > ?",
+    )
+    .bind(&now_s)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for (bid, since, expires) in &candidates {
+        let (Ok(since), Ok(expires)) = (
+            chrono::DateTime::parse_from_rfc3339(since),
+            chrono::DateTime::parse_from_rfc3339(expires),
+        ) else {
+            continue;
+        };
+        let halfway = since.with_timezone(&Utc) + (expires - since) / 2;
+        if now < halfway {
+            continue;
+        }
+        // Claim first so a slow SMTP send can never produce a second nudge.
+        let claimed = sqlx::query(
+            "UPDATE bookings SET pending_reminder_sent_at = ?
+             WHERE id = ? AND status = 'pending' AND pending_reminder_sent_at IS NULL",
+        )
+        .bind(&now_s)
+        .bind(bid)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+        if claimed == 0 {
+            continue;
+        }
+        let (pool, smtp, bid) = (pool.clone(), smtp_config.clone(), bid.clone());
+        let expires = expires.with_timezone(&Utc);
+        spawn_emails(async move {
+            send_pending_nudge(&pool, &smtp, &bid, expires).await;
+        });
+        sweep.nudged += 1;
+    }
+    sweep
+}
+
+/// The host side of a pending booking as (name, email, language): the
+/// assigned member, every eligible member of a collective booking, or the
+/// owner, i.e. whoever was asked to approve it.
+async fn pending_host_recipients(
+    pool: &SqlitePool,
+    uid: &str,
+    owner_user_id: &str,
+) -> Vec<(String, String, Option<String>)> {
+    let hosts = reschedule_hosts(pool, uid, owner_user_id).await;
+    let mut ids = hosts.user_ids;
+    if ids.is_empty() {
+        ids.push(owner_user_id.to_string());
+    }
+    let mut out = Vec::new();
+    for id in &ids {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT name, COALESCE(booking_email, email), language FROM users WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        out.extend(row);
+    }
+    out
+}
+
+/// Public booking page of an event type, for the "pick another time" link in
+/// the expiry email. Only for enabled public event types: internal and
+/// private ones need a per-guest invite the guest no longer has. A public
+/// event type on a private team is only reachable with the team's invite
+/// token (`?invite=`, as checked by the team slot page), so the link carries
+/// it, and there is no link when the team has none.
+async fn event_type_rebook_url(pool: &SqlitePool, et_id: &str) -> Option<String> {
+    let base = crate::settings::base_url()?;
+    #[allow(clippy::type_complexity)]
+    let (slug, visibility, enabled, team_slug, team_visibility, team_invite, username): (
+        String,
+        String,
+        i32,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT et.slug, et.visibility, et.enabled, t.slug, t.visibility, t.invite_token, u.username
+         FROM event_types et
+         JOIN accounts a ON a.id = et.account_id
+         LEFT JOIN users u ON u.id = a.user_id
+         LEFT JOIN teams t ON t.id = et.team_id
+         WHERE et.id = ?",
+    )
+    .bind(et_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    if visibility != "public" || enabled == 0 {
+        return None;
+    }
+    let base = base.trim_end_matches('/');
+    match (team_slug, username) {
+        (Some(team), _) => {
+            let url = format!("{}/team/{}/{}", base, team, slug);
+            if team_visibility.as_deref() == Some("private") {
+                let token = team_invite.filter(|t| !t.is_empty())?;
+                Some(format!("{}?invite={}", url, urlencoding::encode(&token)))
+            } else {
+                Some(url)
+            }
+        }
+        (None, Some(user)) => Some(format!("{}/u/{}/{}", base, user, slug)),
+        (None, None) => None,
+    }
+}
+
+type PendingRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+async fn load_pending_row(pool: &SqlitePool, booking_id: &str) -> Option<PendingRow> {
+    sqlx::query_as(
+        "SELECT b.uid, b.guest_name, b.guest_email,
+                CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at,
+                CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at,
+                et.title, COALESCE(b.guest_timezone, 'UTC'), b.language, b.guest_phone,
+                et.sms_phone_mode, et.id, a.user_id, b.confirm_token, b.notes
+         FROM bookings b
+         JOIN event_types et ON et.id = b.event_type_id
+         JOIN accounts a ON a.id = et.account_id
+         WHERE b.id = ?",
+    )
+    .bind(booking_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+}
+
+/// Emails and SMS for a request the sweep just declined as expired.
+async fn notify_pending_expired(
+    pool: &SqlitePool,
+    secret_key: &[u8; 32],
+    smtp_config: Option<&crate::email::SmtpConfig>,
+    booking_id: &str,
+) {
+    let Some((
+        uid,
+        guest_name,
+        guest_email,
+        start_at,
+        end_at,
+        event_title,
+        guest_timezone,
+        guest_language,
+        guest_phone,
+        sms_phone_mode,
+        et_id,
+        owner_user_id,
+        _confirm_token,
+        _notes,
+    )) = load_pending_row(pool, booking_id).await
+    else {
+        return;
+    };
+    let stored_tz = get_host_tz(pool, &et_id).await;
+    let guest_tz = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+    let (date, start_time, end_time) =
+        booking_strings_in_guest_tz(&start_at, &end_at, stored_tz, guest_tz);
+    let hosts = pending_host_recipients(pool, &uid, &owner_user_id).await;
+    let (host_name, host_email) = hosts
+        .first()
+        .map(|(n, e, _)| (n.clone(), e.clone()))
+        .unwrap_or_default();
+    let details = crate::email::CancellationDetails {
+        utc_times: crate::booking_time::ics_times(&start_at, &end_at),
+        event_title,
+        date,
+        start_time,
+        end_time,
+        guest_name,
+        guest_email,
+        guest_timezone,
+        host_name,
+        host_email,
+        uid: uid.clone(),
+        reason: None,
+        cancelled_by_host: true,
+        guest_language,
+        host_language: None,
+        host_timezone: stored_tz.name().to_string(),
+    };
+
+    if let Some(smtp_config) = smtp_config {
+        let rebook_url = event_type_rebook_url(pool, &et_id).await;
+        log_email_result(
+            crate::email::send_guest_pending_expired(smtp_config, &details, rebook_url.as_deref())
+                .await,
+            "guest_pending_expired",
+            &uid,
+        );
+        for (name, email, language) in &hosts {
+            let host_details = crate::email::CancellationDetails {
+                host_name: name.clone(),
+                host_email: email.clone(),
+                host_language: language.clone(),
+                ..details.clone()
+            };
+            log_email_result(
+                crate::email::send_host_pending_expired(smtp_config, &host_details).await,
+                "host_pending_expired",
+                &uid,
+            );
+        }
+    }
+
+    if let Some(ctx) = crate::sms::SmsContext::for_cancellation(
+        &details,
+        guest_phone.as_deref(),
+        crate::sms::collects_phone(&sms_phone_mode),
+    ) {
+        crate::sms::notify_guest(pool, secret_key, crate::sms::SmsEvent::Expired, ctx).await;
+    }
+}
+
+/// The one host reminder for a request still unanswered halfway to its
+/// deadline: the approval request again, with the deadline spelled out.
+async fn send_pending_nudge(
+    pool: &SqlitePool,
+    smtp_config: &crate::email::SmtpConfig,
+    booking_id: &str,
+    expires: chrono::DateTime<Utc>,
+) {
+    let Some((
+        uid,
+        guest_name,
+        guest_email,
+        start_at,
+        end_at,
+        event_title,
+        guest_timezone,
+        guest_language,
+        guest_phone,
+        sms_phone_mode,
+        et_id,
+        owner_user_id,
+        confirm_token,
+        notes,
+    )) = load_pending_row(pool, booking_id).await
+    else {
+        return;
+    };
+    let stored_tz = get_host_tz(pool, &et_id).await;
+    let guest_tz = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+    let (date, start_time, end_time) =
+        booking_strings_in_guest_tz(&start_at, &end_at, stored_tz, guest_tz);
+    let expires_display = format!(
+        "{} ({})",
+        expires.with_timezone(&stored_tz).format("%Y-%m-%d %H:%M"),
+        stored_tz.name()
+    );
+    let base_url = crate::settings::base_url();
+    let details = crate::email::BookingDetails {
+        utc_times: crate::booking_time::ics_times(&start_at, &end_at),
+        event_title,
+        date,
+        start_time,
+        end_time,
+        guest_name,
+        guest_email,
+        guest_timezone,
+        uid: uid.clone(),
+        notes: notes.filter(|n| !n.trim().is_empty()),
+        guest_phone: guest_phone.filter(|_| crate::sms::collects_phone(&sms_phone_mode)),
+        guest_language,
+        host_timezone: stored_tz.name().to_string(),
+        resource_name: booking_resource_label(pool, &uid).await,
+        ..Default::default()
+    };
+    for (name, email, language) in pending_host_recipients(pool, &uid, &owner_user_id).await {
+        let host_details = crate::email::BookingDetails {
+            host_name: name,
+            host_email: email,
+            host_language: language,
+            ..details.clone()
+        };
+        log_email_result(
+            crate::email::send_host_approval_reminder(
+                smtp_config,
+                &host_details,
+                confirm_token.as_deref(),
+                base_url.as_deref(),
+                &expires_display,
+            )
+            .await,
+            "host_approval_reminder",
+            &uid,
+        );
+    }
+}
+
 /// Log a failed email send with enough context to find the booking again.
 /// Email is best-effort everywhere in the booking flow, but a failure that
 /// leaves no trace is how #236 went unnoticed: `send_email` logs the SMTP
@@ -698,6 +1193,10 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             }
             last_session_cleanup = std::time::Instant::now();
         }
+
+        // Pending requests: decline the ones past their deadline and nudge
+        // hosts halfway there (#234).
+        sweep_pending_requests(&pool, &secret_key, Utc::now()).await;
 
         // Reminders run in their own function: their early exits (nothing
         // due, no channel configured) used to `continue` this loop and skip
@@ -2326,10 +2825,11 @@ async fn dashboard_bookings(
     let user = &auth_user.user;
     let error_message = match query.get("error").map(String::as_str) {
         Some("resource-busy") => {
-            "Cannot approve: a required resource is no longer available for that time.              Ask the guest to pick another slot."
+            crate::i18n::translate(auth_user.lang, "bae-body-resource-gone", None)
         }
-        Some(_) => "Something went wrong.",
-        None => "",
+        Some("host-busy") => crate::i18n::translate(auth_user.lang, "bae-body-host-busy", None),
+        Some(_) => crate::i18n::translate(auth_user.lang, "bookings-error-generic", None),
+        None => String::new(),
     };
 
     let pending_bookings: Vec<(
@@ -4744,7 +5244,7 @@ async fn cancel_booking(
     // Guarded on the status read above: a double click, or an approval or
     // cancellation landing in between, must not notify the guest twice or
     // cancel a booking that changed state meanwhile.
-    let changed = sqlx::query("UPDATE bookings SET status = ? WHERE id = ? AND status = ?")
+    let changed = sqlx::query("UPDATE bookings SET status = ?, pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = ?")
         .bind(new_status)
         .bind(&bid)
         .bind(&prev_status)
@@ -4909,23 +5409,53 @@ async fn confirm_booking(
         None => return Redirect::to("/dashboard/bookings").into_response(),
     };
 
+    // Refresh the hosts' calendars before taking the lock below (bounded,
+    // see `prepare_approval_hosts`).
+    let approval_hosts = prepare_approval_hosts(&state, &uid, &user.id).await;
+
     // Pending bookings do not block shared resources, so re-verify them at
-    // approval time under the process-wide resource lock; in round-robin
+    // approval time under the process-wide lock taken below; in round-robin
     // mode the resource is re-picked (the original pick may be long stale).
-    let resource_guard = {
+    // The feeds are refreshed first, outside the lock.
+    let has_resources = {
         let ids: Vec<String> = crate::resources::resources_for_event_type(&state.pool, &et_id)
             .await
             .into_iter()
             .map(|r| r.id)
             .collect();
         if ids.is_empty() {
-            None
+            false
         } else {
             crate::resources::sync_if_stale(&state.pool, &ids).await;
-            Some(crate::resources::booking_lock().await)
+            true
         }
     };
-    if resource_guard.is_some() {
+
+    // One process-wide lock from the availability re-checks through the
+    // status flip: without it two overlapping requests approved at the same
+    // time could both pass the host check (#234). The resource re-check runs
+    // under the same guard, which is why it no longer takes its own.
+    let booking_guard = crate::resources::booking_lock().await;
+
+    // The host may have filled the time since the request came in (another
+    // meeting in their calendar, or another booking): approving would then
+    // double-book them (#234).
+    if !approval_hosts_free(
+        &state.pool,
+        &approval_hosts,
+        &bid,
+        &uid,
+        &et_id,
+        &start_at,
+        &end_at,
+    )
+    .await
+    {
+        tracing::warn!(booking_id = %bid, "approval refused: host no longer free");
+        return Redirect::to("/dashboard/bookings?error=host-busy").into_response();
+    }
+
+    if has_resources {
         if let (Some(s), Some(e)) = (parse_ical_datetime(&start_at), parse_ical_datetime(&end_at)) {
             let tz_check = get_host_tz(&state.pool, &et_id).await;
             let (s, e) =
@@ -4954,13 +5484,13 @@ async fn confirm_booking(
     // approvals (double click, or dashboard and email link together) only
     // one goes on to send the emails and the paid SMS.
     let flipped =
-        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+        sqlx::query("UPDATE bookings SET status = 'confirmed', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = 'pending'")
             .bind(&bid)
             .execute(&state.pool)
             .await
             .map(|r| r.rows_affected())
             .unwrap_or(0);
-    drop(resource_guard);
+    drop(booking_guard);
     if flipped == 0 {
         return Redirect::to("/dashboard/bookings").into_response();
     }
@@ -5189,6 +5719,12 @@ struct EventTypeForm {
     // stores NULL (no limit); 0 means today only.
     #[serde(default)]
     booking_horizon_days: String,
+    // Pending requests (#234), shown when requires_confirmation is on.
+    // Checkbox: "on" or absent.
+    pending_blocks_slot: Option<String>,
+    // "never" or a number of hours from PENDING_EXPIRY_CHOICES. Its presence
+    // is also the marker that the form carried the section at all.
+    pending_expiry_hours: Option<String>,
 }
 
 /// Template context for the "Required resources" section of the event type
@@ -5499,6 +6035,7 @@ async fn new_event_type_form(
             form_reschedule_notice_value => 0,
             form_reschedule_notice_unit => "minutes",
             form_booking_horizon_days => "",
+            form_pending => PendingSettings::DEFAULT.context(),
             tz_options => common_timezones_with(&user.timezone)
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -5715,6 +6252,7 @@ async fn create_event_type(
     .bind(booking_horizon_days)
     .execute(&state.pool)
     .await;
+    save_pending_settings(&state.pool, &et_id, &form, true).await;
 
     tracing::info!(slug = %slug, user = %auth_user.user.email, "event type created");
 
@@ -5919,6 +6457,7 @@ async fn edit_event_type_form(
         .await
         .map(|v| v.to_string())
         .unwrap_or_default();
+    let form_pending = PendingSettings::load(&state.pool, &et_id).await.context();
 
     let meeting_pattern_override: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT meeting_pattern_override FROM event_types WHERE id = ?",
@@ -6161,6 +6700,7 @@ async fn edit_event_type_form(
             form_reschedule_notice_value => form_reschedule_notice_value,
             form_reschedule_notice_unit => form_reschedule_notice_unit,
             form_booking_horizon_days => form_booking_horizon_days,
+            form_pending => form_pending,
             tz_options => common_timezones_with(&form_timezone)
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -6337,6 +6877,7 @@ async fn update_event_type(
     .bind(&et_id)
     .execute(&state.pool)
     .await;
+    save_pending_settings(&state.pool, &et_id, &form, false).await;
 
     // Update availability rules: delete old, insert new. Pass the user's
     // profile-default schedule as a fallback so an empty submission falls back
@@ -7858,6 +8399,9 @@ async fn render_event_type_form_error(
             // Preserve what the user typed, so a validation error doesn't
             // silently blank the horizon back to "no limit".
             form_booking_horizon_days => form.booking_horizon_days.trim(),
+            form_pending => PendingSettings::from_form(form)
+                .unwrap_or(PendingSettings::DEFAULT)
+                .context(),
             tz_options => common_timezones_with(form.timezone.as_deref().unwrap_or(&auth_user.user.timezone))
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -8862,6 +9406,7 @@ async fn new_group_event_type_form(
             form_first_slot_only => false,
             form_frequency_limits => "",
             form_booking_horizon_days => "",
+            form_pending => PendingSettings::DEFAULT.context(),
             form_timezone => &user.timezone,
             tz_options => common_timezones_with(&user.timezone)
                 .iter()
@@ -9047,6 +9592,7 @@ async fn create_group_event_type(
     .bind(booking_horizon_days)
     .execute(&state.pool)
     .await;
+    save_pending_settings(&state.pool, &et_id, &form, true).await;
 
     // Create availability rules. Pass the creating user's profile-default
     // schedule as a fallback so an empty submission falls back to it instead
@@ -9249,6 +9795,7 @@ async fn edit_group_event_type_form(
         .await
         .map(|v| v.to_string())
         .unwrap_or_default();
+    let form_pending = PendingSettings::load(&state.pool, &et_id).await.context();
 
     let meeting_pattern_override: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT meeting_pattern_override FROM event_types WHERE id = ?",
@@ -9452,6 +9999,7 @@ async fn edit_group_event_type_form(
             form_reschedule_notice_value => form_reschedule_notice_value,
             form_reschedule_notice_unit => form_reschedule_notice_unit,
             form_booking_horizon_days => form_booking_horizon_days,
+            form_pending => form_pending,
             tz_options => common_timezones_with(&form_timezone)
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -9644,6 +10192,7 @@ async fn update_group_event_type(
     .bind(&et_id)
     .execute(&state.pool)
     .await;
+    save_pending_settings(&state.pool, &et_id, &form, false).await;
 
     // Update availability rules. Pass the editing user's profile-default
     // schedule as a fallback so an empty submission falls back to it instead
@@ -11056,7 +11605,11 @@ async fn handle_group_booking(
     .await;
 
     match insert_result {
-        Ok(_) => {}
+        Ok(_) => {
+            if needs_approval {
+                stamp_pending_deadline(&mut tx, &id).await;
+            }
+        }
         Err(e) => {
             let _ = tx.rollback().await;
             if e.to_string().contains("UNIQUE constraint failed") {
@@ -12092,7 +12645,11 @@ async fn handle_dynamic_group_booking(
     .await;
 
     match insert_result {
-        Ok(_) => {}
+        Ok(_) => {
+            if needs_approval {
+                stamp_pending_deadline(&mut tx, &id).await;
+            }
+        }
         Err(e) => {
             let _ = tx.rollback().await;
             if e.to_string().contains("UNIQUE constraint failed") {
@@ -13043,7 +13600,11 @@ async fn handle_booking_for_user(
     .await;
 
     match insert_result {
-        Ok(_) => {}
+        Ok(_) => {
+            if needs_approval {
+                stamp_pending_deadline(&mut tx, &id).await;
+            }
+        }
         Err(e) => {
             let _ = tx.rollback().await;
             if e.to_string().contains("UNIQUE constraint failed") {
@@ -13320,9 +13881,9 @@ async fn pick_group_member(
             continue;
         }
 
-        // Pending bookings never mark a member busy above (they don't
-        // block public slots), but the per-member unique index counts
-        // them: re-picking a member with a pending same-slot assignment
+        // Pending bookings mark a member busy above only when their event
+        // type has `pending_blocks_slot` on, but the per-member unique index
+        // counts them always: re-picking a member with a pending same-slot assignment
         // would just bounce the INSERT (#146). Deliberately broader than
         // the index (any event type, buffered window): a member with an
         // overlapping pending commitment anywhere is a bad pick — if both
@@ -13484,6 +14045,35 @@ async fn fetch_busy_times_for_user_ex(
     exclude_booking_id: Option<&str>,
     exclude_booking_uid: Option<&str>,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    fetch_busy_times_for_user_opts(
+        pool,
+        user_id,
+        window_start,
+        window_end,
+        host_tz,
+        event_type_id,
+        exclude_booking_id,
+        exclude_booking_uid,
+        true,
+    )
+    .await
+}
+
+/// [`fetch_busy_times_for_user_ex`], choosing whether pending requests that
+/// hold their slot count as busy. Slot pages and booking checks count them;
+/// the approval re-check does not (see [`approval_hosts_free`]).
+#[allow(clippy::too_many_arguments)]
+async fn fetch_busy_times_for_user_opts(
+    pool: &SqlitePool,
+    user_id: &str,
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    host_tz: Tz,
+    event_type_id: Option<&str>,
+    exclude_booking_id: Option<&str>,
+    exclude_booking_uid: Option<&str>,
+    include_pending_holds: bool,
+) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     // Events are stored in compact iCal form ("YYYYMMDDTHHMMSS" for timed,
     // "YYYYMMDD" for all-day), so both overlap bounds must also be compact
     // with a time component. Using a date-only upper bound here ("YYYYMMDD")
@@ -13577,19 +14167,20 @@ async fn fetch_busy_times_for_user_ex(
     // a member of that team. An assigned booking must NOT mark the event
     // type owner busy: on a round-robin team the owner stays free when
     // another member took the booking (#146).
-    let bookings: Vec<(String, String)> = sqlx::query_as(
+    //
+    // Pending requests count too when their own event type says so
+    // (`pending_blocks_slot`, on by default): otherwise a second guest is
+    // offered the slot, fills the form, and is bounced at submit, and an
+    // overlapping slot on another event type could be requested as well (#234).
+    let bookings: Vec<(String, String)> = sqlx::query_as(&format!(
         "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
-         WHERE (b.assigned_user_id = ?
-                OR (b.assigned_user_id IS NULL AND a.user_id = ?)
-                OR (b.assigned_user_id IS NULL AND et.team_id IS NOT NULL AND EXISTS (
-                      SELECT 1 FROM team_members tm
-                      WHERE tm.team_id = et.team_id AND tm.user_id = ?)))
-           AND b.status = 'confirmed'
+         WHERE {}
            AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
            AND (? = '' OR b.id != ?)",
-    )
+        crate::booking_time::user_busy_bookings(include_pending_holds)
+    ))
     .bind(user_id)
     .bind(user_id)
     .bind(user_id)
@@ -14411,6 +15002,124 @@ async fn get_booking_horizon(pool: &SqlitePool, et_id: &str) -> Option<i32> {
     .ok()
     .flatten()
     .flatten()
+}
+
+/// The pending-request section of the event type form (#234): whether a
+/// pending request blocks the slot, and how long it may wait (`None` = never).
+/// The one place that maps between stored values, form values and the
+/// template, so the defaults and the "never" spelling live nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSettings {
+    blocks_slot: bool,
+    expiry_hours: Option<i32>,
+}
+
+impl PendingSettings {
+    /// What a new event type gets from the web form.
+    const DEFAULT: Self = Self {
+        blocks_slot: true,
+        expiry_hours: Some(DEFAULT_PENDING_EXPIRY_HOURS),
+    };
+
+    /// Longest expiry accepted from the form, one year. Anything positive up
+    /// to that is kept, so a stored value outside [`PENDING_EXPIRY_CHOICES`]
+    /// survives a save instead of being reset to "never".
+    const MAX_EXPIRY_HOURS: i32 = 24 * 365;
+
+    /// The select value for an expiry: hours as a number, or "never".
+    fn expiry_value(expiry_hours: Option<i32>) -> String {
+        expiry_hours
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "never".to_string())
+    }
+
+    /// Parse a select value back. "never", and anything that is not a
+    /// positive hour count within [`Self::MAX_EXPIRY_HOURS`], is `None`.
+    fn parse_expiry(raw: &str) -> Option<i32> {
+        raw.trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|h| (1..=Self::MAX_EXPIRY_HOURS).contains(h))
+    }
+
+    /// The settings a submitted form carries, or `None` when the form did not
+    /// include the section at all (no `pending_expiry_hours` field, e.g. a
+    /// script posting the old field set).
+    fn from_form(form: &EventTypeForm) -> Option<Self> {
+        let raw = form.pending_expiry_hours.as_deref()?;
+        Some(Self {
+            blocks_slot: form.pending_blocks_slot.as_deref() == Some("on"),
+            expiry_hours: Self::parse_expiry(raw),
+        })
+    }
+
+    async fn load(pool: &SqlitePool, et_id: &str) -> Self {
+        let row: Option<(i32, Option<i32>)> = sqlx::query_as(
+            "SELECT pending_blocks_slot, pending_expiry_hours FROM event_types WHERE id = ?",
+        )
+        .bind(et_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        match row {
+            Some((blocks, hours)) => Self {
+                blocks_slot: blocks != 0,
+                expiry_hours: hours,
+            },
+            None => Self::DEFAULT,
+        }
+    }
+
+    /// Template context: the checkbox state, the selected value, and the
+    /// options to render. A stored expiry that is not one of the offered
+    /// choices is listed too, so it stays selected.
+    fn context(&self) -> minijinja::Value {
+        let mut hours: Vec<i32> = PENDING_EXPIRY_CHOICES.to_vec();
+        if let Some(h) = self.expiry_hours {
+            if !hours.contains(&h) {
+                hours.push(h);
+                hours.sort_unstable();
+            }
+        }
+        let mut options = vec![context! { value => "never", hours => () }];
+        options.extend(
+            hours
+                .into_iter()
+                .map(|h| context! { value => h.to_string(), hours => h }),
+        );
+        context! {
+            blocks_slot => self.blocks_slot,
+            selected => Self::expiry_value(self.expiry_hours),
+            options => options,
+        }
+    }
+}
+
+/// Persist the pending-request settings from the event type form. A
+/// submission without the section keeps the stored values on edit and gets
+/// [`PendingSettings::DEFAULT`] on create.
+async fn save_pending_settings(
+    pool: &SqlitePool,
+    et_id: &str,
+    form: &EventTypeForm,
+    creating: bool,
+) {
+    let settings = match PendingSettings::from_form(form) {
+        Some(settings) => settings,
+        None if creating => PendingSettings::DEFAULT,
+        None => return,
+    };
+    if let Err(e) = sqlx::query(
+        "UPDATE event_types SET pending_blocks_slot = ?, pending_expiry_hours = ? WHERE id = ?",
+    )
+    .bind(settings.blocks_slot as i32)
+    .bind(settings.expiry_hours)
+    .bind(et_id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(event_type_id = %et_id, error = %e, "cannot save pending request settings");
+    }
 }
 
 /// The last host-local date a guest may book, for a given horizon.
@@ -15700,7 +16409,11 @@ async fn handle_booking(
     .await;
 
     match insert_result {
-        Ok(_) => {}
+        Ok(_) => {
+            if needs_approval {
+                stamp_pending_deadline(&mut tx, &id).await;
+            }
+        }
         Err(e) => {
             let _ = tx.rollback().await;
             if e.to_string().contains("UNIQUE constraint failed") {
@@ -16145,16 +16858,21 @@ async fn troubleshoot(
         }
     }
 
-    // Bookings for this date
-    let bookings: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.guest_name, et2.title
+    // Bookings for this date: the same bookings that make this user busy on
+    // the slot pages (their own, the ones assigned to them on someone else's
+    // team event type, unassigned collective ones, and held pending requests).
+    let bookings: Vec<(String, String, String, String, String)> = sqlx::query_as(&format!(
+        "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.guest_name, et.title, b.status
          FROM bookings b
-         JOIN event_types et2 ON et2.id = b.event_type_id
-         JOIN accounts a ON a.id = et2.account_id
-         WHERE a.user_id = ? AND b.status IN ('confirmed', 'pending')
+         JOIN event_types et ON et.id = b.event_type_id
+         JOIN accounts a ON a.id = et.account_id
+         WHERE {}
            AND b.start_at < strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at > strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
          ORDER BY b.start_at",
-    )
+        crate::booking_time::user_busy_bookings(true)
+    ))
+    .bind(&user.id)
+    .bind(&user.id)
     .bind(&user.id)
     .bind(&day_end_iso)
     .bind(&day_start_iso)
@@ -16220,11 +16938,23 @@ async fn troubleshoot(
         .collect();
 
     // Parse bookings into (start_dt, end_dt, label, detail)
+    // A pending request is shown as such, so the host can tell a held slot
+    // from a confirmed meeting.
     let bookings_parsed: Vec<(NaiveDateTime, NaiveDateTime, String, String)> = bookings
         .iter()
-        .filter_map(|(s, e, guest, et_title)| {
+        .filter_map(|(s, e, guest, et_title, status)| {
             let (start, end) = crate::booking_time::busy_range(s, e, host_tz)?;
-            Some((start, end, guest.clone(), et_title.clone()))
+            let detail = if status == "pending" {
+                tr1(
+                    auth_user.lang,
+                    "troubleshoot-detail-pending-request",
+                    "title",
+                    et_title,
+                )
+            } else {
+                et_title.clone()
+            };
+            Some((start, end, guest.clone(), detail))
         })
         .collect();
 
@@ -19425,10 +20155,15 @@ async fn approve_booking_by_token(
             .flatten()
             .flatten();
 
+    // Refresh the hosts' calendars before taking the lock below (bounded,
+    // see `prepare_approval_hosts`).
+    let approval_hosts = prepare_approval_hosts(&state, &uid, &user_id).await;
+
     // Pending bookings do not block shared resources, so re-verify them at
-    // approval time under the process-wide resource lock; in round-robin
+    // approval time under the process-wide lock taken below; in round-robin
     // mode the resource is re-picked (the original pick may be long stale).
-    let resource_guard = {
+    // The feeds are refreshed first, outside the lock.
+    let has_resources = {
         let ids: Vec<String> =
             crate::resources::resources_for_event_type(&state.pool, &event_type_id)
                 .await
@@ -19436,13 +20171,36 @@ async fn approve_booking_by_token(
                 .map(|r| r.id)
                 .collect();
         if ids.is_empty() {
-            None
+            false
         } else {
             crate::resources::sync_if_stale(&state.pool, &ids).await;
-            Some(crate::resources::booking_lock().await)
+            true
         }
     };
-    if resource_guard.is_some() {
+
+    // Same lock and host re-check as the dashboard approval (#234).
+    let booking_guard = crate::resources::booking_lock().await;
+    if !approval_hosts_free(
+        &state.pool,
+        &approval_hosts,
+        &bid,
+        &uid,
+        &event_type_id,
+        &start_at,
+        &end_at,
+    )
+    .await
+    {
+        tracing::warn!(booking_id = %bid, "approval refused: host no longer free");
+        return render_booking_action_error_keys(
+            &state,
+            &headers,
+            "bae-title-cannot-approve",
+            "bae-body-host-busy",
+        );
+    }
+
+    if has_resources {
         if let (Some(s), Some(e)) = (parse_ical_datetime(&start_at), parse_ical_datetime(&end_at)) {
             let tz_check = get_host_tz(&state.pool, &event_type_id).await;
             let (s, e) =
@@ -19482,13 +20240,13 @@ async fn approve_booking_by_token(
     // Confirm the booking, guarded like the dashboard path: a concurrent
     // approval that already flipped it lands on the "already handled" page.
     let flipped =
-        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+        sqlx::query("UPDATE bookings SET status = 'confirmed', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = 'pending'")
             .bind(&bid)
             .execute(&state.pool)
             .await
             .map(|r| r.rows_affected())
             .unwrap_or(0);
-    drop(resource_guard);
+    drop(booking_guard);
     if flipped == 0 {
         let already: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
             .bind(&bid)
@@ -19788,7 +20546,7 @@ async fn decline_booking_by_token(
     // Decline the booking, guarded like approval: if a concurrent approve or
     // decline got there first, say so instead of emailing the guest again.
     let changed =
-        sqlx::query("UPDATE bookings SET status = 'declined' WHERE id = ? AND status = 'pending'")
+        sqlx::query("UPDATE bookings SET status = 'declined', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = 'pending'")
             .bind(&bid)
             .execute(&state.pool)
             .await
@@ -20234,7 +20992,7 @@ async fn guest_cancel_booking(
     // Cancel the booking. Guarded so a double submit, or a host decline or
     // cancel in between, does not notify everyone twice.
     let changed = sqlx::query(
-        "UPDATE bookings SET status = 'cancelled' WHERE id = ? AND status IN ('confirmed', 'pending')",
+        "UPDATE bookings SET status = 'cancelled', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status IN ('confirmed', 'pending')",
     )
     .bind(&bid)
     .execute(&state.pool)
@@ -21001,11 +21759,30 @@ async fn guest_reschedule_booking(
         }
         Err(e) => return internal_error_response("booking conflict check", &e),
     }
+    // The pending window is written by the same UPDATE as the status: a
+    // request put back to pending gets a fresh deadline (and a fresh host
+    // nudge) atomically, so the expiry sweep can never see it pending with
+    // the previous, possibly past, deadline. A confirmed result clears it.
+    let (pending_expires_at, pending_since) = if needs_approval {
+        let (hours, min_notice): (Option<i32>, i32) = sqlx::query_as(
+            "SELECT pending_expiry_hours, min_notice_min FROM event_types WHERE id = ?",
+        )
+        .bind(&et_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or((None, 0));
+        pending_window(Utc::now(), &new_start_at, hours, min_notice)
+    } else {
+        (None, None)
+    };
     let update_result = sqlx::query(
         "UPDATE bookings SET time_version = 1, start_at = ?, end_at = ?, status = ?,
                 reschedule_token = ?, cancel_token = ?, confirm_token = ?,
                 reminder_sent_at = NULL, guest_timezone = ?, reschedule_by_host = 0,
-                assigned_resource_id = ?
+                assigned_resource_id = ?,
+                pending_expires_at = ?, pending_since = ?, pending_reminder_sent_at = NULL
          WHERE id = ?",
     )
     .bind(&new_start_at)
@@ -21016,6 +21793,8 @@ async fn guest_reschedule_booking(
     .bind(&new_confirm)
     .bind(&new_guest_timezone)
     .bind(&new_resource_assignment)
+    .bind(&pending_expires_at)
+    .bind(&pending_since)
     .bind(&booking_id)
     .execute(&state.pool)
     .await;
@@ -21812,6 +22591,81 @@ async fn reschedule_busy_source(
         member_busy.insert(user_id.clone(), busy);
     }
     BusySource::Team(member_busy)
+}
+
+/// Upper bound on the calendar refresh an approval does before re-checking
+/// the hosts. The token path is unauthenticated, so a slow or dead CalDAV
+/// server must not hold the request (or the approval) open indefinitely.
+const APPROVAL_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The hosts an approval has to re-check (same resolution as a reschedule:
+/// the assigned member, every eligible member of a collective booking, the
+/// owner otherwise), with their calendars refreshed when stale. The refresh
+/// is bounded by [`APPROVAL_SYNC_TIMEOUT`] overall; past it the check uses
+/// the cached events, which is what it would have done before the refresh.
+async fn prepare_approval_hosts(
+    state: &Arc<AppState>,
+    booking_uid: &str,
+    owner_user_id: &str,
+) -> RescheduleHosts {
+    let hosts = reschedule_hosts(&state.pool, booking_uid, owner_user_id).await;
+    if tokio::time::timeout(APPROVAL_SYNC_TIMEOUT, sync_reschedule_hosts(state, &hosts))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            uid = %booking_uid,
+            "calendar refresh before approval timed out; checking cached events"
+        );
+    }
+    hosts
+}
+
+/// Whether everyone a pending booking needs is still free for it, checked
+/// under the booking lock right before an approval flips it to confirmed.
+///
+/// Busy means a calendar event or a confirmed booking, excluding the booking
+/// itself and its own calendar copy. Other pending requests are not counted:
+/// they hold slots against new guests, but between two waiting requests the
+/// host decides, and counting them would let two overlapping requests block
+/// each other's approval forever. Once one is approved it is confirmed, and
+/// the other is then refused. Working hours are not re-applied: the host is
+/// explicitly accepting this time. An empty collective roster is never free,
+/// as in [`reschedule_hosts`].
+async fn approval_hosts_free(
+    pool: &SqlitePool,
+    hosts: &RescheduleHosts,
+    booking_id: &str,
+    booking_uid: &str,
+    et_id: &str,
+    start_at: &str,
+    end_at: &str,
+) -> bool {
+    if hosts.user_ids.is_empty() {
+        return false;
+    }
+    let host_tz = get_host_tz(pool, et_id).await;
+    let Some((start, end)) = crate::booking_time::busy_range(start_at, end_at, host_tz) else {
+        return true;
+    };
+    for user_id in &hosts.user_ids {
+        let busy = fetch_busy_times_for_user_opts(
+            pool,
+            user_id,
+            start,
+            end,
+            host_tz,
+            Some(et_id),
+            Some(booking_id),
+            Some(booking_uid),
+            false,
+        )
+        .await;
+        if has_conflict(&busy, start, end) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The host profile the reschedule page shows: the person the booking is with
@@ -35709,6 +36563,7 @@ mod tests {
         assert_eq!(parse_optional_day_count("abc"), None);
     }
     include!("booking_time_tests.rs");
+    include!("pending_hold_tests.rs");
 
     // --- #209: guest emails sent on someone else's request keep the guest's language ---
 

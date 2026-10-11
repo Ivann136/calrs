@@ -1346,3 +1346,26 @@ dynamic-group-user-not-found = Nie znaleziono użytkownika „{ $username }”.
 dynamic-group-user-opted-out = Użytkownik „{ $username }” nie włączył linków grupy dynamicznej.
 
 error-slot-unavailable-member = Ten termin nie jest już dostępny ({ $username } ma konflikt).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Prośba wygasła: { $event }, { $date } o { $time } ({ $tz }). Brak odpowiedzi, wybierz inny termin.
+email-pending-expired-status = Prośba wygasła
+email-pending-expired-headline = Twoja prośba o rezerwację wygasła: gospodarz nie odpowiedział na czas. Wybierz inny termin.
+email-pending-expired-action = Wybierz inny termin
+bae-body-host-busy = Gospodarz (lub wymagany członek zespołu) nie jest już wolny o tej porze. Poproś gościa o wybranie innego terminu.
+bookings-error-generic = Coś poszło nie tak.
+troubleshoot-detail-pending-request = { $title } (oczekująca prośba)
+etf-pending-blocks-slot = Oczekujące prośby blokują termin
+etf-pending-blocks-slot-help = Dopóki prośba czeka na twoją odpowiedź, nikt inny nie może zarezerwować tego czasu, ani w tym, ani w innych twoich typach wydarzeń.
+etf-pending-expiry = Wygasanie próśb
+etf-pending-expiry-help = Prośba, na którą do tego czasu nie odpowiesz, zostaje automatycznie odrzucona, a gość zostaje poproszony o wybranie innego terminu. Termin kończy się wcześniej, gdy spotkanie jest zbyt blisko, by ktoś inny mógł jeszcze zarezerwować ten czas. W połowie czasu dostajesz jedno przypomnienie.
+etf-pending-expiry-never = Nigdy
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Po { $hours } godzinie
+        [few] Po { $hours } godzinach
+        [many] Po { $hours } godzinach
+       *[other] Po { $hours } godziny
+    }

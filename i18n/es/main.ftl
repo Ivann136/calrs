@@ -1324,3 +1324,24 @@ dynamic-group-user-not-found = Usuario «{ $username }» no encontrado.
 dynamic-group-user-opted-out = El usuario «{ $username }» no ha activado los enlaces de grupo dinámico.
 
 error-slot-unavailable-member = Este hueco ya no está disponible ({ $username } tiene un conflicto).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Solicitud caducada: { $event }, { $date } a las { $time } ({ $tz }). Sin respuesta a tiempo, elige otra hora.
+email-pending-expired-status = Solicitud caducada
+email-pending-expired-headline = Tu solicitud de reserva ha caducado: el anfitrión no respondió a tiempo. Elige otra hora, por favor.
+email-pending-expired-action = Elegir otra hora
+bae-body-host-busy = El anfitrión (o un miembro necesario del equipo) ya no está libre a esta hora. Pide al invitado que elija otro hueco.
+bookings-error-generic = Algo salió mal.
+troubleshoot-detail-pending-request = { $title } (solicitud pendiente)
+etf-pending-blocks-slot = Las solicitudes pendientes bloquean el hueco
+etf-pending-blocks-slot-help = Mientras una solicitud espera tu respuesta, nadie más puede reservar esa hora, ni en este tipo de evento ni en los demás.
+etf-pending-expiry = Caducidad de las solicitudes
+etf-pending-expiry-help = Una solicitud que no hayas respondido para entonces se rechaza automáticamente y se pide al invitado que elija otra hora. Termina antes si la reunión está demasiado cerca para que otra persona reserve ese hueco. Recibes un recordatorio a mitad de plazo.
+etf-pending-expiry-never = Nunca
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Tras { $hours } hora
+       *[other] Tras { $hours } horas
+    }
