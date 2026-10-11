@@ -609,8 +609,11 @@ struct PendingSweep {
 ///    deadline gets one host reminder with the Approve/Decline links. It is
 ///    deferred, not dropped, while SMTP is unconfigured.
 ///
-/// Nothing needs cleaning up on expiry: meeting links, resource reservations
-/// and CalDAV write-back only happen on confirmation.
+/// The status flips and claims are inline; the emails and SMS they trigger
+/// are spawned (see [`spawn_emails`]) so the reminders that follow in the
+/// same tick are never held up by SMTP. Nothing needs cleaning up on expiry:
+/// meeting links, resource reservations and CalDAV write-back only happen on
+/// confirmation.
 async fn sweep_pending_requests(
     pool: &SqlitePool,
     secret_key: &[u8; 32],
@@ -652,7 +655,14 @@ async fn sweep_pending_requests(
             reason = "expired: the host did not respond before the deadline",
             "pending request declined"
         );
-        notify_pending_expired(pool, secret_key, smtp_config.as_ref(), bid).await;
+        // Notifications go out in the background, like the booking flow's
+        // (`spawn_emails`): a slow relay or a burst of expiries must not hold
+        // up the reminders this loop sends next. The decline above is
+        // already committed.
+        let (pool, key, smtp, bid) = (pool.clone(), *secret_key, smtp_config.clone(), bid.clone());
+        spawn_emails(async move {
+            notify_pending_expired(&pool, &key, smtp.as_ref(), &bid).await;
+        });
         sweep.expired += 1;
     }
 
@@ -694,7 +704,11 @@ async fn sweep_pending_requests(
         if claimed == 0 {
             continue;
         }
-        send_pending_nudge(pool, &smtp_config, bid, expires.with_timezone(&Utc)).await;
+        let (pool, smtp, bid) = (pool.clone(), smtp_config.clone(), bid.clone());
+        let expires = expires.with_timezone(&Utc);
+        spawn_emails(async move {
+            send_pending_nudge(&pool, &smtp, &bid, expires).await;
+        });
         sweep.nudged += 1;
     }
     sweep

@@ -1133,6 +1133,81 @@ async fn troubleshoot_counts_the_same_bookings_as_the_slot_pages() {
     assert!(!body.contains("Bobs Guest"), "{body}");
 }
 
+/// Review finding on #234: the sweep sent its emails inline and serially,
+/// before the reminder batch of the same tick, so a relay that stalls (or a
+/// burst of expiries) delayed every reminder. The flips stay inline; the
+/// notifications are spawned.
+#[tokio::test]
+async fn sweep_does_not_wait_for_a_stalled_mail_relay() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let _guard = crate::test_support::EnvGuard::new();
+    let pool = setup_test_db().await;
+    let (_user_id, _account_id, et_id) = seed_test_data(&pool).await;
+    // A relay that accepts connections and never says a word.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    use_capturing_mta(&pool, port).await;
+
+    let now = Utc::now();
+    let mut expired = Vec::new();
+    for i in 0..3 {
+        expired.push(
+            insert_v1_booking(
+                &pool,
+                &et_id,
+                &format!("stalled{i}@test.com"),
+                now + Duration::days(3) + Duration::hours(i),
+                30,
+                "pending",
+                &[(
+                    "pending_expires_at",
+                    Some(utc_stamp(now - Duration::minutes(1))),
+                )],
+            )
+            .await,
+        );
+    }
+    insert_v1_booking(
+        &pool,
+        &et_id,
+        "nudge@test.com",
+        now + Duration::days(4),
+        30,
+        "pending",
+        &[
+            ("pending_since", Some(utc_stamp(now - Duration::hours(10)))),
+            (
+                "pending_expires_at",
+                Some(utc_stamp(now + Duration::hours(2))),
+            ),
+        ],
+    )
+    .await;
+
+    let sweep = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sweep_pending_requests(&pool, &[0u8; 32], now),
+    )
+    .await
+    .expect("the sweep must not wait on SMTP");
+    assert_eq!(
+        sweep,
+        PendingSweep {
+            expired: 3,
+            nudged: 1
+        }
+    );
+    for id in &expired {
+        assert_eq!(booking_status(&pool, id).await, "declined");
+    }
+}
+
 /// Review finding on #234: a public event type on a private team linked to
 /// /team/{team}/{slug} without the team invite, which lands the guest on
 /// "event type not found".
