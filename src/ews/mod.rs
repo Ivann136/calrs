@@ -226,6 +226,21 @@ impl CalendarProvider for EwsProvider {
         }
         Ok(())
     }
+
+    async fn event_exists(&self, calendar_id: &str, uid: &str) -> Result<bool> {
+        // Same lookup `put_event` and `delete_event` use to find a prior
+        // copy, so a write it cannot see here would also be invisible to a
+        // later cancellation.
+        let found = operations::find_items_by_uid(
+            &self.endpoint,
+            &self.username,
+            &self.password,
+            calendar_id,
+            uid,
+        )
+        .await?;
+        Ok(!found.is_empty())
+    }
 }
 
 /// Build a `RawEvent` for each item via [`ical::synth_vcalendar`].

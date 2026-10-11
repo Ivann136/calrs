@@ -1,5 +1,6 @@
 pub mod captcha;
 pub mod meeting;
+pub(crate) mod writeback;
 
 use crate::utils::{convert_event_to_tz, parse_ical_datetime};
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -857,10 +858,16 @@ async fn notify_pending_expired(
     let (date, start_time, end_time) =
         booking_strings_in_guest_tz(&start_at, &end_at, stored_tz, guest_tz);
     let hosts = pending_host_recipients(pool, &uid, &owner_user_id).await;
-    let (host_name, host_email) = hosts
-        .first()
-        .map(|(n, e, _)| (n.clone(), e.clone()))
-        .unwrap_or_default();
+    // The guest's email names the host the way every other guest email does
+    // (joined roster and ICS organizer for collective bookings), so its
+    // sender and Reply-To match the confirmation they would have got (#221).
+    let (host_name, host_email) = match booking_host_identity(pool, &uid).await {
+        Some((name, email, _)) => (name, email),
+        None => hosts
+            .first()
+            .map(|(n, e, _)| (n.clone(), e.clone()))
+            .unwrap_or_default(),
+    };
     let details = crate::email::CancellationDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
         event_title,
@@ -1006,7 +1013,7 @@ fn log_email_result(result: anyhow::Result<()>, email: &'static str, booking: &s
 /// up with a 504, and guests retried a booking that existed (#236). The
 /// future owns everything it needs; failures are logged via
 /// `log_email_result` inside it.
-fn spawn_emails<F>(task: F)
+pub(crate) fn spawn_emails<F>(task: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1207,13 +1214,17 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
         // the background sync below on almost every tick.
         send_due_reminders(pool.clone(), secret_key).await;
 
+        // Calendar write-backs that failed earlier and are due another try
+        // (#162).
+        writeback::retry_failed_writebacks(&pool, &secret_key, Utc::now()).await;
+
         // Background sync: pick the stalest enabled source and sync it.
         // With ctag + sync-token this is very cheap for unchanged calendars.
         let stalest: Option<(String,)> = sqlx::query_as(
             "SELECT cs.id
              FROM caldav_sources cs
              WHERE cs.enabled = 1
-             ORDER BY COALESCE(cs.last_synced, '2000-01-01') ASC
+             ORDER BY MAX(COALESCE(cs.last_synced, '2000-01-01'), COALESCE(cs.last_sync_error_at, '2000-01-01')) ASC
              LIMIT 1",
         )
         .fetch_optional(&pool)
@@ -1330,12 +1341,24 @@ async fn send_due_reminders(pool: SqlitePool, secret_key: [u8; 32]) {
         let mut notified = false;
 
         if let Some(smtp_config) = &smtp_config {
+            // The guest's reminder names the host as their confirmation
+            // did: for a collective booking the joined roster, with the ICS
+            // organizer as sender and Reply-To (#221), not the owner `due`
+            // joined on.
+            let guest_details = match booking_host_identity(&pool, uid).await {
+                Some((host_name, host_email, _)) => crate::email::BookingDetails {
+                    host_name,
+                    host_email,
+                    ..details.clone()
+                },
+                None => details.clone(),
+            };
             // Inline on purpose: this loop is already off the request
             // path, and `send_email` bounds each attempt.
             log_email_result(
                 crate::email::send_guest_reminder(
                     smtp_config,
-                    &details,
+                    &guest_details,
                     guest_cancel_url.as_deref(),
                 )
                 .await,
@@ -1989,11 +2012,18 @@ fn build_csp(captcha: &Option<captcha::CaptchaConfig>) -> String {
         Some(c) => {
             let widget_origin = c.widget_script_origin();
             let instance_origin = c.instance_origin();
+            // A custom WASM URL is fetched by the widget, so its origin joins
+            // connect-src (and only connect-src: it is never a script).
+            let wasm_origin = c
+                .wasm_origin()
+                .filter(|o| *o != widget_origin && *o != instance_origin)
+                .map(|o| format!(" {o}"))
+                .unwrap_or_default();
             (
                 " 'wasm-unsafe-eval'",
                 "worker-src blob:; ",
                 format!(" {}", widget_origin),
-                format!(" {} {}", instance_origin, widget_origin),
+                format!(" {} {}{}", instance_origin, widget_origin, wasm_origin),
             )
         }
         None => ("", "", String::new(), String::new()),
@@ -2869,14 +2899,15 @@ async fn dashboard_bookings(
     .await
     .unwrap_or_default();
 
-    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String)> =
+    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String, Option<String>)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, b.guest_phone, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, b.reschedule_by_host,
                     COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                     COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                     COALESCE(r.name, '') AS resource_name,
                     et.sms_phone_mode,
-                    COALESCE(b.notes, '') AS notes
+                    COALESCE(b.notes, '') AS notes,
+                    b.writeback_error
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2996,11 +3027,15 @@ async fn dashboard_bookings(
                 resource_name,
                 sms_phone_mode,
                 notes,
+                writeback_error,
             )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
                     id => id,
+                    // The booking is confirmed but not on the host's
+                    // calendar; retried in the background (#162).
+                    writeback_error => writeback_error.as_deref().unwrap_or(""),
                     guest_name => name,
                     guest_email => email,
                     guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },
@@ -3692,8 +3727,10 @@ async fn dashboard_sources(
         Option<String>,
         String,
         String,
+        Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type, cs.provider_type
+        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type, cs.provider_type, cs.last_sync_error, cs.sync_failing_since
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ?
@@ -3730,6 +3767,8 @@ async fn dashboard_sources(
                 write_cal,
                 auth_type,
                 provider_type,
+                last_sync_error,
+                sync_failing_since,
             )| {
                 let cals: Vec<minijinja::Value> = all_calendars
                     .iter()
@@ -3748,6 +3787,10 @@ async fn dashboard_sources(
                     url => url,
                     username => username,
                     last_synced => last_synced.as_deref().unwrap_or("never"),
+                    // Availability is still served from the last good sync;
+                    // this tells the owner it is stale (#162).
+                    sync_error => last_sync_error.as_deref().unwrap_or(""),
+                    sync_failing_since => sync_failing_since.as_deref().unwrap_or(""),
                     enabled => enabled,
                     write_calendar_href => write_cal.as_deref().unwrap_or(""),
                     auth_type => auth_type,
@@ -4280,7 +4323,9 @@ async fn settings_save(
         return render_error(&msg, sidebar);
     };
 
-    // Validate and update username if provided
+    // Validate the username if provided. It is written by the single UPDATE
+    // below, together with every other field, so a later validation failure
+    // cannot leave a half-saved row behind.
     if let Some(ref uname) = new_username {
         if uname.len() < 2 {
             let msg =
@@ -4301,11 +4346,6 @@ async fn settings_save(
                     crate::i18n::translate(auth_user.lang, "settings-error-username-taken", None);
                 return render_error(&msg, sidebar);
             }
-            let _ = sqlx::query("UPDATE users SET username = ? WHERE id = ?")
-                .bind(uname)
-                .bind(&user.id)
-                .execute(&state.pool)
-                .await;
         }
     }
 
@@ -4323,9 +4363,10 @@ async fn settings_save(
     }
 
     let result = sqlx::query(
-        "UPDATE users SET name = ?, title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE users SET name = ?, username = COALESCE(?, username), title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&name)
+    .bind(&new_username)
     .bind(&title)
     .bind(&bio)
     .bind(&booking_email)
@@ -7931,45 +7972,24 @@ async fn run_sync_for_source(
     token_expires_at: Option<&str>,
     provider_type: &str,
 ) -> (Vec<String>, usize) {
-    // EWS sources go through the provider trait — no OAuth2 dispatch needed.
-    if provider_type == crate::providers::factory::kinds::EWS {
-        let enc = match password_enc {
-            Some(e) => e,
-            None => return (vec!["EWS source missing password".to_string()], 0),
-        };
-        let password = match crate::crypto::decrypt_password(key, enc) {
-            Ok(p) => p,
-            Err(e) => return (vec![format!("Decrypt failed: {}", e)], 0),
-        };
-        return run_sync(
-            pool,
-            key,
-            source_id,
-            provider_type,
-            url,
-            username,
-            &password,
-        )
-        .await;
-    }
-    let client = match crate::oauth2_caldav::build_client_for_source(
+    // Same dispatch as the background and CLI syncs, so a failure here
+    // (including credentials that no longer work) is recorded on the source
+    // too. A calendar that failed to fetch fails the sync, so "Sync
+    // complete." is only shown when every calendar synced (#162).
+    match crate::commands::sync::sync_one_source(
         pool,
         key,
         source_id,
         url,
-        auth_type,
         username,
         password_enc,
+        auth_type,
         access_token_enc,
         token_expires_at,
+        provider_type,
     )
     .await
     {
-        Ok(c) => c,
-        Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
-    };
-
-    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
         Ok(()) => {
             let cal_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
@@ -8826,6 +8846,11 @@ async fn send_invite_bulk(
                     &email,
                     &et_title,
                     &auth_user.user.name,
+                    // Account email, not booking_email: invites go to
+                    // recipients the sender picks, and booking_email is an
+                    // unverified free-form address, so replies must not be
+                    // steerable off the identity OIDC/registration vouched for.
+                    &auth_user.user.email,
                     message_opt,
                     &invite_url,
                     expires_at.as_deref(),
@@ -11187,6 +11212,7 @@ async fn show_group_book_form(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
             embed => embed.is_embedded(),
             embed_brand => embed.brand_css().unwrap_or_default(),
@@ -12379,6 +12405,7 @@ async fn show_dynamic_group_book_form(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e)),
@@ -13232,6 +13259,7 @@ async fn show_slots_for_user(
 
 async fn show_book_form_for_user(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<BookQuery>,
@@ -13373,6 +13401,24 @@ async fn show_book_form_for_user(
         Ok(t) => t,
         Err(e) => return internal_error_html("internal", &e).into_response(),
     };
+    let profile_name = optional_auth
+        .user
+        .as_ref()
+        .map(|user| user.name.as_str())
+        .unwrap_or("");
+    let profile_email = optional_auth
+        .user
+        .as_ref()
+        .map(|user| user.email.as_str())
+        .unwrap_or("");
+    let form_name = invite_guest_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(profile_name);
+    let form_email = invite_guest_email
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(profile_email);
     let captcha = captcha::CaptchaVars::from_config(&*state.captcha_config.read().await);
     let rendered = tmpl
         .render(context! {
@@ -13397,8 +13443,8 @@ async fn show_book_form_for_user(
             time_end => end_time,
             guest_tz => guest_tz_name,
             error => "",
-            form_name => invite_guest_name.as_deref().unwrap_or(""),
-            form_email => invite_guest_email.as_deref().unwrap_or(""),
+            form_name => form_name,
+            form_email => form_email,
             form_notes => "",
             invite_token => query.invite.as_deref().unwrap_or(""),
             max_additional_guests => max_additional_guests,
@@ -13406,6 +13452,7 @@ async fn show_book_form_for_user(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
             embed => embed.is_embedded(),
             embed_brand => embed.brand_css().unwrap_or_default(),
@@ -16048,6 +16095,7 @@ async fn show_book_form(
             captcha_enabled => captcha.enabled,
             captcha_api_endpoint => captcha.api_endpoint,
             captcha_widget_url => captcha.widget_url,
+            captcha_wasm_url => captcha.wasm_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e));
@@ -17942,6 +17990,10 @@ async fn admin_dashboard(
         .as_ref()
         .map(|c| c.widget_url.clone())
         .unwrap_or_else(|| captcha::DEFAULT_WIDGET_URL.to_string());
+    let captcha_wasm_url = captcha_cfg
+        .as_ref()
+        .and_then(|c| c.wasm_url.clone())
+        .unwrap_or_default();
     drop(captcha_cfg);
 
     let meeting_cfg = state.meeting_config.read().await;
@@ -18047,6 +18099,7 @@ async fn admin_dashboard(
             captcha_instance_url => captcha_instance_url,
             captcha_site_key => captcha_site_key,
             captcha_widget_url => captcha_widget_url,
+            captcha_wasm_url => captcha_wasm_url,
             jitsi_configured => jitsi_configured,
             jitsi_base_url => jitsi_base_url,
             jitsi_pattern => jitsi_pattern,
@@ -19065,6 +19118,7 @@ struct AdminCaptchaForm {
     captcha_site_key: Option<String>,
     captcha_secret: Option<String>,
     captcha_widget_url: Option<String>,
+    captcha_wasm_url: Option<String>,
 }
 
 // --- General / system runtime settings (base URL, private-host allowlist) ---
@@ -19167,6 +19221,18 @@ async fn admin_update_captcha(
     let instance_url = form.captcha_instance_url.filter(|s| !s.trim().is_empty());
     let site_key = form.captcha_site_key.filter(|s| !s.trim().is_empty());
     let widget_url = form.captcha_widget_url.filter(|s| !s.trim().is_empty());
+    let wasm_url = form
+        .captcha_wasm_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if wasm_url
+        .as_deref()
+        .is_some_and(|u| !captcha::is_http_url(u))
+    {
+        let msg = crate::i18n::translate(_admin.lang, "admin-captcha-wasm-url-invalid", None);
+        let encoded = urlencoding::encode(&msg).into_owned();
+        return Redirect::to(&format!("/dashboard/admin?error={}", encoded)).into_response();
+    }
 
     let secret_provided = form
         .captcha_secret
@@ -19181,12 +19247,13 @@ async fn admin_update_captcha(
             Err(e) => return internal_error_response("encrypt captcha secret", &e),
         };
         if let Err(e) = sqlx::query(
-            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_secret = ?, captcha_widget_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_secret = ?, captcha_widget_url = ?, captcha_wasm_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
         )
         .bind(&instance_url)
         .bind(&site_key)
         .bind(&encrypted)
         .bind(&widget_url)
+        .bind(&wasm_url)
         .execute(&state.pool)
         .await
         {
@@ -19194,11 +19261,12 @@ async fn admin_update_captcha(
         }
     } else {
         if let Err(e) = sqlx::query(
-            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_widget_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_widget_url = ?, captcha_wasm_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
         )
         .bind(&instance_url)
         .bind(&site_key)
         .bind(&widget_url)
+        .bind(&wasm_url)
         .execute(&state.pool)
         .await
         {
@@ -20861,6 +20929,23 @@ async fn decline_booking_by_token(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
+        // The query above joins the event type's owner; the guest's email
+        // names the host they booked with, which is also its sender and
+        // Reply-To (#221).
+        let booking_uid: Option<String> =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE id = ?")
+                .bind(&bid)
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap_or(None);
+        let identity = match &booking_uid {
+            Some(uid) => booking_host_identity(&state.pool, uid).await,
+            None => None,
+        };
+        let (guest_host_name, guest_host_email) = match identity {
+            Some((name, email, _)) => (name, email),
+            None => (host_name.clone(), host_email),
+        };
         let details = crate::email::CancellationDetails {
             utc_times: crate::booking_time::ics_times(&start_at, &end_at),
             event_title: event_title.clone(),
@@ -20870,8 +20955,8 @@ async fn decline_booking_by_token(
             guest_name: guest_name.clone(),
             guest_email: guest_email.clone(),
             guest_timezone: guest_timezone.clone(),
-            host_name: host_name.clone(),
-            host_email,
+            host_name: guest_host_name,
+            host_email: guest_host_email,
             uid: String::new(),
             reason: reason.clone(),
             cancelled_by_host: true,
@@ -21377,9 +21462,21 @@ async fn guest_cancel_booking(
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
         let details = details.clone();
+        // The query above joins the event type's owner. The guest's copy
+        // names the host they booked with (assigned member, or the joined
+        // roster and ICS organizer for a collective booking), which is also
+        // its sender and Reply-To (#221).
+        let guest_details = match booking_host_identity(&state.pool, &details.uid).await {
+            Some((host_name, host_email, _)) => crate::email::CancellationDetails {
+                host_name,
+                host_email,
+                ..details.clone()
+            },
+            None => details.clone(),
+        };
         spawn_emails(async move {
             log_email_result(
-                crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                crate::email::send_guest_cancellation(&smtp_config, &guest_details).await,
                 "guest_cancellation",
                 &details.uid,
             );
@@ -22215,7 +22312,7 @@ async fn guest_reschedule_booking(
                 guest_email: guest_email.clone(),
                 guest_timezone: new_guest_timezone.clone(),
                 host_name: host_name.clone(),
-                host_email,
+                host_email: host_email.clone(),
                 uid: uid.clone(),
                 location: loc_value.clone(),
                 host_timezone: host_tz.name().to_string(),
@@ -22248,7 +22345,7 @@ async fn guest_reschedule_booking(
                 guest_email: guest_email.clone(),
                 guest_timezone: new_guest_timezone,
                 host_name: host_name.clone(),
-                host_email: String::new(),
+                host_email,
                 uid: uid.clone(),
                 notes: None,
                 location: loc_value,
@@ -23105,16 +23202,19 @@ async fn caldav_push_booking(
     booking_uid: &str,
     details: &crate::email::BookingDetails,
 ) {
-    for target in booking_write_targets(pool, booking_uid, user_id).await {
-        caldav_push_booking_for_user(pool, key, &target, booking_uid, details).await;
-    }
+    // Records the outcome on the booking: a failure is retried from the
+    // background loop and shown to the host (#162).
+    writeback::push_and_record(
+        pool,
+        key,
+        user_id,
+        booking_uid,
+        details,
+        writeback::PushKind::Fresh,
+    )
+    .await;
 }
 
-/// Push a confirmed booking to ONE user's CalDAV calendar (every source
-/// with a write_calendar_href set for them). Most callers want
-/// [`caldav_push_booking`], which resolves the right user(s) first; this
-/// is for pushes that deliberately target a specific extra calendar
-/// (booking claims).
 /// Email the host when the Google Meet time patch failed for good.
 ///
 /// `details` carries the booking's host identity, and the skip branch only
@@ -23160,13 +23260,23 @@ async fn notify_host_meet_time_desync(
     }
 }
 
+/// Push a confirmed booking to ONE user's CalDAV calendar (every source
+/// with a write_calendar_href set for them). Most callers want
+/// [`caldav_push_booking`], which resolves the right user(s) first; this
+/// is for pushes that deliberately target a specific extra calendar
+/// (booking claims).
+///
+/// Returns one message per source the booking could not be written to (or
+/// written but not read back), empty when every write landed or the user
+/// has nothing to write to.
 async fn caldav_push_booking_for_user(
     pool: &SqlitePool,
     key: &[u8; 32],
     user_id: &str,
     booking_uid: &str,
     details: &crate::email::BookingDetails,
-) {
+) -> Vec<String> {
+    let mut failures = Vec::new();
     // Find all sources with write_calendar_href configured for this user
     let sources: Vec<(
         String,
@@ -23179,8 +23289,9 @@ async fn caldav_push_booking_for_user(
         Option<String>,
         String,
         Option<String>,
+        String,
     )> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type, cs.oauth2_provider
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type, cs.oauth2_provider, cs.name
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href IS NOT NULL",
@@ -23216,7 +23327,7 @@ async fn caldav_push_booking_for_user(
             // Silence here is what made #147 hard to diagnose.
             tracing::warn!(user_id = %user_id, uid = %booking_uid, "calendar write-back skipped: no enabled CalDAV source for this user");
         }
-        return;
+        return failures;
     }
 
     let ics = crate::email::generate_ics_caldav(details);
@@ -23233,6 +23344,7 @@ async fn caldav_push_booking_for_user(
         token_expires_at,
         provider_type,
         oauth2_provider,
+        source_name,
     ) in &sources
     {
         if crate::google_meet::should_skip_caldav_put(
@@ -23316,74 +23428,101 @@ async fn caldav_push_booking_for_user(
 
         tracing::debug!(uid = %booking_uid, calendar_href = %calendar_href, provider = %provider_type, "pushing booking to calendar");
 
-        let put_result = if provider_type == crate::providers::factory::kinds::EWS {
-            let enc = match password_enc.as_deref() {
-                Some(e) => e,
-                None => {
-                    tracing::error!(url = %url, "calendar write-back failed: EWS source missing password");
-                    continue;
-                }
-            };
-            let password = match crate::crypto::decrypt_password(key, enc) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: could not decrypt credentials");
-                    continue;
-                }
-            };
-            let client = match crate::providers::build_provider(
-                provider_type,
-                url,
-                username,
-                &password,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: unknown provider");
-                    continue;
-                }
-            };
-            client.put_event(calendar_href, booking_uid, &ics).await
-        } else {
-            let client = match crate::oauth2_caldav::build_client_for_source(
-                pool,
-                key,
-                source_id,
-                url,
-                auth_type,
-                username,
-                password_enc.as_deref(),
-                access_token_enc.as_deref(),
-                token_expires_at.as_deref(),
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: could not build client");
-                    continue;
-                }
-            };
-            client.put_event(calendar_href, booking_uid, &ics).await
+        let provider = match write_provider_for_source(
+            pool,
+            key,
+            source_id,
+            url,
+            username,
+            password_enc.as_deref(),
+            auth_type,
+            access_token_enc.as_deref(),
+            token_expires_at.as_deref(),
+            provider_type,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(url = %url, error = format!("{e:#}"), "calendar write-back failed: could not build client");
+                failures.push(format!("{source_name}: {e:#}"));
+                continue;
+            }
         };
 
-        if let Err(e) = put_result {
-            tracing::error!(uid = %booking_uid, calendar_href = %calendar_href, error = %e, "calendar write-back failed");
-            continue;
-        }
-
-        tracing::info!(uid = %booking_uid, calendar_href = %calendar_href, "calendar write-back succeeded");
+        // A 2xx on the write is not proof the host sees the event (#162):
+        // read it back by UID before calling it written.
+        let written =
+            crate::providers::put_and_verify(provider.as_ref(), calendar_href, booking_uid, &ics)
+                .await;
+        let event_may_exist = match &written {
+            Ok(()) => true,
+            Err(e) => e.event_may_exist(),
+        };
 
         // Record which calendar href the booking was pushed to (last successful
         // one), unless a Meet skip already pinned the Meet-holding calendar.
-        if !preserved_meet_href {
+        // Also recorded when the write was accepted but could not be read
+        // back: the event may still be there, and cancellation keys its
+        // delete off this href.
+        if event_may_exist && !preserved_meet_href {
             let _ = sqlx::query("UPDATE bookings SET caldav_calendar_href = ? WHERE uid = ?")
                 .bind(calendar_href)
                 .bind(booking_uid)
                 .execute(pool)
                 .await;
         }
+
+        match written {
+            Ok(()) => {
+                tracing::info!(uid = %booking_uid, calendar_href = %calendar_href, "calendar write-back succeeded (verified)");
+            }
+            Err(e) => {
+                tracing::error!(uid = %booking_uid, calendar_href = %calendar_href, error = %e, "calendar write-back failed");
+                failures.push(format!("{source_name}: {e}"));
+            }
+        }
     }
+    failures
+}
+
+/// A calendar client for one of a user's sources, whatever its protocol:
+/// EWS through the provider factory, CalDAV (basic or OAuth2) through
+/// `build_client_for_source`.
+#[allow(clippy::too_many_arguments)]
+async fn write_provider_for_source(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    source_id: &str,
+    url: &str,
+    username: &str,
+    password_enc: Option<&str>,
+    auth_type: &str,
+    access_token_enc: Option<&str>,
+    token_expires_at: Option<&str>,
+    provider_type: &str,
+) -> anyhow::Result<Box<dyn crate::providers::CalendarProvider>> {
+    if provider_type == crate::providers::factory::kinds::EWS {
+        let enc = password_enc.ok_or_else(|| anyhow::anyhow!("EWS source missing password"))?;
+        let password = crate::crypto::decrypt_password(key, enc)
+            .map_err(|e| anyhow::anyhow!("could not decrypt credentials: {e}"))?;
+        return crate::providers::build_provider(provider_type, url, username, &password);
+    }
+    let client = crate::oauth2_caldav::build_client_for_source(
+        pool,
+        key,
+        source_id,
+        url,
+        auth_type,
+        username,
+        password_enc,
+        access_token_enc,
+        token_expires_at,
+    )
+    .await?;
+    Ok(Box::new(
+        crate::providers::caldav::CaldavProvider::from_client(client),
+    ))
 }
 
 /// Delete a booking from a user's CalDAV calendar by looking up their write-enabled source directly.
@@ -30682,6 +30821,40 @@ mod tests {
         (router, pool, session_token, et_id)
     }
 
+    async fn insert_test_user_with_session(
+        pool: &SqlitePool,
+        name: &str,
+        email: &str,
+        username: &str,
+    ) -> (String, String) {
+        let user_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled) \
+             VALUES (?, ?, ?, 'user', 'local', ?, 1)",
+        )
+        .bind(&user_id)
+        .bind(email)
+        .bind(name)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let session_token = uuid::Uuid::new_v4().to_string();
+        let expires_at = (Utc::now() + Duration::days(30))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
+            .bind(&session_token)
+            .bind(&user_id)
+            .bind(&expires_at)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        (user_id, session_token)
+    }
+
     fn get(uri: &str) -> axum::http::Request<Body> {
         axum::http::Request::builder()
             .uri(uri)
@@ -30695,6 +30868,14 @@ mod tests {
             .header("cookie", format!("__Host-calrs_session={}", session))
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn booking_form_uri(invite: Option<&str>) -> String {
+        let date = (Utc::now() + Duration::days(1)).format("%Y-%m-%d");
+        let invite = invite
+            .map(|token| format!("&invite={token}"))
+            .unwrap_or_default();
+        format!("/u/testuser/test-meeting/book?date={date}&time=10:00{invite}")
     }
 
     async fn body_string(response: axum::http::Response<Body>) -> String {
@@ -32390,6 +32571,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_failed_save_does_not_write_the_username() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let csrf = "test-csrf-settings-208";
+        let body = format!(
+            "_csrf={}&name=Test+User&username=brand-new-name&booking_email=not-an-email",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let resp_body = body_string(response).await;
+        assert!(
+            !resp_body.contains("Settings saved"),
+            "a rejected booking email must not report a save"
+        );
+
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "the username must not be written by a failed save"
+        );
+        assert_ne!(after.as_deref(), Some("brand-new-name"));
+    }
+
+    #[tokio::test]
+    async fn settings_save_writes_the_username_with_the_rest() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-settings-208-ok";
+        let body = format!(
+            "_csrf={}&name=Test+User&username=brand-new-name&booking_email=",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.as_deref(), Some("brand-new-name"));
+    }
+
+    #[tokio::test]
     async fn settings_save_confirms_language_change_in_the_new_language() {
         let (app, _pool, session, _) = setup_test_app().await;
         let csrf = "test-csrf-settings-lang";
@@ -32598,6 +32836,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(domains.unwrap(), "example.com");
+    }
+
+    #[tokio::test]
+    async fn admin_captcha_wasm_url_is_validated_and_stored() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let stored = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT captcha_wasm_url FROM auth_config WHERE id = 'singleton'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        let csrf = "test-csrf-captcha-wasm";
+        let body = format!("_csrf={}&captcha_wasm_url=javascript%3Aalert(1)", csrf);
+        let response = app
+            .clone()
+            .oneshot(post_form("/dashboard/admin/captcha", &session, csrf, &body))
+            .await
+            .unwrap();
+        let location = response.headers()["location"].to_str().unwrap().to_string();
+        assert!(
+            location.starts_with("/dashboard/admin?error="),
+            "{location}"
+        );
+        assert_eq!(stored().await, None, "an invalid URL must not be saved");
+
+        let body = format!(
+            "_csrf={}&captcha_wasm_url=https%3A%2F%2Fcap.example.com%2Fassets%2Fcap_wasm_bg.wasm",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/admin/captcha", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["location"], "/dashboard/admin");
+        assert_eq!(
+            stored().await.as_deref(),
+            Some("https://cap.example.com/assets/cap_wasm_bg.wasm")
+        );
     }
 
     #[tokio::test]
@@ -34147,6 +34426,101 @@ mod tests {
         let body = body_string(response).await;
         assert!(body.contains("Test Meeting"));
         assert!(body.contains("Confirm booking") || body.contains("confirm"));
+        assert!(
+            body.contains("id=\"name\" name=\"name\" required maxlength=\"255\" value=\"\""),
+            "anonymous name should remain empty"
+        );
+        assert!(
+            body.contains("id=\"email\" name=\"email\" required maxlength=\"255\" value=\"\""),
+            "anonymous email should remain empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_booking_form_prefills_guest_identity() {
+        let (app, pool, _, _) = setup_test_app().await;
+        let (_, session) =
+            insert_test_user_with_session(&pool, "Alice Example", "alice@example.com", "alice")
+                .await;
+
+        let response = app
+            .oneshot(get_authed(&booking_form_uri(None), &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = body_string(response).await;
+        assert!(body.contains("value=\"Alice Example\""));
+        assert!(body.contains("value=\"alice@example.com\""));
+    }
+
+    #[tokio::test]
+    async fn personalized_invite_identity_overrides_authenticated_profile() {
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (alice_id, session) =
+            insert_test_user_with_session(&pool, "Alice Example", "alice@example.com", "alice")
+                .await;
+        sqlx::query("UPDATE event_types SET visibility = 'private' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO booking_invites (id, event_type_id, token, guest_name, guest_email, max_uses, created_by_user_id) \
+             VALUES (?, ?, ?, 'Bob Guest', 'bob@example.net', 1, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&et_id)
+        .bind(&token)
+        .bind(&alice_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(get_authed(&booking_form_uri(Some(&token)), &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = body_string(response).await;
+        assert!(body.contains("value=\"Bob Guest\""));
+        assert!(body.contains("value=\"bob@example.net\""));
+        assert!(!body.contains("value=\"Alice Example\""));
+        assert!(!body.contains("value=\"alice@example.com\""));
+    }
+
+    #[tokio::test]
+    async fn quick_invite_without_identity_uses_authenticated_profile() {
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (alice_id, session) =
+            insert_test_user_with_session(&pool, "Alice Example", "alice@example.com", "alice")
+                .await;
+        sqlx::query("UPDATE event_types SET visibility = 'internal' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO booking_invites (id, event_type_id, token, guest_name, guest_email, max_uses, created_by_user_id) \
+             VALUES (?, ?, ?, '', '', 1, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&et_id)
+        .bind(&token)
+        .bind(&alice_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(get_authed(&booking_form_uri(Some(&token)), &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = body_string(response).await;
+        assert!(body.contains("value=\"Alice Example\""));
+        assert!(body.contains("value=\"alice@example.com\""));
     }
 
     // --- Legacy book form ---
@@ -36187,7 +36561,92 @@ mod tests {
             site_key: "testkey".to_string(),
             secret: "secret".to_string(),
             widget_url: widget_url.to_string(),
+            wasm_url: None,
         }
+    }
+
+    #[test]
+    fn build_csp_with_custom_wasm_url_adds_its_origin_to_connect_src() {
+        let mut cfg = make_captcha_config("https://cap.example.com", captcha::DEFAULT_WIDGET_URL);
+        cfg.wasm_url = Some("https://assets.example.org/cap/cap_wasm_bg.wasm".to_string());
+        let with_wasm = build_csp(&Some(cfg));
+        let connect = with_wasm
+            .split("; ")
+            .find(|d| d.starts_with("connect-src"))
+            .expect("connect-src directive");
+        assert_eq!(
+            connect,
+            "connect-src 'self' https://cap.example.com https://cdn.jsdelivr.net https://assets.example.org"
+        );
+        let script = with_wasm
+            .split("; ")
+            .find(|d| d.starts_with("script-src"))
+            .expect("script-src directive");
+        assert!(
+            !script.contains("assets.example.org"),
+            "the WASM origin must not be allowed to serve scripts: {script}"
+        );
+
+        // Everything else is the policy without a WASM URL plus that origin.
+        let without = build_csp(&Some(make_captcha_config(
+            "https://cap.example.com",
+            captcha::DEFAULT_WIDGET_URL,
+        )));
+        assert_eq!(
+            with_wasm.replace(" https://assets.example.org", ""),
+            without
+        );
+    }
+
+    #[test]
+    fn build_csp_does_not_repeat_a_wasm_origin_already_allowed() {
+        let mut cfg = make_captcha_config("https://cap.example.com", captcha::DEFAULT_WIDGET_URL);
+        cfg.wasm_url = Some("https://cap.example.com/assets/cap_wasm_bg.wasm".to_string());
+        let csp = build_csp(&Some(cfg));
+        assert_eq!(csp.matches("https://cap.example.com").count(), 1, "{csp}");
+    }
+
+    #[test]
+    fn book_template_sets_the_custom_wasm_url_before_the_widget() {
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        env.set_loader(minijinja::path_loader("templates"));
+        crate::i18n::register(&mut env);
+        let tmpl = env
+            .get_template("book.html")
+            .expect("book.html should load");
+        let render = |wasm_url: &str| {
+            tmpl.render(context! {
+                event_type => context! { slug => "intro", title => "Intro Call", duration_min => 30 },
+                sms_phone_mode => "off",
+                host_name => "Alice",
+                username => "alice",
+                captcha_enabled => true,
+                captcha_api_endpoint => "https://cap.example.com/key/",
+                captcha_widget_url => "https://cap.example.com/assets/widget.js",
+                captcha_wasm_url => wasm_url,
+            })
+            .expect("book.html should render")
+        };
+
+        let set = render("https://cap.example.com/assets/cap_wasm_bg.wasm");
+        let assignment =
+            r#"window.CAP_CUSTOM_WASM_URL = "https://cap.example.com/assets/cap_wasm_bg.wasm";"#;
+        let at = set.find(assignment).expect("the WASM URL should be set");
+        let widget = set
+            .find("widget.js")
+            .expect("the widget script should be referenced");
+        assert!(
+            at < widget,
+            "the WASM URL must be set before the widget loads"
+        );
+
+        // A value that tries to close the script is JSON-escaped, not emitted raw.
+        let hostile = render("https://x.example.com/</script><script>alert(1)</script>");
+        assert!(!hostile.contains("</script><script>alert(1)"));
+
+        let unset = render("");
+        assert!(!unset.contains("CAP_CUSTOM_WASM_URL"));
     }
 
     #[test]
@@ -36939,6 +37398,7 @@ mod tests {
     }
     include!("booking_time_tests.rs");
     include!("pending_hold_tests.rs");
+    include!("writeback_tests.rs");
 
     // --- #209: guest emails sent on someone else's request keep the guest's language ---
 
@@ -37417,6 +37877,117 @@ mod tests {
         );
         assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
         assert!(!mail.contains("has been declined"), "{mail}");
+    }
+
+    // --- #221: guest emails come from the host, with Reply-To ---
+
+    /// The value of the first `name:` header of a captured message.
+    fn mail_header<'a>(mail: &'a str, name: &str) -> Option<&'a str> {
+        let headers = mail.split("\r\n\r\n").next().unwrap_or(mail);
+        let prefix = format!("{name}: ");
+        headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+    }
+
+    /// The guest's confirmation goes out under the host's name in the
+    /// guest's language, on the instance address, with Reply-To pointing at
+    /// the host's booking address.
+    #[tokio::test]
+    async fn guest_confirmation_comes_from_the_host() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        sqlx::query("UPDATE smtp_config SET from_name = 'Acme Scheduling'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET booking_email = 'bookings@example.com' WHERE email = 'test@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-221-approve").await;
+
+        let csrf = "test-csrf-221-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert_eq!(
+            mail_header(&mail, "From"),
+            Some("\"Test User via Acme Scheduling\" <noreply@test.com>"),
+            "{mail}"
+        );
+        assert_eq!(
+            mail_header(&mail, "Reply-To"),
+            Some("bookings@example.com"),
+            "{mail}"
+        );
+    }
+
+    /// A guest cancelling a booking assigned to a member other than the
+    /// event type's owner hears back from that member, not the owner, while
+    /// the host-side notice keeps the instance sender and no Reply-To.
+    #[tokio::test]
+    async fn guest_cancellation_comes_from_the_assigned_host() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+
+        let bob_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled, booking_email) VALUES (?, 'bob@test.com', 'Bob Member', 'user', 'local', 'bob', 1, 'bob.bookings@test.com')")
+            .bind(&bob_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-221-cancel").await;
+        sqlx::query("UPDATE bookings SET status = 'confirmed', assigned_user_id = ?, cancel_token = 'cancel-221', start_at = '2099-06-15T10:00:00', end_at = '2099-06-15T10:30:00' WHERE id = ?")
+            .bind(&bob_id)
+            .bind(&booking_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "test-csrf-221-cancel";
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/booking/cancel/cancel-221",
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert_eq!(
+            mail_header(&mail, "From"),
+            Some("\"Bob Member\" <noreply@test.com>"),
+            "{mail}"
+        );
+        assert_eq!(
+            mail_header(&mail, "Reply-To"),
+            Some("bob.bookings@test.com"),
+            "{mail}"
+        );
+
+        let host_mail = mail_to(&mails, "test@example.com").await;
+        assert_eq!(
+            mail_header(&host_mail, "From"),
+            Some("noreply@test.com"),
+            "{host_mail}"
+        );
+        assert_eq!(mail_header(&host_mail, "Reply-To"), None, "{host_mail}");
     }
 
     /// Pages declare the language they are rendered in, so browsers pick the

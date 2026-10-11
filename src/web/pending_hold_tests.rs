@@ -389,10 +389,23 @@ async fn sweep_declines_expired_requests_once_and_emails_the_guest_in_their_lang
         guest.contains("https://cal.example.com/u/testuser/test-meeting"),
         "the guest gets a link to pick another time: {guest}"
     );
+    // A guest email: sent as the host, replies go to the host (#221).
+    assert_eq!(
+        mail_header(&guest, "From"),
+        Some("\"Test User\" <noreply@test.com>"),
+        "{guest}"
+    );
+    assert_eq!(
+        mail_header(&guest, "Reply-To"),
+        Some("test@example.com"),
+        "{guest}"
+    );
     let host = mail_to(&mails, "test@example.com").await;
     // The host has no saved language, so their notice is English.
     assert!(host.contains("Booking request expired"), "{host}");
     assert!(host.contains("<html lang=\"en\">"), "{host}");
+    assert_eq!(mail_header(&host, "From"), Some("noreply@test.com"));
+    assert_eq!(mail_header(&host, "Reply-To"), None, "{host}");
 
     // Idempotent: a second pass finds nothing and sends nothing.
     let sent = mails.lock().unwrap().len();
@@ -457,6 +470,9 @@ async fn sweep_nudges_the_host_once_halfway_to_the_deadline() {
     let host = mail_to(&mails, "test@example.com").await;
     assert!(host.contains("is still waiting for your answer"), "{host}");
     assert!(host.contains("due@test.com"), "{host}");
+    // Host-facing: the instance sender, no Reply-To (#221).
+    assert_eq!(mail_header(&host, "From"), Some("noreply@test.com"));
+    assert_eq!(mail_header(&host, "Reply-To"), None, "{host}");
 
     let sent_at = |id: String| {
         let pool = pool.clone();
@@ -1247,4 +1263,67 @@ async fn rebook_link_carries_the_private_team_invite() {
     );
     set_team("private", None).await;
     assert_eq!(event_type_rebook_url(&pool, &team_et).await, None);
+}
+
+/// #221: an expired collective request reaches the guest from the joined
+/// roster, with Reply-To on the ICS organizer (first member by name), like
+/// the confirmation they would have got. It used to name only the first host
+/// the recipient query returned.
+#[tokio::test]
+async fn expired_collective_request_comes_from_the_roster() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let _guard = crate::test_support::EnvGuard::new();
+    let pool = setup_test_db().await;
+    seed_test_data(&pool).await;
+    let (team_id, team_et) = seed_team_event_type(&pool).await;
+    sqlx::query(
+        "UPDATE event_types SET scheduling_mode = 'collective', requires_confirmation = 1 WHERE id = ?",
+    )
+    .bind(&team_et)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ann_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'ann@test.com', 'Ann Member', 'user', 'local', 'ann', 1)")
+        .bind(&ann_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
+        .bind(&team_id)
+        .bind(&ann_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (port, mails) = spawn_capturing_mta().await;
+    use_capturing_mta(&pool, port).await;
+
+    let now = Utc::now();
+    insert_v1_booking(
+        &pool,
+        &team_et,
+        "roster@test.com",
+        now + Duration::days(3),
+        30,
+        "pending",
+        &[("pending_expires_at", Some(utc_stamp(now - Duration::minutes(1))))],
+    )
+    .await;
+
+    let sweep = sweep_pending_requests(&pool, &[0u8; 32], now).await;
+    assert_eq!(sweep.expired, 1);
+
+    let guest = mail_to(&mails, "roster@test.com").await;
+    // lettre RFC 2047-encodes a display name containing "&":
+    // base64("Ann Member & Test User").
+    assert_eq!(
+        mail_header(&guest, "From"),
+        Some("=?utf-8?b?QW5uIE1lbWJlciAmIFRlc3QgVXNlcg==?= <noreply@test.com>"),
+        "{guest}"
+    );
+    assert_eq!(
+        mail_header(&guest, "Reply-To"),
+        Some("ann@test.com"),
+        "{guest}"
+    );
 }

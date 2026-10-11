@@ -18,10 +18,11 @@ The project is just a container for the OAuth2 client and the enabled APIs. You 
 
 In **APIs & Services → Library**, enable:
 
-- **Google Calendar API**: used for CalDAV access to the user's calendars (event read and write-back).
+- **CalDAV API**: used for CalDAV access to the user's calendars (reading busy times and writing bookings back). It is a separate entry in the Library from the Calendar API; search for "CalDAV API".
+- **Google Calendar API**: used to attach Google Meet links to bookings (see [Google Meet auto-links](#google-meet-auto-links)). Enable it even if you do not use Meet today, so the option works the day an event type switches to it.
 - **OIDC userinfo**: Google exposes this automatically when you request the `openid email` scopes; there is no separate "API" to toggle, but the OAuth consent screen must allow those scopes (see step 5).
 
-Without the Calendar API enabled, every CalDAV request will fail with a 403 even though the OAuth2 handshake itself succeeds.
+Without the CalDAV API enabled, every CalDAV request will fail with a 403 even though the OAuth2 handshake itself succeeds; enabling only the Google Calendar API is not enough. Without the Google Calendar API, bookings still sync and write back, but Google Meet links cannot be generated.
 
 ---
 
@@ -96,7 +97,7 @@ When an event type's location is **Google Meet (auto-generated link)**, confirme
 2. It then calls Google Calendar API `events.patch` with `conferenceData.createRequest` (`hangoutsMeet`) using the host's existing OAuth token.
 3. The Meet URL is stored on `bookings.meeting_url` and included in confirmation emails, the guest ICS, and CalDAV copies on any other calendars.
 
-No extra Google Cloud API, OAuth scope, or admin field is required beyond the Calendar OAuth2 setup above. Users who already connected Google Calendar do not reconnect.
+No extra OAuth scope or admin field is required beyond the setup above, as long as the Google Calendar API was enabled in step 2. Users who already connected Google Calendar do not reconnect.
 
 ### Who owns the Meet
 

@@ -51,6 +51,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut failed: Vec<(String, String)> = Vec::new();
     for (
         source_id,
         name,
@@ -75,63 +76,148 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
             .await;
         }
 
-        // EWS sources go through the provider trait (no OAuth2, no CalDAV-only
-        // sync-collection); CalDAV sources keep the existing flow.
-        if provider_type == kinds::EWS {
-            let password =
-                match crate::crypto::decrypt_password(key, password_enc.as_deref().unwrap_or("")) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("  {} Decrypt failed: {}", "✗".red(), e);
-                        continue;
-                    }
-                };
-            let provider =
-                match crate::providers::build_provider(provider_type, url, username, &password) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("  {} Provider build failed: {}", "✗".red(), e);
-                        continue;
-                    }
-                };
-            if let Err(e) = sync_ews_source(pool, key, provider.as_ref(), source_id).await {
-                println!("  {} Sync failed: {}", "✗".red(), e);
-            }
-            continue;
-        }
-
-        let client = crate::oauth2_caldav::build_client_for_source(
+        if let Err(e) = sync_one_source(
             pool,
             key,
             source_id,
             url,
-            auth_type,
             username,
             password_enc.as_deref(),
+            auth_type,
             access_token_enc.as_deref(),
             token_expires_at.as_deref(),
+            provider_type,
         )
-        .await?;
-
-        if let Err(e) = sync_source(pool, key, &client, source_id).await {
-            println!("  {} Sync failed: {}", "✗".red(), e);
-            continue;
+        .await
+        {
+            println!("  {} Sync failed: {:#}", "✗".red(), e);
+            failed.push((name.clone(), format!("{e:#}")));
         }
     }
 
-    println!("{} Sync complete.", "✓".green());
-    Ok(())
+    // A failing source may have queued an email to its owner.
+    crate::web::drain_emails(std::time::Duration::from_secs(30)).await;
+
+    if failed.is_empty() {
+        println!("{} Sync complete.", "✓".green());
+        return Ok(());
+    }
+    // #162: this used to print "Sync complete." after a failure and exit 0,
+    // so a cron job or a monitoring check could not tell anything was wrong.
+    println!(
+        "{} Sync failed for {} of {} source(s):",
+        "✗".red(),
+        failed.len(),
+        sources.len()
+    );
+    for (name, error) in &failed {
+        println!("  {} {}: {}", "✗".red(), name, error);
+    }
+    println!(
+        "  {}",
+        "Availability keeps being served from the last successful sync of these sources.".dimmed()
+    );
+    anyhow::bail!(
+        "{} of {} source(s) failed to sync",
+        failed.len(),
+        sources.len()
+    )
+}
+
+/// Build the right client for a source row and sync it, recording the
+/// outcome on the source (see [`crate::commands::sync_health`]), including
+/// failures that happen before any request is sent. EWS sources go through
+/// the provider trait (no OAuth2, no CalDAV-only sync-collection); CalDAV
+/// sources keep the CalDAV flow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sync_one_source(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    source_id: &str,
+    url: &str,
+    username: &str,
+    password_enc: Option<&str>,
+    auth_type: &str,
+    access_token_enc: Option<&str>,
+    token_expires_at: Option<&str>,
+    provider_type: &str,
+) -> Result<()> {
+    if provider_type == kinds::EWS {
+        let provider = crate::crypto::decrypt_password(key, password_enc.unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("could not decrypt credentials: {e}"))
+            .and_then(|password| {
+                crate::providers::build_provider(provider_type, url, username, &password)
+            });
+        let provider = match provider {
+            Ok(p) => p,
+            Err(e) => {
+                crate::commands::sync_health::record_sync_failure(pool, key, source_id, &e).await;
+                return Err(e);
+            }
+        };
+        return sync_ews_source(pool, key, provider.as_ref(), source_id).await;
+    }
+
+    let client = match crate::oauth2_caldav::build_client_for_source(
+        pool,
+        key,
+        source_id,
+        url,
+        auth_type,
+        username,
+        password_enc,
+        access_token_enc,
+        token_expires_at,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            crate::commands::sync_health::record_sync_failure(pool, key, source_id, &e).await;
+            return Err(e);
+        }
+    };
+    sync_source(pool, key, &client, source_id).await
 }
 
 /// Sync a single CalDAV source: discover calendars and fetch events.
 /// Uses ctag comparison to skip unchanged calendars.
 /// Uses sync-token (RFC 6578) for delta sync when available, with fallback to full fetch.
+///
+/// The outcome is recorded on the source. A calendar that fails to fetch
+/// fails the whole sync (after the others are synced), so the error is
+/// visible instead of a silently stale calendar.
 pub async fn sync_source(
     pool: &SqlitePool,
     key: &[u8; 32],
     client: &CaldavClient,
     source_id: &str,
 ) -> Result<()> {
+    let result = sync_caldav_calendars(pool, key, client, source_id).await;
+    crate::commands::sync_health::record_sync_outcome(pool, key, source_id, &result).await;
+    result
+}
+
+/// Turn the calendars that failed during a sync into the sync's error.
+fn calendar_failures_result(failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{} calendar(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    }
+}
+
+async fn sync_caldav_calendars(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    client: &CaldavClient,
+    source_id: &str,
+) -> Result<()> {
+    let mut calendar_failures: Vec<String> = Vec::new();
     let principal = client.discover_principal().await?;
     let calendar_home = client.discover_calendar_home(&principal).await?;
     let calendars = client.list_calendars(&calendar_home).await?;
@@ -279,6 +365,7 @@ pub async fn sync_source(
                 }
                 Err(e) => {
                     println!("  {} {} — failed: {}", "✗".red(), cal_label, e);
+                    calendar_failures.push(format!("{cal_label}: {e:#}"));
                 }
             }
         }
@@ -304,12 +391,16 @@ pub async fn sync_source(
 
     tracing::info!(source_id = %source_id, "CalDAV sync completed");
 
-    Ok(())
+    calendar_failures_result(&calendar_failures)
 }
 
 /// Sync calendars for a user if any of their sources are stale (last_synced > STALE_SECS ago).
 /// Uses sync-token delta when available, with fallback to full fetch.
-/// Silently skips on errors (best-effort for guest-facing pages).
+/// Errors do not reach the caller (best-effort for guest-facing pages): slots
+/// are served from the last good sync, and the failure is recorded on the
+/// source. A source that failed within the last `STALE_SECS` is not retried
+/// on demand, so a dead server costs a guest page one timeout every five
+/// minutes rather than one per page load.
 pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
     let cutoff = Utc::now() - chrono::Duration::seconds(STALE_SECS);
     // Must match SQLite datetime('now') format: "YYYY-MM-DD HH:MM:SS" (space, not T)
@@ -320,7 +411,8 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1
-           AND (cs.last_synced IS NULL OR cs.last_synced < ?)",
+           AND (cs.last_synced IS NULL OR cs.last_synced < ?2)
+           AND (cs.last_sync_error_at IS NULL OR cs.last_sync_error_at < ?2)",
     )
     .bind(user_id)
     .bind(&cutoff_str)
@@ -351,57 +443,41 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
         let lock = source_lock(source_id).await;
         let _guard = lock.lock().await;
 
-        let last_synced: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT last_synced FROM caldav_sources WHERE id = ?",
+        // MAX() of the two: whichever of the last success and the last
+        // failure is more recent says whether the source was just tried.
+        let last_attempt: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MAX(COALESCE(last_synced, ''), COALESCE(last_sync_error_at, '')) \
+             FROM caldav_sources WHERE id = ?",
         )
         .bind(source_id)
         .fetch_optional(pool)
         .await
         .unwrap_or(None)
         .flatten();
-        if last_synced
+        if last_attempt
             .as_deref()
             .is_some_and(|ls| ls >= cutoff_str.as_str())
         {
             tracing::debug!(
                 source_id = %source_id,
-                "skipping on-demand sync, another task already refreshed this source"
+                "skipping on-demand sync, another task already tried this source"
             );
             continue;
         }
 
-        if provider_type == kinds::EWS {
-            let password =
-                match crate::crypto::decrypt_password(key, password_enc.as_deref().unwrap_or("")) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-            let provider =
-                match crate::providers::build_provider(provider_type, url, username, &password) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-            let _ = sync_ews_source(pool, key, provider.as_ref(), source_id).await;
-            continue;
-        }
-
-        let client = match crate::oauth2_caldav::build_client_for_source(
+        let _ = sync_one_source(
             pool,
             key,
             source_id,
             url,
-            auth_type,
             username,
             password_enc.as_deref(),
+            auth_type,
             access_token_enc.as_deref(),
             token_expires_at.as_deref(),
+            provider_type,
         )
-        .await
-        {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let _ = sync_source(pool, key, &client, source_id).await;
+        .await;
     }
 }
 
@@ -448,38 +524,19 @@ pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &st
                 .await;
     }
 
-    if provider_type == kinds::EWS {
-        let password =
-            match crate::crypto::decrypt_password(key, password_enc.as_deref().unwrap_or("")) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-        let provider =
-            match crate::providers::build_provider(&provider_type, &url, &username, &password) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-        let _ = sync_ews_source(pool, key, provider.as_ref(), source_id).await;
-        return;
-    }
-
-    let client = match crate::oauth2_caldav::build_client_for_source(
+    let _ = sync_one_source(
         pool,
         key,
         source_id,
         &url,
-        &auth_type,
         &username,
         password_enc.as_deref(),
+        &auth_type,
         access_token_enc.as_deref(),
         token_expires_at.as_deref(),
+        &provider_type,
     )
-    .await
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let _ = sync_source(pool, key, &client, source_id).await;
+    .await;
 }
 
 /// EWS-specific sync path using the [`crate::providers::CalendarProvider`]
@@ -488,12 +545,26 @@ pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &st
 /// hardened orphan reconciliation). The EWS path is intentionally simpler:
 /// list folders, fetch each one in full, and reconcile by UID. Delta sync is a
 /// known follow-up — see `EwsProvider::sync_delta`.
+///
+/// The outcome is recorded on the source, as for [`sync_source`].
 pub async fn sync_ews_source(
     pool: &SqlitePool,
     key: &[u8; 32],
     provider: &dyn crate::providers::CalendarProvider,
     source_id: &str,
 ) -> Result<()> {
+    let result = sync_ews_calendars(pool, key, provider, source_id).await;
+    crate::commands::sync_health::record_sync_outcome(pool, key, source_id, &result).await;
+    result
+}
+
+async fn sync_ews_calendars(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    provider: &dyn crate::providers::CalendarProvider,
+    source_id: &str,
+) -> Result<()> {
+    let mut calendar_failures: Vec<String> = Vec::new();
     let calendars = provider.list_calendars().await?;
 
     // Bounded fetch window. Matches the CalDAV path's FULL_FETCH_LOOKBACK_DAYS:
@@ -536,6 +607,7 @@ pub async fn sync_ews_source(
             }
             Err(e) => {
                 println!("  {} {} — failed: {}", "✗".red(), cal_label, e);
+                calendar_failures.push(format!("{cal_label}: {e:#}"));
             }
         }
     }
@@ -549,7 +621,7 @@ pub async fn sync_ews_source(
         .execute(pool)
         .await?;
     tracing::info!(source_id = %source_id, "EWS sync completed");
-    Ok(())
+    calendar_failures_result(&calendar_failures)
 }
 
 /// Provider-trait equivalent of [`upsert_calendar`]. EWS uses opaque folder

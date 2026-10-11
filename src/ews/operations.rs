@@ -260,6 +260,12 @@ pub async fn create_item_from_ics(
 
 /// Find calendar items that match a specific iCalendar UID. EWS exposes
 /// `calendar:UID` as a searchable field; the result is usually 0 or 1 item.
+///
+/// Some Exchange versions refuse `calendar:UID` inside a `Restriction` with
+/// `ErrorUnsupportedPathForQuery` (#179). On that fault, and only on the
+/// query-shape faults listed in [`is_unsupported_restriction_fault`], the
+/// lookup falls back to [`find_items_by_uid_in_calendar_view`]. Auth and
+/// transport errors, and any other fault, propagate unchanged.
 pub async fn find_items_by_uid(
     endpoint: &str,
     username: &str,
@@ -288,9 +294,111 @@ pub async fn find_items_by_uid(
         uid = escape(uid),
         folder = escape(folder_id),
     );
-    let resp = post_soap(endpoint, username, password, &body, false).await?;
+    let resp = match post_soap(endpoint, username, password, &body, false).await {
+        Ok(resp) => resp,
+        Err(e) if is_unsupported_restriction_fault(&e.to_string()) => {
+            tracing::info!(
+                uid = %uid,
+                error = %e,
+                "EWS refused the calendar:UID restriction, scanning a CalendarView instead"
+            );
+            return find_items_by_uid_in_calendar_view(
+                endpoint, username, password, folder_id, uid,
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
     let parsed = parse_calendar_items_response(&resp)?;
     Ok(parsed.items.into_iter().map(|i| i.item_id).collect())
+}
+
+/// SOAP fault codes that mean "this server cannot run the restricted
+/// FindItem", as opposed to "this request is not allowed" or "this folder is
+/// gone". Only these trigger the CalendarView fallback.
+const UNSUPPORTED_RESTRICTION_FAULTS: &[&str] = &[
+    "ErrorUnsupportedPathForQuery",
+    "ErrorUnsupportedQueryFilter",
+    "ErrorInvalidRestriction",
+];
+
+/// Whether an error raised by [`post_soap`] is a SOAP fault whose code says
+/// the restriction itself is unsupported. `post_soap` formats faults as
+/// `EWS SOAP fault: <Code>: <MessageText>`; 401s and transport failures carry
+/// a different message and never match.
+fn is_unsupported_restriction_fault(message: &str) -> bool {
+    let Some(fault) = message.strip_prefix(super::soap::SOAP_FAULT_PREFIX) else {
+        return false;
+    };
+    let code = fault.split(':').next().unwrap_or("").trim();
+    UNSUPPORTED_RESTRICTION_FAULTS.contains(&code)
+}
+
+/// How far back and forward the fallback scan looks. The booking horizon is
+/// capped at 365 days, so a calrs-written item lives inside this window.
+const UID_SCAN_PAST_DAYS: i64 = 30;
+const UID_SCAN_FUTURE_DAYS: i64 = 400;
+/// Width of one CalendarView request. A CalendarView returns at most 1000
+/// entries, so the window is split to keep each request well under that on a
+/// busy calendar.
+const UID_SCAN_CHUNK_DAYS: i64 = 60;
+
+/// Fallback for [`find_items_by_uid`]: walk the folder with CalendarView
+/// requests that carry `calendar:UID`, and filter by UID in memory. Chunks
+/// are scanned from the oldest to the newest and the scan stops at the first
+/// chunk with a match, since calrs writes each booking as a single item.
+async fn find_items_by_uid_in_calendar_view(
+    endpoint: &str,
+    username: &str,
+    password: &str,
+    folder_id: &str,
+    uid: &str,
+) -> Result<Vec<String>> {
+    let now = chrono::Utc::now();
+    let mut start = now - chrono::Duration::days(UID_SCAN_PAST_DAYS);
+    let end = now + chrono::Duration::days(UID_SCAN_FUTURE_DAYS);
+    while start < end {
+        let chunk_end = (start + chrono::Duration::days(UID_SCAN_CHUNK_DAYS)).min(end);
+        let items = list_items_in_window(
+            endpoint,
+            username,
+            password,
+            folder_id,
+            &start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            &chunk_end.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        )
+        .await?;
+        if items.len() >= 1000 {
+            tracing::warn!(
+                folder_id = %folder_id,
+                "EWS CalendarView hit its 1000-entry cap, the UID scan may miss items"
+            );
+        }
+        let found = item_ids_with_uid(&items, uid);
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        start = chunk_end;
+    }
+    Ok(Vec::new())
+}
+
+/// Item ids whose `calendar:UID` equals `uid`, deduplicated in order. A
+/// CalendarView lists each occurrence of a recurring series separately, and
+/// overlapping requests can return the same single item twice.
+fn item_ids_with_uid(items: &[EwsCalendarItem], uid: &str) -> Vec<String> {
+    let escaped = escape(uid);
+    let mut ids: Vec<String> = Vec::new();
+    for item in items {
+        let matches = item
+            .uid
+            .as_deref()
+            .is_some_and(|u| u == uid || u == escaped);
+        if matches && !ids.contains(&item.item_id) {
+            ids.push(item.item_id.clone());
+        }
+    }
+    ids
 }
 
 /// Permanently delete an item by id. We use `HardDelete` because the
@@ -379,4 +487,88 @@ pub async fn sync_folder_items(
          returning partial result, next sync will resume from cursor"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ews::soap::{extract_soap_fault, SOAP_FAULT_PREFIX};
+
+    /// The response from #179, trimmed to the parts `post_soap` reads.
+    const UNSUPPORTED_PATH_RESPONSE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Die Eigenschaft darf nicht mit diesem Einschränkungstyp verwendet werden.</m:MessageText>
+          <m:ResponseCode>ErrorUnsupportedPathForQuery</m:ResponseCode>
+          <m:DescriptiveLinkKey>0</m:DescriptiveLinkKey>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+    #[test]
+    fn unsupported_path_fault_triggers_the_fallback() {
+        let fault = extract_soap_fault(UNSUPPORTED_PATH_RESPONSE).expect("a fault");
+        let message = format!("{SOAP_FAULT_PREFIX}{fault}");
+        assert!(is_unsupported_restriction_fault(&message), "{message}");
+    }
+
+    #[test]
+    fn other_errors_do_not_trigger_the_fallback() {
+        for message in [
+            "EWS authentication failed (401). Check username/password.",
+            "EWS request to https://ex.example.com/EWS/Exchange.asmx failed",
+            "EWS SOAP fault: ErrorAccessDenied: Access is denied.",
+            "EWS SOAP fault: ErrorFolderNotFound",
+            "ErrorUnsupportedPathForQuery without the fault prefix",
+        ] {
+            assert!(!is_unsupported_restriction_fault(message), "{message}");
+        }
+        assert!(is_unsupported_restriction_fault(
+            "EWS SOAP fault: ErrorInvalidRestriction"
+        ));
+    }
+
+    fn item(id: &str, uid: Option<&str>) -> EwsCalendarItem {
+        EwsCalendarItem {
+            item_id: id.to_string(),
+            change_key: None,
+            uid: uid.map(str::to_string),
+            subject: None,
+            start: None,
+            end: None,
+            location: None,
+            is_all_day: false,
+            is_cancelled: false,
+            free_busy_status: None,
+            has_recurrence: false,
+        }
+    }
+
+    #[test]
+    fn calendar_view_items_are_filtered_by_uid_and_deduplicated() {
+        let items = vec![
+            item("A", Some("other@calrs")),
+            item("B", Some("73c8e55c@calrs")),
+            item("C", None),
+            item("B", Some("73c8e55c@calrs")),
+            item("D", Some("73c8e55c@calrs")),
+        ];
+        assert_eq!(item_ids_with_uid(&items, "73c8e55c@calrs"), ["B", "D"]);
+        assert!(item_ids_with_uid(&items, "missing@calrs").is_empty());
+    }
+
+    #[test]
+    fn calendar_view_response_is_filtered_through_the_shared_parser() {
+        let xml = r#"<m:FindItemResponse><m:ResponseMessages><m:FindItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:RootFolder TotalItemsInView="2" IncludesLastItemInRange="true"><t:Items>
+<t:CalendarItem><t:ItemId Id="AAA" ChangeKey="x"/><t:UID>keep@calrs</t:UID></t:CalendarItem>
+<t:CalendarItem><t:ItemId Id="BBB" ChangeKey="y"/><t:UID>drop@calrs</t:UID></t:CalendarItem>
+</t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>"#;
+        let page = parse_calendar_items_response(xml).unwrap();
+        assert_eq!(item_ids_with_uid(&page.items, "keep@calrs"), ["AAA"]);
+    }
 }
