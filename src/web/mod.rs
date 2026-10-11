@@ -499,7 +499,7 @@ async fn due_reminders(pool: &SqlitePool, now: chrono::DateTime<Utc>) -> Vec<Due
 /// the booking's iCal uid, or its row id where the uid is not at hand.
 fn log_email_result(result: anyhow::Result<()>, email: &'static str, booking: &str) {
     if let Err(e) = result {
-        tracing::warn!(email, booking = %booking, error = %e, "email send failed");
+        tracing::warn!(email, booking = %booking, error = format!("{e:#}"), "email send failed");
     }
 }
 
@@ -699,174 +699,10 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             last_session_cleanup = std::time::Instant::now();
         }
 
-        // Find bookings that need a reminder:
-        // - status is confirmed
-        // - reminder not yet sent
-        // - event type has reminder_minutes set (> 0)
-        // - start_at minus reminder_minutes <= now
-        // - start_at > now (don't remind for past bookings)
-        // `host_timezone` resolves like `get_host_tz`: prefer the explicit
-        // event-type tz, fall back to the host user's tz. NULL falls through
-        // to UTC at parse time.
-        let due = due_reminders(&pool, Utc::now()).await;
-
-        let base_url = crate::settings::base_url();
-
-        if due.is_empty() {
-            continue;
-        }
-
-        // SMS is delivered independently of email, so a deployment with SMS
-        // but no SMTP still gets its reminders out. Skip the batch only when
-        // neither channel can deliver anything.
-        let smtp_config = crate::email::load_smtp_config(&pool, &secret_key)
-            .await
-            .ok()
-            .flatten();
-        let sms_configured = crate::sms::load_config(&pool, &secret_key)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        if smtp_config.is_none() && !sms_configured {
-            continue;
-        }
-
-        for (
-            bid,
-            guest_name,
-            guest_email,
-            guest_timezone,
-            start_at,
-            end_at,
-            event_title,
-            host_name,
-            host_email,
-            location_value,
-            cancel_token,
-            uid,
-            guest_language,
-            host_language,
-            host_timezone,
-        ) in &due
-        {
-            // Legacy times use the event timezone; version 1 timestamps are UTC. Convert
-            // to the guest's tz so `BookingDetails` carries guest-local wall-clock —
-            // matches the contract used by cancel/confirm handlers, and lets
-            // `host_time_display` convert back into the host's tz correctly for
-            // the host reminder.
-            let stored_tz_str = host_timezone.as_deref().unwrap_or("UTC");
-            let stored_tz = stored_tz_str.parse::<Tz>().unwrap_or(Tz::UTC);
-            let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
-            let (date, start_time, end_time) =
-                booking_strings_in_guest_tz(start_at, end_at, stored_tz, guest_tz_parsed);
-
-            let location = location_value.as_ref().filter(|v| !v.is_empty()).cloned();
-
-            let details = crate::email::BookingDetails {
-                utc_times: crate::booking_time::ics_times(start_at, end_at),
-                event_title: event_title.clone(),
-                date,
-                start_time,
-                end_time,
-                guest_name: guest_name.clone(),
-                guest_email: guest_email.clone(),
-                guest_timezone: guest_timezone.clone(),
-                host_name: host_name.clone(),
-                host_email: host_email.clone(),
-                uid: uid.clone(),
-                notes: None,
-                guest_phone: None,
-                location,
-                reminder_minutes: None,
-                additional_attendees: vec![],
-                guest_language: guest_language.clone(),
-                host_language: host_language.clone(),
-                host_timezone: stored_tz_str.to_string(),
-                resource_name: booking_resource_label(&pool, uid).await,
-            };
-
-            let guest_cancel_url = cancel_token.as_ref().and_then(|t| {
-                base_url
-                    .as_ref()
-                    .map(|base| format!("{}/booking/cancel/{}", base.trim_end_matches('/'), t))
-            });
-
-            // Tracks whether any channel could actually carry this reminder.
-            // Stamping `reminder_sent_at` when neither could would silently
-            // swallow it, so an instance whose SMTP is missing keeps the
-            // booking pending until SMTP comes back, as it did before SMS.
-            let mut notified = false;
-
-            if let Some(smtp_config) = &smtp_config {
-                // Inline on purpose: this loop is already off the request
-                // path, and `send_email` bounds each attempt.
-                log_email_result(
-                    crate::email::send_guest_reminder(
-                        smtp_config,
-                        &details,
-                        guest_cancel_url.as_deref(),
-                    )
-                    .await,
-                    "guest_reminder",
-                    uid,
-                );
-                log_email_result(
-                    crate::email::send_host_reminder(smtp_config, &details).await,
-                    "host_reminder",
-                    uid,
-                );
-                notified = true;
-            }
-
-            // Reminder SMS to the guest. Queried per booking rather than
-            // joined into `due` above: sqlx only derives FromRow for tuples up
-            // to 16 elements, and that one is already at the limit.
-            if sms_configured {
-                let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
-                    "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b
-                     JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
-                )
-                .bind(bid)
-                .fetch_optional(&pool)
-                .await
-                .unwrap_or(None);
-
-                if let Some((phone, phone_mode)) = sms_target {
-                    if let Some(ctx) = crate::sms::SmsContext::for_booking(
-                        &details,
-                        phone.as_deref(),
-                        crate::sms::collects_phone(&phone_mode),
-                    ) {
-                        crate::sms::notify_guest(
-                            &pool,
-                            &secret_key,
-                            crate::sms::SmsEvent::Reminder,
-                            ctx,
-                        )
-                        .await;
-                        notified = true;
-                    }
-                }
-            }
-
-            if !notified {
-                tracing::debug!(
-                    booking_id = %bid,
-                    "reminder deferred: no channel can deliver it yet"
-                );
-                continue;
-            }
-
-            // Mark reminder as sent
-            let _ =
-                sqlx::query("UPDATE bookings SET reminder_sent_at = datetime('now') WHERE id = ?")
-                    .bind(bid)
-                    .execute(&pool)
-                    .await;
-
-            tracing::info!(booking_id = %bid, "reminder sent");
-        }
+        // Reminders run in their own function: their early exits (nothing
+        // due, no channel configured) used to `continue` this loop and skip
+        // the background sync below on almost every tick.
+        send_due_reminders(pool.clone(), secret_key).await;
 
         // Background sync: pick the stalest enabled source and sync it.
         // With ctag + sync-token this is very cheap for unchanged calendars.
@@ -885,6 +721,178 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             crate::commands::sync::sync_source_by_id(&pool, &secret_key, &source_id).await;
             tracing::debug!(source_id = %source_id, "background sync completed");
         }
+    }
+}
+
+/// One pass of the reminder batch: email and SMS reminders for confirmed
+/// bookings whose reminder time has come.
+async fn send_due_reminders(pool: SqlitePool, secret_key: [u8; 32]) {
+    // Find bookings that need a reminder:
+    // - status is confirmed
+    // - reminder not yet sent
+    // - event type has reminder_minutes set (> 0)
+    // - start_at minus reminder_minutes <= now
+    // - start_at > now (don't remind for past bookings)
+    // `host_timezone` resolves like `get_host_tz`: prefer the explicit
+    // event-type tz, fall back to the host user's tz. NULL falls through
+    // to UTC at parse time.
+    let due = due_reminders(&pool, Utc::now()).await;
+
+    let base_url = crate::settings::base_url();
+
+    if due.is_empty() {
+        return;
+    }
+
+    // SMS is delivered independently of email, so a deployment with SMS
+    // but no SMTP still gets its reminders out. Skip the batch only when
+    // neither channel can deliver anything.
+    let smtp_config = crate::email::load_smtp_config(&pool, &secret_key)
+        .await
+        .ok()
+        .flatten();
+    let sms_configured = crate::sms::load_config(&pool, &secret_key)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if smtp_config.is_none() && !sms_configured {
+        return;
+    }
+
+    for (
+        bid,
+        guest_name,
+        guest_email,
+        guest_timezone,
+        start_at,
+        end_at,
+        event_title,
+        host_name,
+        host_email,
+        location_value,
+        cancel_token,
+        uid,
+        guest_language,
+        host_language,
+        host_timezone,
+    ) in &due
+    {
+        // Legacy times use the event timezone; version 1 timestamps are UTC. Convert
+        // to the guest's tz so `BookingDetails` carries guest-local wall-clock —
+        // matches the contract used by cancel/confirm handlers, and lets
+        // `host_time_display` convert back into the host's tz correctly for
+        // the host reminder.
+        let stored_tz_str = host_timezone.as_deref().unwrap_or("UTC");
+        let stored_tz = stored_tz_str.parse::<Tz>().unwrap_or(Tz::UTC);
+        let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+        let (date, start_time, end_time) =
+            booking_strings_in_guest_tz(start_at, end_at, stored_tz, guest_tz_parsed);
+
+        let location = location_value.as_ref().filter(|v| !v.is_empty()).cloned();
+
+        let details = crate::email::BookingDetails {
+            utc_times: crate::booking_time::ics_times(start_at, end_at),
+            event_title: event_title.clone(),
+            date,
+            start_time,
+            end_time,
+            guest_name: guest_name.clone(),
+            guest_email: guest_email.clone(),
+            guest_timezone: guest_timezone.clone(),
+            host_name: host_name.clone(),
+            host_email: host_email.clone(),
+            uid: uid.clone(),
+            notes: None,
+            guest_phone: None,
+            location,
+            reminder_minutes: None,
+            additional_attendees: vec![],
+            guest_language: guest_language.clone(),
+            host_language: host_language.clone(),
+            host_timezone: stored_tz_str.to_string(),
+            resource_name: booking_resource_label(&pool, uid).await,
+        };
+
+        let guest_cancel_url = cancel_token.as_ref().and_then(|t| {
+            base_url
+                .as_ref()
+                .map(|base| format!("{}/booking/cancel/{}", base.trim_end_matches('/'), t))
+        });
+
+        // Tracks whether any channel could actually carry this reminder.
+        // Stamping `reminder_sent_at` when neither could would silently
+        // swallow it, so an instance whose SMTP is missing keeps the
+        // booking pending until SMTP comes back, as it did before SMS.
+        let mut notified = false;
+
+        if let Some(smtp_config) = &smtp_config {
+            // Inline on purpose: this loop is already off the request
+            // path, and `send_email` bounds each attempt.
+            log_email_result(
+                crate::email::send_guest_reminder(
+                    smtp_config,
+                    &details,
+                    guest_cancel_url.as_deref(),
+                )
+                .await,
+                "guest_reminder",
+                uid,
+            );
+            log_email_result(
+                crate::email::send_host_reminder(smtp_config, &details).await,
+                "host_reminder",
+                uid,
+            );
+            notified = true;
+        }
+
+        // Reminder SMS to the guest. Queried per booking rather than
+        // joined into `due` above: sqlx only derives FromRow for tuples up
+        // to 16 elements, and that one is already at the limit.
+        if sms_configured {
+            let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
+                "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b
+                 JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
+            )
+            .bind(bid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None);
+
+            if let Some((phone, phone_mode)) = sms_target {
+                if let Some(ctx) = crate::sms::SmsContext::for_booking(
+                    &details,
+                    phone.as_deref(),
+                    crate::sms::collects_phone(&phone_mode),
+                ) {
+                    crate::sms::notify_guest(
+                        &pool,
+                        &secret_key,
+                        crate::sms::SmsEvent::Reminder,
+                        ctx,
+                    )
+                    .await;
+                    notified = true;
+                }
+            }
+        }
+
+        if !notified {
+            tracing::debug!(
+                booking_id = %bid,
+                "reminder deferred: no channel can deliver it yet"
+            );
+            continue;
+        }
+
+        // Mark reminder as sent
+        let _ = sqlx::query("UPDATE bookings SET reminder_sent_at = datetime('now') WHERE id = ?")
+            .bind(bid)
+            .execute(&pool)
+            .await;
+
+        tracing::info!(booking_id = %bid, "reminder sent");
     }
 }
 
@@ -2015,11 +2023,14 @@ async fn dashboard(
         String,
         String,
         String,
+        Option<String>,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title,
                 COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                 COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
-                COALESCE(b.notes, '') AS notes
+                COALESCE(b.notes, '') AS notes,
+                b.guest_phone, et.sms_phone_mode
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2068,13 +2079,28 @@ async fn dashboard(
     let pending_ctx: Vec<minijinja::Value> = pending_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, stored_tz, guest_tz, notes)| {
+            |(
+                id,
+                name,
+                email,
+                start,
+                end,
+                title,
+                stored_tz,
+                guest_tz,
+                notes,
+                phone,
+                sms_phone_mode,
+            )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
                     id => id,
                     guest_name => name,
                     guest_email => email,
+                    // Same rule as the bookings page: shown while the event
+                    // type collects a phone, so the host can call first (#231).
+                    guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },
                     start_at => primary,
                     start_at_guest => secondary,
                     event_title => title,
@@ -4715,11 +4741,20 @@ async fn cancel_booking(
     let was_pending = prev_status == "pending";
     let new_status = if was_pending { "declined" } else { "cancelled" };
 
-    let _ = sqlx::query("UPDATE bookings SET status = ? WHERE id = ?")
+    // Guarded on the status read above: a double click, or an approval or
+    // cancellation landing in between, must not notify the guest twice or
+    // cancel a booking that changed state meanwhile.
+    let changed = sqlx::query("UPDATE bookings SET status = ? WHERE id = ? AND status = ?")
         .bind(new_status)
         .bind(&bid)
+        .bind(&prev_status)
         .execute(&state.pool)
-        .await;
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+    if changed == 0 {
+        return Redirect::to("/dashboard/bookings").into_response();
+    }
 
     tracing::info!(booking_id = %bid, status = new_status, "booking {}", new_status);
 
@@ -4836,8 +4871,11 @@ async fn confirm_booking(
         Option<String>,
         String,
         Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
     )> = sqlx::query_as(
-        "SELECT b.id, b.uid, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, COALESCE(NULLIF(b.meeting_url, ''), et.location_value), b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, et.id, b.assigned_user_id
+        "SELECT b.id, b.uid, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, COALESCE(NULLIF(b.meeting_url, ''), et.location_value), b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, et.id, b.assigned_user_id, NULLIF(TRIM(b.language), ''), b.guest_phone, et.sms_phone_mode
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -4863,6 +4901,9 @@ async fn confirm_booking(
         reschedule_token,
         et_id,
         assigned_user_id,
+        guest_language,
+        guest_phone,
+        sms_phone_mode,
     ) = match booking {
         Some(b) => b,
         None => return Redirect::to("/dashboard/bookings").into_response(),
@@ -4988,7 +5029,7 @@ async fn confirm_booking(
         additional_attendees: vec![],
         // The host clicked approve, so the request carries the host's
         // language; the guest's is the one stored with the booking (#209).
-        guest_language: crate::email::stored_booking_language(&state.pool, &bid).await,
+        guest_language,
         host_timezone: stored_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
         ..Default::default()
@@ -5012,27 +5053,18 @@ async fn confirm_booking(
 
     // Confirmation SMS to the guest, the same deferred send as the token
     // approve path: a pending booking stays silent until the host approves.
-    let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
-        "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
-    )
-    .bind(&bid)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
-    if let Some((guest_phone, sms_phone_mode)) = sms_target {
-        if let Some(ctx) = crate::sms::SmsContext::for_booking(
-            &details,
-            guest_phone.as_deref(),
-            crate::sms::collects_phone(&sms_phone_mode),
-        ) {
-            crate::sms::notify_guest(
-                &state.pool,
-                &state.secret_key,
-                crate::sms::SmsEvent::Confirmed,
-                ctx,
-            )
-            .await;
-        }
+    if let Some(ctx) = crate::sms::SmsContext::for_booking(
+        &details,
+        guest_phone.as_deref(),
+        crate::sms::collects_phone(&sms_phone_mode),
+    ) {
+        crate::sms::notify_guest(
+            &state.pool,
+            &state.secret_key,
+            crate::sms::SmsEvent::Confirmed,
+            ctx,
+        )
+        .await;
     }
 
     // Send confirmation emails
@@ -8215,7 +8247,7 @@ async fn send_invite_bulk(
                 )
                 .await;
                 if let Err(e) = send_res {
-                    tracing::warn!(email = %email, error = %e, "bulk invite SMTP send failed");
+                    tracing::warn!(email = %email, error = format!("{e:#}"), "bulk invite SMTP send failed");
                     result.failed.push(email);
                     continue;
                 }
@@ -18440,7 +18472,7 @@ async fn admin_update_smtp_test(
             Redirect::to("/dashboard/admin?smtp_test=sent").into_response()
         }
         Err(e) => {
-            tracing::warn!(admin = %admin.user.email, error = %e, "admin: smtp test email failed");
+            tracing::warn!(admin = %admin.user.email, error = format!("{e:#}"), "admin: smtp test email failed");
             Redirect::to("/dashboard/admin?smtp_test=error").into_response()
         }
     }
@@ -19753,11 +19785,23 @@ async fn decline_booking_by_token(
         }
     };
 
-    // Decline the booking
-    let _ = sqlx::query("UPDATE bookings SET status = 'declined' WHERE id = ?")
-        .bind(&bid)
-        .execute(&state.pool)
-        .await;
+    // Decline the booking, guarded like approval: if a concurrent approve or
+    // decline got there first, say so instead of emailing the guest again.
+    let changed =
+        sqlx::query("UPDATE bookings SET status = 'declined' WHERE id = ? AND status = 'pending'")
+            .bind(&bid)
+            .execute(&state.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
+    if changed == 0 {
+        let already: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
+            .bind(&bid)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+        return render_token_error(&state, &headers, &token, already);
+    }
 
     tracing::info!(booking_id = %bid, "booking declined via token");
 
@@ -20187,11 +20231,31 @@ async fn guest_cancel_booking(
         }
     }
 
-    // Cancel the booking
-    let _ = sqlx::query("UPDATE bookings SET status = 'cancelled' WHERE id = ?")
-        .bind(&bid)
-        .execute(&state.pool)
-        .await;
+    // Cancel the booking. Guarded so a double submit, or a host decline or
+    // cancel in between, does not notify everyone twice.
+    let changed = sqlx::query(
+        "UPDATE bookings SET status = 'cancelled' WHERE id = ? AND status IN ('confirmed', 'pending')",
+    )
+    .bind(&bid)
+    .execute(&state.pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if changed == 0 {
+        // Lost the race: report what actually happened, as the GET form does.
+        let status: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
+            .bind(&bid)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+        let (title_key, message_key) = match status {
+            Some((status,)) if status == "declined" => {
+                ("bae-title-booking-declined", "bae-body-declined-by-host")
+            }
+            _ => ("bae-title-already-cancelled", "bae-body-already-cancelled"),
+        };
+        return render_booking_action_error_keys(&state, &headers, title_key, message_key);
+    }
 
     tracing::info!(booking_id = %bid, "booking cancelled by guest");
 
@@ -29715,6 +29779,8 @@ mod tests {
     /// transport by saving the form untouched.
     #[tokio::test]
     async fn admin_smtp_tls_mode_select_marks_one_option() {
+        // Reads config that CALRS_* env blocks override (see CLAUDE.md).
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         for (stored, expected_label) in [
             ("starttls", "STARTTLS (port 587)"),
             ("tls", "Implicit TLS (port 465)"),
@@ -33767,6 +33833,8 @@ mod tests {
 
     #[tokio::test]
     async fn optional_phone_mode_stores_a_normalized_number_and_tolerates_an_empty_one() {
+        // Reads config that CALRS_* env blocks override (see CLAUDE.md).
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         let (app, pool, _, et_id) = setup_test_app().await;
         sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
             .bind(&et_id)
@@ -34034,6 +34102,8 @@ mod tests {
 
     #[tokio::test]
     async fn sms_config_round_trips_through_the_database() {
+        // Reads config that CALRS_* env blocks override (see CLAUDE.md).
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         let pool = setup_test_db().await;
         let key = [7u8; 32];
 
@@ -35589,6 +35659,8 @@ mod tests {
 
     #[tokio::test]
     async fn team_event_type_form_round_trip_persists_horizon() {
+        // Reads config that CALRS_* env blocks override (see CLAUDE.md).
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         // PR #114 shipped a limit that only persisted on personal event types.
         // Assert the team UPDATE path carries the horizon too.
         let (app, pool, session, _) = setup_test_app().await;
@@ -35810,16 +35882,10 @@ mod tests {
         assert!(!mail.contains("Hi Guest,"), "{mail}");
     }
 
-    /// Approving from the dashboard sends the guest the confirmation SMS, like
-    /// the approve link in the host's email always did.
-    #[tokio::test]
-    async fn dashboard_approval_texts_the_guest() {
+    /// A webhook SMS gateway on a local port that records each request and
+    /// accepts it.
+    async fn spawn_sms_webhook() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let _env = crate::test_support::ENV_LOCK.lock().await;
-        let (app, pool, session, et_id) = setup_test_app().await;
-
-        // A webhook gateway that records each request body and accepts it.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -35860,14 +35926,205 @@ mod tests {
             }
         });
 
+        (port, received)
+    }
+
+    async fn use_sms_webhook(pool: &SqlitePool, port: u16) {
         sqlx::query(
             "INSERT INTO sms_config (id, provider, sender, base_url, default_country_code) \
              VALUES ('cfg', 'webhook', 'calrs', ?, '+33')",
         )
         .bind(format!("http://127.0.0.1:{port}/sms"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Two approvals racing (a double click, or the dashboard and the email
+    /// link together) confirm once: one SMS, one guest email.
+    #[tokio::test]
+    async fn concurrent_approvals_notify_the_guest_once() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (sms_port, received) = spawn_sms_webhook().await;
+        use_sms_webhook(&pool, sms_port).await;
+        let (mta_port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, mta_port).await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let uid = "uid-double-approve";
+        let booking_id = insert_pending_french_booking(&pool, &et_id, uid).await;
+        sqlx::query("UPDATE bookings SET guest_phone = '+33612345678' WHERE id = ?")
+            .bind(&booking_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "test-csrf-double-approve";
+        let dashboard = app.clone().oneshot(post_form(
+            &format!("/dashboard/bookings/{}/confirm", booking_id),
+            &session,
+            csrf,
+            &format!("_csrf={}", csrf),
+        ));
+        let dashboard_again = app.clone().oneshot(post_form(
+            &format!("/dashboard/bookings/{}/confirm", booking_id),
+            &session,
+            csrf,
+            &format!("_csrf={}", csrf),
+        ));
+        let by_token = app.clone().oneshot(post_form_unauthed(
+            &format!("/booking/approve/confirm-{uid}"),
+            csrf,
+            &format!("_csrf={}", csrf),
+        ));
+        let (a, b, c) = tokio::join!(dashboard, dashboard_again, by_token);
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+
+        // The guest confirmation goes out in the background; wait for it.
+        let _ = mail_to(&mails, "guest@test.com").await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let guest_mails = mails
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.rcpt.iter().any(|r| r.contains("guest@test.com")))
+            .count();
+        assert_eq!(guest_mails, 1, "the guest must be emailed once");
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "the guest must be texted once"
+        );
+    }
+
+    /// Approving from the dashboard emails watcher teams their claim links,
+    /// as the approve link in the host's email always did.
+    #[tokio::test]
+    async fn dashboard_approval_notifies_watchers() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let _vars = crate::test_support::EnvGuard::new();
+        std::env::set_var("CALRS_BASE_URL", "https://cal.test");
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+
+        let watcher_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'watcher@test.com', 'Watcher', 'user', 'local', 'watcher', 1)")
+            .bind(&watcher_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let team_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO teams (id, name, slug, visibility) VALUES (?, 'Sales', 'sales', 'public')",
+        )
+        .bind(&team_id)
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, 'member', 'direct')")
+            .bind(&team_id)
+            .bind(&watcher_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO event_type_watchers (event_type_id, team_id) VALUES (?, ?)")
+            .bind(&et_id)
+            .bind(&team_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-watch-approve").await;
+
+        let csrf = "test-csrf-watch-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let tokens: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM booking_claim_tokens WHERE booking_id = ? AND user_id = ?",
+        )
+        .bind(&booking_id)
+        .bind(&watcher_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tokens.0, 1, "the watcher should get a claim token");
+        let mail = mail_to(&mails, "watcher@test.com").await;
+        assert!(mail.contains("https://cal.test/booking/claim/"), "{mail}");
+    }
+
+    /// Two declines racing email the guest once.
+    #[tokio::test]
+    async fn concurrent_declines_notify_the_guest_once() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-double-decline").await;
+
+        let csrf = "test-csrf-double-decline";
+        let dashboard = app.clone().oneshot(post_form(
+            &format!("/dashboard/bookings/{}/cancel", booking_id),
+            &session,
+            csrf,
+            &format!("_csrf={}", csrf),
+        ));
+        let dashboard_again = app.clone().oneshot(post_form(
+            &format!("/dashboard/bookings/{}/cancel", booking_id),
+            &session,
+            csrf,
+            &format!("_csrf={}", csrf),
+        ));
+        let by_token = app.clone().oneshot(post_form_unauthed(
+            "/booking/decline/confirm-uid-double-decline",
+            csrf,
+            &format!("_csrf={}", csrf),
+        ));
+        let (a, b, c) = tokio::join!(dashboard, dashboard_again, by_token);
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+
+        let _ = mail_to(&mails, "guest@test.com").await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let guest_mails = mails
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.rcpt.iter().any(|r| r.contains("guest@test.com")))
+            .count();
+        assert_eq!(guest_mails, 1, "the guest must be emailed once");
+        let status: (String,) = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
+            .bind(&booking_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status.0, "declined");
+    }
+
+    /// Approving from the dashboard sends the guest the confirmation SMS, like
+    /// the approve link in the host's email always did.
+    #[tokio::test]
+    async fn dashboard_approval_texts_the_guest() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+
+        let (port, received) = spawn_sms_webhook().await;
+        use_sms_webhook(&pool, port).await;
         sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
             .bind(&et_id)
             .execute(&pool)
