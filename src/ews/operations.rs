@@ -342,11 +342,15 @@ const UID_SCAN_FUTURE_DAYS: i64 = 400;
 /// entries, so the window is split to keep each request well under that on a
 /// busy calendar.
 const UID_SCAN_CHUNK_DAYS: i64 = 60;
+/// Exchange truncates a CalendarView at this many entries, silently.
+const CALENDAR_VIEW_CAP: usize = 1000;
+/// A window at the cap is halved and both halves scanned again, down to this
+/// width. A window this narrow still at the cap is reported as an error, since
+/// an empty result would read as "the event is gone".
+const UID_SCAN_MIN_WINDOW_HOURS: i64 = 24;
 
 /// Fallback for [`find_items_by_uid`]: walk the folder with CalendarView
-/// requests that carry `calendar:UID`, and filter by UID in memory. Chunks
-/// are scanned from the oldest to the newest and the scan stops at the first
-/// chunk with a match, since calrs writes each booking as a single item.
+/// requests that carry `calendar:UID`, and filter by UID in memory.
 async fn find_items_by_uid_in_calendar_view(
     endpoint: &str,
     username: &str,
@@ -355,30 +359,78 @@ async fn find_items_by_uid_in_calendar_view(
     uid: &str,
 ) -> Result<Vec<String>> {
     let now = chrono::Utc::now();
-    let mut start = now - chrono::Duration::days(UID_SCAN_PAST_DAYS);
+    let start = now - chrono::Duration::days(UID_SCAN_PAST_DAYS);
     let end = now + chrono::Duration::days(UID_SCAN_FUTURE_DAYS);
-    while start < end {
-        let chunk_end = (start + chrono::Duration::days(UID_SCAN_CHUNK_DAYS)).min(end);
-        let items = list_items_in_window(
-            endpoint,
-            username,
-            password,
-            folder_id,
-            &start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            &chunk_end.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        )
-        .await?;
-        if items.len() >= 1000 {
-            tracing::warn!(
-                folder_id = %folder_id,
-                "EWS CalendarView hit its 1000-entry cap, the UID scan may miss items"
-            );
-        }
+    scan_windows_for_uid(
+        start,
+        end,
+        uid,
+        CALENDAR_VIEW_CAP,
+        chrono::Duration::hours(UID_SCAN_MIN_WINDOW_HOURS),
+        |s, e| async move {
+            list_items_in_window(
+                endpoint,
+                username,
+                password,
+                folder_id,
+                &s.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                &e.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            )
+            .await
+        },
+    )
+    .await
+}
+
+/// Scan `[start, end)` in [`UID_SCAN_CHUNK_DAYS`] chunks, oldest first, and
+/// stop at the first window holding `uid`, since calrs writes each booking as
+/// a single item. A window that comes back with `cap` entries or more may have
+/// been truncated by the server, so it is split in half and both halves are
+/// scanned (oldest first) instead, recursively. A window no wider than
+/// `min_window` that is still at the cap is an error: returning an empty
+/// result there would let a caller conclude the item does not exist.
+async fn scan_windows_for_uid<F, Fut>(
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    uid: &str,
+    cap: usize,
+    min_window: chrono::Duration,
+    mut fetch: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<EwsCalendarItem>>>,
+{
+    // Windows still to scan, the next one on top of the stack.
+    let mut chunks = Vec::new();
+    let mut chunk_start = start;
+    while chunk_start < end {
+        let chunk_end = (chunk_start + chrono::Duration::days(UID_SCAN_CHUNK_DAYS)).min(end);
+        chunks.push((chunk_start, chunk_end));
+        chunk_start = chunk_end;
+    }
+    chunks.reverse();
+
+    while let Some((s, e)) = chunks.pop() {
+        let items = fetch(s, e).await?;
+        // A match is a match even in a truncated window.
         let found = item_ids_with_uid(&items, uid);
         if !found.is_empty() {
             return Ok(found);
         }
-        start = chunk_end;
+        if items.len() >= cap {
+            if e - s <= min_window {
+                bail!(
+                    "EWS CalendarView from {s} to {e} returned {} entries, the server cap; \
+                     the UID scan cannot tell whether the item exists",
+                    items.len()
+                );
+            }
+            let mid = s + (e - s) / 2;
+            tracing::debug!(%s, %e, "EWS CalendarView hit its entry cap, splitting the window");
+            chunks.push((mid, e));
+            chunks.push((s, mid));
+        }
     }
     Ok(Vec::new())
 }
@@ -560,6 +612,127 @@ mod tests {
         ];
         assert_eq!(item_ids_with_uid(&items, "73c8e55c@calrs"), ["B", "D"]);
         assert!(item_ids_with_uid(&items, "missing@calrs").is_empty());
+    }
+
+    /// A fake CalendarView over items placed at fixed instants: returns the
+    /// items inside `[s, e)`, truncated to `cap` like Exchange does, and
+    /// records every window requested.
+    fn fake_view(
+        items: Vec<(chrono::DateTime<chrono::Utc>, EwsCalendarItem)>,
+        cap: usize,
+        calls: &std::cell::RefCell<
+            Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        >,
+        s: chrono::DateTime<chrono::Utc>,
+        e: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<EwsCalendarItem>> {
+        calls.borrow_mut().push((s, e));
+        Ok(items
+            .into_iter()
+            .filter(|(at, _)| *at >= s && *at < e)
+            .map(|(_, i)| i)
+            .take(cap)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn uid_scan_splits_a_truncated_window_until_it_finds_the_item() {
+        use chrono::TimeZone;
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let end = start + chrono::Duration::days(60);
+        // Twelve busy items, six in each half, push the chunk past the cap
+        // of 10, so the target near its end is truncated away. Each half on
+        // its own stays under the cap.
+        let mut items: Vec<_> = (0..12)
+            .map(|n| {
+                let at = start + chrono::Duration::days(n % 6 + 31 * (n / 6));
+                (at, item(&format!("busy{n}"), Some("other@calrs")))
+            })
+            .collect();
+        items.push((
+            start + chrono::Duration::days(50),
+            item("TARGET", Some("wanted@calrs")),
+        ));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let found = scan_windows_for_uid(
+            start,
+            end,
+            "wanted@calrs",
+            10,
+            chrono::Duration::days(1),
+            |s, e| {
+                let r = fake_view(items.clone(), 10, &calls, s, e);
+                async move { r }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(found, ["TARGET"]);
+        let calls = calls.into_inner();
+        assert_eq!(calls[0], (start, end), "the whole chunk is tried first");
+        assert_eq!(
+            calls[1],
+            (start, start + chrono::Duration::days(30)),
+            "then its older half"
+        );
+        assert_eq!(calls[2], (start + chrono::Duration::days(30), end));
+    }
+
+    #[tokio::test]
+    async fn uid_scan_errors_instead_of_reporting_not_found_when_still_truncated() {
+        use chrono::TimeZone;
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let end = start + chrono::Duration::days(60);
+        // Ten items inside the same minute: no split can get below the cap.
+        let items: Vec<_> = (0..10)
+            .map(|n| {
+                let at = start + chrono::Duration::seconds(n);
+                (at, item(&format!("busy{n}"), Some("other@calrs")))
+            })
+            .collect();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = scan_windows_for_uid(
+            start,
+            end,
+            "wanted@calrs",
+            10,
+            chrono::Duration::days(1),
+            |s, e| {
+                let r = fake_view(items.clone(), 10, &calls, s, e);
+                async move { r }
+            },
+        )
+        .await;
+        let err = result.expect_err("a truncated minimum window must not read as not found");
+        assert!(err.to_string().contains("cap"), "{err}");
+        let last = *calls.borrow().last().unwrap();
+        assert!(last.1 - last.0 <= chrono::Duration::days(1));
+    }
+
+    #[tokio::test]
+    async fn uid_scan_returns_empty_when_no_window_is_truncated() {
+        use chrono::TimeZone;
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let end = start + chrono::Duration::days(130);
+        let items = vec![(start, item("A", Some("other@calrs")))];
+        let calls = std::cell::RefCell::new(Vec::new());
+        let found = scan_windows_for_uid(
+            start,
+            end,
+            "wanted@calrs",
+            10,
+            chrono::Duration::days(1),
+            |s, e| {
+                let r = fake_view(items.clone(), 10, &calls, s, e);
+                async move { r }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(found.is_empty());
+        // 130 days in 60-day chunks, oldest first, no splitting.
+        assert_eq!(calls.borrow().len(), 3);
+        assert_eq!(calls.borrow()[2].1, end);
     }
 
     #[test]
