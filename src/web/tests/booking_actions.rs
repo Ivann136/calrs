@@ -1389,3 +1389,72 @@ async fn guest_reschedule_post_rejects_beyond_horizon() {
         "a beyond-horizon reschedule must not move the booking"
     );
 }
+
+/// A reschedule POST has to name a slot the reschedule page offers: a day
+/// blocked by an override, or a time outside its custom hours, is refused;
+/// a time inside them moves the booking.
+#[tokio::test]
+async fn guest_reschedule_post_honours_availability_overrides() {
+    let (app, pool, _, et_id) = setup_test_app().await;
+    let monday = NaiveDate::parse_from_str(&far_future_monday(), "%Y-%m-%d").unwrap();
+    let start = Utc.from_utc_datetime(&monday.and_hms_opt(14, 0, 0).unwrap());
+    let id = insert_v1_booking(&pool, &et_id, "g@test.com", start, 30, "confirmed", &[]).await;
+    let token: String = sqlx::query_scalar("SELECT reschedule_token FROM bookings WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let tuesday = (monday + Duration::days(1)).format("%Y-%m-%d").to_string();
+    let start_at = || async {
+        sqlx::query_scalar::<_, String>("SELECT start_at FROM bookings WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let original = start_at().await;
+    let reschedule = |time: &'static str| {
+        let app = app.clone();
+        let uri = format!("/booking/reschedule/{token}");
+        let body = format!("_csrf=csrf-resched-ovr&date={tuesday}&time={time}&tz=UTC");
+        async move {
+            app.oneshot(post_form_unauthed(&uri, "csrf-resched-ovr", &body))
+                .await
+                .unwrap()
+        }
+    };
+
+    sqlx::query("INSERT INTO availability_overrides (id, event_type_id, date, is_blocked) VALUES (?, ?, ?, 1)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&et_id)
+        .bind(&tuesday)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let page = body_string(reschedule("10%3A00").await).await;
+    assert!(page.contains("no longer available"));
+    assert_eq!(
+        start_at().await,
+        original,
+        "blocked day must not take the booking"
+    );
+
+    sqlx::query("UPDATE availability_overrides SET is_blocked = 0, start_time = '13:00', end_time = '15:00' WHERE event_type_id = ?")
+        .bind(&et_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    reschedule("10%3A00").await;
+    assert_eq!(
+        start_at().await,
+        original,
+        "10:00 is outside the override's custom hours"
+    );
+
+    reschedule("13%3A00").await;
+    assert_eq!(
+        start_at().await,
+        format!("{tuesday}T13:00:00Z"),
+        "13:00 is inside the override's custom hours"
+    );
+}

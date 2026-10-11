@@ -121,6 +121,82 @@ pub async fn cleanup_expired_sessions(pool: &SqlitePool) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+// --- Last-admin guard ---
+
+/// SQL condition on a `users` row: changing it away from "enabled admin"
+/// still leaves at least one enabled admin. True for any row that is not an
+/// enabled admin. It is part of the `UPDATE`/`DELETE` itself rather than a
+/// count read beforehand, so two concurrent demotions cannot both pass:
+/// SQLite runs one write at a time, and the second sees the first's result.
+const KEEPS_AN_ENABLED_ADMIN: &str = "(users.role != 'admin' OR users.enabled = 0 \
+     OR EXISTS (SELECT 1 FROM users other \
+                WHERE other.role = 'admin' AND other.enabled = 1 AND other.id != users.id))";
+
+/// Result of a role or enabled-flag change that must keep an enabled admin.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdminChange {
+    Changed,
+    NotFound,
+    /// Refused: the user is the last enabled admin.
+    LastAdmin,
+}
+
+/// Apply `set` (a fixed assignment, never user input) to one user, under the
+/// last-admin guard when `guarded`.
+async fn guarded_user_update(
+    pool: &SqlitePool,
+    user_id: &str,
+    set: &'static str,
+    guarded: bool,
+) -> std::result::Result<AdminChange, sqlx::Error> {
+    let guard = if guarded {
+        format!(" AND {KEEPS_AN_ENABLED_ADMIN}")
+    } else {
+        String::new()
+    };
+    let sql = format!("UPDATE users SET {set}, updated_at = datetime('now') WHERE id = ?{guard}");
+    let result = sqlx::query(&sql).bind(user_id).execute(pool).await?;
+    if result.rows_affected() > 0 {
+        return Ok(AdminChange::Changed);
+    }
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(if exists.is_some() {
+        AdminChange::LastAdmin
+    } else {
+        AdminChange::NotFound
+    })
+}
+
+/// Make a user an admin (`true`) or a regular user (`false`), refusing to
+/// demote the last enabled admin.
+pub async fn set_user_admin(
+    pool: &SqlitePool,
+    user_id: &str,
+    admin: bool,
+) -> std::result::Result<AdminChange, sqlx::Error> {
+    if admin {
+        guarded_user_update(pool, user_id, "role = 'admin'", false).await
+    } else {
+        guarded_user_update(pool, user_id, "role = 'user'", true).await
+    }
+}
+
+/// Enable or disable a user, refusing to disable the last enabled admin.
+pub async fn set_user_enabled(
+    pool: &SqlitePool,
+    user_id: &str,
+    enabled: bool,
+) -> std::result::Result<AdminChange, sqlx::Error> {
+    if enabled {
+        guarded_user_update(pool, user_id, "enabled = 1", false).await
+    } else {
+        guarded_user_update(pool, user_id, "enabled = 0", true).await
+    }
+}
+
 // --- User deletion ---
 
 /// Reasons `delete_user` can refuse or fail. The web layer and CLI both
@@ -188,12 +264,13 @@ pub async fn delete_user(
     requester_user_id: Option<&str>,
     avatars_dir: Option<&std::path::Path>,
 ) -> std::result::Result<(), DeleteUserError> {
-    let target: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT role, avatar_path FROM users WHERE id = ?")
-            .bind(target_user_id)
-            .fetch_optional(pool)
-            .await?;
-    let (target_role, avatar_filename) = match target {
+    let target: Option<(Option<String>, bool)> = sqlx::query_as(&format!(
+        "SELECT avatar_path, {KEEPS_AN_ENABLED_ADMIN} FROM users WHERE id = ?"
+    ))
+    .bind(target_user_id)
+    .fetch_optional(pool)
+    .await?;
+    let (avatar_filename, keeps_an_admin) = match target {
         Some(t) => t,
         None => return Err(DeleteUserError::NotFound),
     };
@@ -204,13 +281,10 @@ pub async fn delete_user(
         }
     }
 
-    if target_role == "admin" {
-        let admin_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
-            .fetch_one(pool)
-            .await?;
-        if admin_count.0 <= 1 {
-            return Err(DeleteUserError::LastAdmin);
-        }
+    // Checked here for an early answer, and again by the DELETE itself below
+    // so a concurrent demotion cannot slip in between.
+    if !keeps_an_admin {
+        return Err(DeleteUserError::LastAdmin);
     }
 
     // Future bookings as host (own event_types) or as a round-robin assignee
@@ -288,10 +362,16 @@ pub async fn delete_user(
     // The user delete cascades sessions, team_members, user_availability_rules,
     // event_type_member_weights, and booking_claim_tokens. teams.created_by
     // and the bookings.assigned/claimed_by_user_id columns are SET NULL.
-    sqlx::query("DELETE FROM users WHERE id = ?")
-        .bind(target_user_id)
-        .execute(&mut *tx)
-        .await?;
+    let deleted = sqlx::query(&format!(
+        "DELETE FROM users WHERE id = ? AND {KEEPS_AN_ENABLED_ADMIN}"
+    ))
+    .bind(target_user_id)
+    .execute(&mut *tx)
+    .await?;
+    if deleted.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Err(DeleteUserError::LastAdmin);
+    }
 
     tx.commit().await?;
 
@@ -2838,5 +2918,152 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alice_count.0, 1);
+    }
+
+    // --- Last-admin guard ---
+
+    async fn enabled_admins(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND enabled = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn last_enabled_admin_cannot_be_demoted_or_disabled() {
+        let pool = setup_db().await;
+        let alice = insert_user(&pool, "alice@x.com", "Alice", "admin").await;
+
+        assert_eq!(
+            set_user_admin(&pool, &alice, false).await.unwrap(),
+            AdminChange::LastAdmin
+        );
+        assert_eq!(
+            set_user_enabled(&pool, &alice, false).await.unwrap(),
+            AdminChange::LastAdmin
+        );
+        assert_eq!(enabled_admins(&pool).await, 1);
+
+        // A second enabled admin lifts the guard, for either one.
+        let bob = insert_user(&pool, "bob@x.com", "Bob", "user").await;
+        assert_eq!(
+            set_user_admin(&pool, &bob, true).await.unwrap(),
+            AdminChange::Changed
+        );
+        assert_eq!(
+            set_user_admin(&pool, &alice, false).await.unwrap(),
+            AdminChange::Changed
+        );
+        assert_eq!(
+            set_user_enabled(&pool, &bob, false).await.unwrap(),
+            AdminChange::LastAdmin,
+            "bob is now the only admin"
+        );
+        assert_eq!(
+            set_user_admin(&pool, "missing", false).await.unwrap(),
+            AdminChange::NotFound
+        );
+    }
+
+    /// A disabled admin cannot sign in, so it does not count as the admin
+    /// the instance keeps. Demoting, disabling or deleting a disabled admin
+    /// is always fine.
+    #[tokio::test]
+    async fn a_disabled_admin_does_not_count_as_another_admin() {
+        let pool = setup_db().await;
+        let (alice, _) = insert_user_with_account(&pool, "alice@x.com", "Alice", "admin").await;
+        let (bob, _) = insert_user_with_account(&pool, "bob@x.com", "Bob", "admin").await;
+        sqlx::query("UPDATE users SET enabled = 0 WHERE id = ?")
+            .bind(&bob)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            set_user_admin(&pool, &alice, false).await.unwrap(),
+            AdminChange::LastAdmin
+        );
+        assert_eq!(
+            set_user_enabled(&pool, &alice, false).await.unwrap(),
+            AdminChange::LastAdmin
+        );
+        assert!(matches!(
+            delete_user(&pool, &alice, None, None).await,
+            Err(DeleteUserError::LastAdmin)
+        ));
+
+        assert_eq!(
+            set_user_admin(&pool, &bob, false).await.unwrap(),
+            AdminChange::Changed
+        );
+        delete_user(&pool, &bob, Some(&alice), None)
+            .await
+            .expect("a disabled former admin can be deleted");
+        assert_eq!(enabled_admins(&pool).await, 1);
+    }
+
+    /// Two admins demoting (or disabling) each other at the same moment:
+    /// each check passes on its own, but the guard is inside the UPDATE, so
+    /// at most one of them may go through. Run against a WAL file database,
+    /// as in production, several times to give the race a chance.
+    #[tokio::test]
+    async fn concurrent_demotions_keep_an_enabled_admin() {
+        let dir = std::env::temp_dir().join(format!("calrs_last_admin_{}", uuid::Uuid::new_v4()));
+        let pool = crate::db::connect(&dir).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let mut ids = Vec::new();
+        for name in ["alice", "bob"] {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO users (id, email, name, role, auth_provider, username, enabled) \
+                 VALUES (?, ?, ?, 'admin', 'local', ?, 1)",
+            )
+            .bind(&id)
+            .bind(format!("{name}@x.com"))
+            .bind(name)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+
+        for round in 0..20 {
+            sqlx::query("UPDATE users SET role = 'admin', enabled = 1")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let disable = round % 2 == 1;
+            let tasks: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let pool = pool.clone();
+                    let id = id.clone();
+                    tokio::spawn(async move {
+                        if disable {
+                            set_user_enabled(&pool, &id, false).await
+                        } else {
+                            set_user_admin(&pool, &id, false).await
+                        }
+                    })
+                })
+                .collect();
+            let mut changed = 0;
+            for task in tasks {
+                // A write that loses the race may also come back as a busy
+                // error: either way it did not apply.
+                if let Ok(AdminChange::Changed) = task.await.unwrap() {
+                    changed += 1;
+                }
+            }
+            assert!(changed <= 1, "round {round}: both changes applied");
+            assert_eq!(
+                enabled_admins(&pool).await,
+                2 - changed,
+                "round {round}: an enabled admin must remain"
+            );
+        }
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

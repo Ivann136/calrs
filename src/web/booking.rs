@@ -498,6 +498,41 @@ pub(super) async fn handle_group_booking(
         );
     }
 
+    // The time must be one the slot page offers. Weekly rules, date
+    // overrides, interval alignment and first_slot_only are only enforced
+    // by recomputing the page's own slots; the checks above just give the
+    // common refusals their own message.
+    let window = offered_slot_window(host_tz, slot_start);
+    let offered_busy = team_busy_source(
+        &state.pool,
+        &et_id,
+        &team_id,
+        is_collective,
+        window.busy_start,
+        window.busy_end,
+        host_tz,
+    )
+    .await;
+    if !is_offered_slot(
+        &state.pool,
+        &et_id,
+        duration,
+        buffer_before,
+        buffer_after,
+        min_notice,
+        host_tz,
+        guest_tz,
+        &window,
+        offered_busy,
+        None,
+        slot_start,
+    )
+    .await
+    {
+        let _ = tx.rollback().await;
+        return Html(crate::i18n::translate(lang, "error-slot-unavailable", None)).into_response();
+    }
+
     // Required shared resources: verify availability and pick one in
     // round-robin mode. The busy reads run on separate pool connections and
     // cannot see uncommitted inserts, so a process-wide lock, held from the
@@ -1049,6 +1084,40 @@ async fn handle_dynamic_group_booking(
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
+    }
+
+    // The time must be one the slot page offers. Weekly rules, date
+    // overrides, interval alignment and first_slot_only are only enforced
+    // by recomputing the page's own slots; the checks above just give the
+    // common refusals their own message.
+    let window = offered_slot_window(host_tz, slot_start);
+    let user_ids: Vec<String> = dg_users.iter().map(|(uid, ..)| uid.clone()).collect();
+    let offered_busy = dynamic_group_busy_source(
+        &state.pool,
+        &et_id,
+        &user_ids,
+        window.busy_start,
+        window.busy_end,
+        host_tz,
+    )
+    .await;
+    if !is_offered_slot(
+        &state.pool,
+        &et_id,
+        duration,
+        buffer_before,
+        buffer_after,
+        min_notice,
+        host_tz,
+        guest_tz,
+        &window,
+        offered_busy,
+        None,
+        slot_start,
+    )
+    .await
+    {
+        return Html(crate::i18n::translate(lang, "error-slot-unavailable", None)).into_response();
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -1622,6 +1691,42 @@ pub(super) async fn handle_booking_for_user(
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
+    }
+
+    // The time must be one the slot page offers. Weekly rules, date
+    // overrides, interval alignment and first_slot_only are only enforced
+    // by recomputing the page's own slots; the checks above just give the
+    // common refusals their own message.
+    let window = offered_slot_window(host_tz, slot_start);
+    let offered_busy = BusySource::Individual(
+        fetch_busy_times_for_user(
+            &state.pool,
+            &host_user_id,
+            window.busy_start,
+            window.busy_end,
+            host_tz,
+            Some(&et_id),
+        )
+        .await,
+    );
+    if !is_offered_slot(
+        &state.pool,
+        &et_id,
+        duration,
+        buffer_before,
+        buffer_after,
+        min_notice,
+        host_tz,
+        guest_tz,
+        &window,
+        offered_busy,
+        None,
+        slot_start,
+    )
+    .await
+    {
+        let _ = tx.rollback().await;
+        return Html(crate::i18n::translate(lang, "error-slot-unavailable", None)).into_response();
     }
 
     // Required shared resources: verify availability and pick one in
@@ -2366,6 +2471,42 @@ pub(super) async fn handle_booking(
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
+    }
+
+    // The time must be one the slot page offers. Weekly rules, date
+    // overrides, interval alignment and first_slot_only are only enforced
+    // by recomputing the page's own slots; the checks above just give the
+    // common refusals their own message.
+    let window = offered_slot_window(host_tz, slot_start);
+    let offered_busy = BusySource::Individual(
+        fetch_busy_times_for_user(
+            &state.pool,
+            &host_user_id,
+            window.busy_start,
+            window.busy_end,
+            host_tz,
+            Some(&et_id),
+        )
+        .await,
+    );
+    if !is_offered_slot(
+        &state.pool,
+        &et_id,
+        duration,
+        buffer_before,
+        buffer_after,
+        min_notice,
+        host_tz,
+        guest_tz,
+        &window,
+        offered_busy,
+        None,
+        slot_start,
+    )
+    .await
+    {
+        let _ = tx.rollback().await;
+        return Html(crate::i18n::translate(lang, "error-slot-unavailable", None)).into_response();
     }
 
     // Required shared resources: verify availability and pick one in

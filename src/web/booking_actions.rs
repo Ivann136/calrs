@@ -1798,6 +1798,49 @@ pub(super) async fn guest_reschedule_booking(
         return Html(crate::i18n::translate(lang, "error-slot-unavailable", None)).into_response();
     }
 
+    // The time must be one the slot page offers. Weekly rules, date
+    // overrides, interval alignment and first_slot_only are only enforced
+    // by recomputing the page's own slots; the checks above just give the
+    // common refusals their own message.
+    let window = offered_slot_window(host_tz, slot_start);
+    let (buffer_before, buffer_after): (i32, i32) =
+        sqlx::query_as("SELECT buffer_before, buffer_after FROM event_types WHERE id = ?")
+            .bind(&et_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or((0, 0));
+    let offered_busy = reschedule_busy_source(
+        &state.pool,
+        &hosts,
+        &et_id,
+        window.busy_start,
+        window.busy_end,
+        host_tz,
+        &booking_id,
+        &uid,
+    )
+    .await;
+    if !is_offered_slot(
+        &state.pool,
+        &et_id,
+        duration,
+        buffer_before,
+        buffer_after,
+        min_notice,
+        host_tz,
+        guest_tz,
+        &window,
+        offered_busy,
+        Some(&booking_id),
+        slot_start,
+    )
+    .await
+    {
+        return Html(crate::i18n::translate(lang, "error-slot-unavailable", None)).into_response();
+    }
+
     // Re-check required resources for the new slot (excluding this booking's
     // own reservation) and re-pick in round-robin mode, serialized with
     // concurrent bookings by the process-wide resource lock (held until the

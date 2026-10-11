@@ -234,6 +234,86 @@ pub(super) struct EventTypeForm {
     pub(super) pending_expiry_hours: Option<String>,
 }
 
+/// Longest event type title accepted, the same limit as team names.
+const MAX_EVENT_TYPE_TITLE: usize = 255;
+/// Longest meeting accepted: a day. The form's own control stops at 8 hours.
+const MAX_EVENT_TYPE_DURATION: i32 = 24 * 60;
+
+/// Server-side checks on an event type form (personal or team, create or
+/// edit). Returns the slug to store, or the Fluent key of the first problem.
+///
+/// The slug is trimmed, lowercased and has spaces turned into dashes, as
+/// both forms always did; left blank, it is derived from the title. Any
+/// other character outside `[a-z0-9-]` is refused rather than dropped, the
+/// rule teams already follow and the one the form's own pattern shows.
+/// Numbers left blank keep their defaults; a value that is there has to
+/// parse and be in range, instead of silently becoming the default.
+pub(super) fn validate_event_type_form(form: &EventTypeForm) -> Result<String, &'static str> {
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Err("form-error-event-type-title-required");
+    }
+    if title.chars().count() > MAX_EVENT_TYPE_TITLE {
+        return Err("form-error-event-type-title-length");
+    }
+
+    let optional_number = |s: &str| -> Result<Option<i32>, ()> {
+        let s = s.trim();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            s.parse().map(Some).map_err(|_| ())
+        }
+    };
+    match optional_number(&form.duration_min) {
+        Ok(None) => {}
+        Ok(Some(d)) if (1..=MAX_EVENT_TYPE_DURATION).contains(&d) => {}
+        _ => return Err("form-error-event-type-duration"),
+    }
+    for field in [
+        &form.buffer_before,
+        &form.buffer_after,
+        &form.min_notice_min,
+        &form.reminder_minutes,
+        &form.max_additional_guests,
+    ] {
+        if !matches!(optional_number(field), Ok(None) | Ok(Some(0..))) {
+            return Err("form-error-event-type-number");
+        }
+    }
+    if !matches!(
+        optional_number(&form.booking_horizon_days),
+        Ok(None) | Ok(Some(0..))
+    ) {
+        return Err("form-error-event-type-horizon");
+    }
+
+    let slug = form.slug.trim().to_lowercase().replace(' ', "-");
+    if slug.is_empty() {
+        let mut derived: String = title
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        while derived.contains("--") {
+            derived = derived.replace("--", "-");
+        }
+        let derived = derived.trim_matches('-').to_string();
+        if derived.is_empty() {
+            return Err("form-error-title-required");
+        }
+        return Ok(derived);
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || !slug.chars().any(|c| c.is_ascii_alphanumeric())
+    {
+        return Err("form-error-slug-charset");
+    }
+    Ok(slug)
+}
+
 /// Template context for the "Required resources" section of the event type
 /// form: (all resources, comma-joined selected ids, scheduling mode).
 /// Resources the user may attach to an event type belonging to `team_id`.
@@ -580,37 +660,20 @@ pub(super) async fn create_event_type(
         None => return Redirect::to("/dashboard/event-types").into_response(),
     };
 
-    // Generate slug from title if empty
-    let mut slug = form.slug.trim().to_lowercase().replace(' ', "-");
-    slug = slug
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect();
-    if slug.is_empty() {
-        slug = form
-            .title
-            .trim()
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>();
-        // Collapse multiple dashes and trim
-        while slug.contains("--") {
-            slug = slug.replace("--", "-");
+    let slug = match validate_event_type_form(&form) {
+        Ok(slug) => slug,
+        Err(key) => {
+            return render_event_type_form_error(
+                &state,
+                &auth_user,
+                &crate::i18n::translate(auth_user.lang, key, None),
+                &form,
+                false,
+            )
+            .await
+            .into_response()
         }
-        slug = slug.trim_matches('-').to_string();
-    }
-    if slug.is_empty() {
-        return render_event_type_form_error(
-            &state,
-            &auth_user,
-            &crate::i18n::translate(auth_user.lang, "form-error-title-required", None),
-            &form,
-            false,
-        )
-        .await
-        .into_response();
-    }
+    };
 
     // Check if a team_id was provided and it's non-empty
     let team_id = form.team_id.as_deref().filter(|s| !s.trim().is_empty());
@@ -1260,7 +1323,20 @@ pub(super) async fn update_event_type(
         None => return Redirect::to("/dashboard/event-types").into_response(),
     };
 
-    let new_slug = form.slug.trim().to_lowercase().replace(' ', "-");
+    let new_slug = match validate_event_type_form(&form) {
+        Ok(slug) => slug,
+        Err(key) => {
+            return render_event_type_form_error(
+                &state,
+                &auth_user,
+                &crate::i18n::translate(auth_user.lang, key, None),
+                &form,
+                true,
+            )
+            .await
+            .into_response()
+        }
+    };
     let requires_confirmation = form.requires_confirmation.as_deref() == Some("on");
     let sms_phone_mode = resolve_phone_mode(
         &state.pool,
@@ -2131,32 +2207,20 @@ pub(super) async fn create_group_event_type(
         None => return Redirect::to("/dashboard/event-types").into_response(),
     };
 
-    let mut slug = form.slug.trim().to_lowercase().replace(' ', "-");
-    slug = slug
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect();
-    if slug.is_empty() {
-        slug = form
-            .title
-            .trim()
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>();
-        while slug.contains("--") {
-            slug = slug.replace("--", "-");
+    let slug = match validate_event_type_form(&form) {
+        Ok(slug) => slug,
+        Err(key) => {
+            return render_event_type_form_error(
+                &state,
+                &auth_user,
+                &crate::i18n::translate(auth_user.lang, key, None),
+                &form,
+                false,
+            )
+            .await
+            .into_response()
         }
-        slug = slug.trim_matches('-').to_string();
-    }
-    if slug.is_empty() {
-        return Html(crate::i18n::translate(
-            auth_user.lang,
-            "form-error-title-required",
-            None,
-        ))
-        .into_response();
-    }
+    };
 
     // Check uniqueness within the team
     let existing: Option<(String,)> =
@@ -2730,7 +2794,20 @@ pub(super) async fn update_group_event_type(
         None => return Redirect::to("/dashboard/event-types").into_response(),
     };
 
-    let new_slug = form.slug.trim().to_lowercase().replace(' ', "-");
+    let new_slug = match validate_event_type_form(&form) {
+        Ok(slug) => slug,
+        Err(key) => {
+            return render_event_type_form_error(
+                &state,
+                &auth_user,
+                &crate::i18n::translate(auth_user.lang, key, None),
+                &form,
+                true,
+            )
+            .await
+            .into_response()
+        }
+    };
     let requires_confirmation = form.requires_confirmation.as_deref() == Some("on");
     let sms_phone_mode = resolve_phone_mode(
         &state.pool,

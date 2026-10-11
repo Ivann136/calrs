@@ -895,9 +895,20 @@ pub(super) async fn admin_test_write_resource(
     admin_resources_redirect_err(&format!("Write test failed. Last error: {}", last_err))
 }
 
+/// Back to the admin panel with the "last enabled admin" refusal, in the
+/// acting admin's language.
+fn admin_last_admin_refusal(lang: &str) -> Response {
+    let message = crate::i18n::translate(lang, "admin-error-last-admin", None);
+    Redirect::to(&format!(
+        "/dashboard/admin?error={}",
+        urlencoding::encode(&message)
+    ))
+    .into_response()
+}
+
 pub(super) async fn admin_toggle_role(
     State(state): State<Arc<AppState>>,
-    _admin: crate::auth::AdminUser,
+    admin: crate::auth::AdminUser,
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Form(csrf): Form<CsrfForm>,
@@ -905,21 +916,27 @@ pub(super) async fn admin_toggle_role(
     if let Err(resp) = verify_csrf_token(&headers, &csrf._csrf) {
         return resp;
     }
-    // Get current role
-    let current_role: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?")
+    let current_role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
         .bind(&user_id)
         .fetch_optional(&state.pool)
         .await
         .unwrap_or(None);
-
-    if let Some((role,)) = current_role {
-        let new_role = if role == "admin" { "user" } else { "admin" };
-        let _ = sqlx::query("UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?")
-            .bind(new_role)
-            .bind(&user_id)
-            .execute(&state.pool)
-            .await;
-        tracing::info!(target_user = %user_id, new_role = %new_role, admin = %_admin.user.email, "admin: role changed");
+    let Some(role) = current_role else {
+        return Redirect::to("/dashboard/admin").into_response();
+    };
+    let make_admin = role != "admin";
+    // The guard is part of the UPDATE, so two admins demoting each other at
+    // the same moment cannot leave the instance with none.
+    match crate::auth::set_user_admin(&state.pool, &user_id, make_admin).await {
+        Ok(crate::auth::AdminChange::Changed) => {
+            tracing::info!(target_user = %user_id, admin_role = make_admin, admin = %admin.user.email, "admin: role changed");
+        }
+        Ok(crate::auth::AdminChange::LastAdmin) => {
+            tracing::warn!(target_user = %user_id, admin = %admin.user.email, "admin: refused to demote the last enabled admin");
+            return admin_last_admin_refusal(admin.lang);
+        }
+        Ok(crate::auth::AdminChange::NotFound) => {}
+        Err(e) => return internal_error_response("admin role change", &e),
     }
 
     Redirect::to("/dashboard/admin").into_response()
@@ -927,7 +944,7 @@ pub(super) async fn admin_toggle_role(
 
 pub(super) async fn admin_toggle_enabled(
     State(state): State<Arc<AppState>>,
-    _admin: crate::auth::AdminUser,
+    admin: crate::auth::AdminUser,
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Form(csrf): Form<CsrfForm>,
@@ -935,22 +952,25 @@ pub(super) async fn admin_toggle_enabled(
     if let Err(resp) = verify_csrf_token(&headers, &csrf._csrf) {
         return resp;
     }
-    // Get current enabled status
-    let current: Option<(bool,)> = sqlx::query_as("SELECT enabled FROM users WHERE id = ?")
+    let current: Option<bool> = sqlx::query_scalar("SELECT enabled FROM users WHERE id = ?")
         .bind(&user_id)
         .fetch_optional(&state.pool)
         .await
         .unwrap_or(None);
-
-    if let Some((enabled,)) = current {
-        let new_enabled = !enabled;
-        let _ =
-            sqlx::query("UPDATE users SET enabled = ?, updated_at = datetime('now') WHERE id = ?")
-                .bind(new_enabled)
-                .bind(&user_id)
-                .execute(&state.pool)
-                .await;
-        tracing::info!(target_user = %user_id, enabled = %new_enabled, admin = %_admin.user.email, "admin: user toggled");
+    let Some(enabled) = current else {
+        return Redirect::to("/dashboard/admin").into_response();
+    };
+    let new_enabled = !enabled;
+    match crate::auth::set_user_enabled(&state.pool, &user_id, new_enabled).await {
+        Ok(crate::auth::AdminChange::Changed) => {
+            tracing::info!(target_user = %user_id, enabled = %new_enabled, admin = %admin.user.email, "admin: user toggled");
+        }
+        Ok(crate::auth::AdminChange::LastAdmin) => {
+            tracing::warn!(target_user = %user_id, admin = %admin.user.email, "admin: refused to disable the last enabled admin");
+            return admin_last_admin_refusal(admin.lang);
+        }
+        Ok(crate::auth::AdminChange::NotFound) => {}
+        Err(e) => return internal_error_response("admin user toggle", &e),
     }
 
     Redirect::to("/dashboard/admin").into_response()
@@ -979,6 +999,10 @@ pub(super) async fn admin_delete_user(
         Ok(()) => {
             tracing::info!(target_user = %user_id, admin = %admin_user.email, "admin: user deleted");
             Redirect::to("/dashboard/admin").into_response()
+        }
+        Err(crate::auth::DeleteUserError::LastAdmin) => {
+            tracing::warn!(target_user = %user_id, admin = %admin_user.email, "admin: refused to delete the last enabled admin");
+            admin_last_admin_refusal(admin.lang)
         }
         Err(e) => {
             tracing::warn!(target_user = %user_id, admin = %admin_user.email, error = %e, "admin: user delete refused");

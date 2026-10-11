@@ -169,23 +169,25 @@ pub async fn run(pool: &SqlitePool, data_dir: &Path, cmd: UserCommands) -> Resul
             println!("{}", Table::new(rows));
         }
         UserCommands::Disable { email } => {
-            let result = sqlx::query(
-                "UPDATE users SET enabled = 0, updated_at = datetime('now') WHERE email = ?",
-            )
-            .bind(&email)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() == 0 {
-                println!("{} User not found: {}", "✗".red(), email);
-            } else {
-                // Also invalidate their sessions
-                sqlx::query(
-                    "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = ?)",
-                )
-                .bind(&email)
-                .execute(pool)
-                .await?;
-                println!("{} User disabled: {}", "✓".green(), email);
+            let id = user_id_by_email(pool, &email).await?;
+            match auth::set_user_enabled(pool, &id, false).await? {
+                auth::AdminChange::NotFound => {
+                    println!("{} User not found: {}", "✗".red(), email);
+                }
+                auth::AdminChange::LastAdmin => {
+                    println!(
+                        "{} Cannot disable the last enabled admin. Promote or enable another admin first.",
+                        "✗".red()
+                    );
+                }
+                auth::AdminChange::Changed => {
+                    // Also invalidate their sessions
+                    sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                        .bind(&id)
+                        .execute(pool)
+                        .await?;
+                    println!("{} User disabled: {}", "✓".green(), email);
+                }
             }
         }
         UserCommands::Enable { email } => {
@@ -215,36 +217,21 @@ pub async fn run(pool: &SqlitePool, data_dir: &Path, cmd: UserCommands) -> Resul
             }
         }
         UserCommands::Demote { email } => {
-            // Prevent demoting the last admin
-            let admin_count: (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin' AND enabled = 1")
-                    .fetch_one(pool)
-                    .await?;
-
-            let is_admin: Option<(String,)> =
-                sqlx::query_as("SELECT role FROM users WHERE email = ? AND role = 'admin'")
-                    .bind(&email)
-                    .fetch_optional(pool)
-                    .await?;
-
-            if is_admin.is_some() && admin_count.0 <= 1 {
-                println!(
-                    "{} Cannot demote the last admin. Promote another user first.",
-                    "✗".red()
-                );
-                return Ok(());
-            }
-
-            let result = sqlx::query(
-                "UPDATE users SET role = 'user', updated_at = datetime('now') WHERE email = ?",
-            )
-            .bind(&email)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() == 0 {
-                println!("{} User not found: {}", "✗".red(), email);
-            } else {
-                println!("{} User demoted to user: {}", "✓".green(), email);
+            // Refuses to demote the last enabled admin, atomically.
+            let id = user_id_by_email(pool, &email).await?;
+            match auth::set_user_admin(pool, &id, false).await? {
+                auth::AdminChange::NotFound => {
+                    println!("{} User not found: {}", "✗".red(), email);
+                }
+                auth::AdminChange::LastAdmin => {
+                    println!(
+                        "{} Cannot demote the last admin. Promote another user first.",
+                        "✗".red()
+                    );
+                }
+                auth::AdminChange::Changed => {
+                    println!("{} User demoted to user: {}", "✓".green(), email);
+                }
             }
         }
         UserCommands::SetPassword { email } => {
@@ -329,6 +316,16 @@ pub async fn run(pool: &SqlitePool, data_dir: &Path, cmd: UserCommands) -> Resul
     }
 
     Ok(())
+}
+
+/// The id of the user with this email, or an empty string when there is
+/// none (the guarded updates then report `NotFound`).
+async fn user_id_by_email(pool: &SqlitePool, email: &str) -> Result<String> {
+    let id: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+        .bind(email)
+        .fetch_optional(pool)
+        .await?;
+    Ok(id.unwrap_or_default())
 }
 
 #[cfg(test)]
