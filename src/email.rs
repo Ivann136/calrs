@@ -1516,6 +1516,64 @@ fn compose_host_calendar_sync_failure(details: &BookingDetails, reason: &str) ->
     .compose()
 }
 
+/// Tell the host a confirmed booking is still not on their calendar after
+/// several write-back attempts (#162). `details` carries the recipient as
+/// the host (name, email, language).
+pub async fn send_host_writeback_failure(
+    config: &SmtpConfig,
+    details: &BookingDetails,
+    error: &str,
+) -> Result<()> {
+    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    send_composed(
+        config,
+        Sender::Instance,
+        to,
+        compose_host_writeback_failure(details, error),
+        None,
+    )
+    .await
+}
+
+fn compose_host_writeback_failure(details: &BookingDetails, error: &str) -> ComposedEmail {
+    let lang = host_lang(details);
+    let (date_display, time_display) = host_time_display_exact(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+        details.utc_times.as_ref(),
+    );
+    let action = t(lang, "email-writeback-failure-action");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-writeback-failure-subject",
+            [("event", &details.event_title), ("date", &date_display)],
+        ),
+        heading: t(lang, "email-writeback-failure-heading"),
+        message: t(lang, "email-writeback-failure-intro"),
+        accent: "#f59e0b",
+        rows: vec![
+            row(t(lang, "confirmed-detail-event"), &details.event_title),
+            row(t(lang, "confirmed-detail-date"), date_display.clone()),
+            row(t(lang, "confirmed-detail-time"), time_display),
+            row(
+                t(lang, "common-detail-guest"),
+                format!("{} <{}>", details.guest_name, details.guest_email),
+            ),
+            row(t(lang, "email-detail-error"), error),
+        ],
+        plain_lines: vec![],
+        footer_plain: Some(action.clone()),
+        footer_html: Some(action),
+        actions: vec![],
+    }
+    .compose()
+}
+
 /// Send booking reminder to the guest
 pub async fn send_guest_reminder(
     config: &SmtpConfig,

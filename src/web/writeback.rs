@@ -83,8 +83,85 @@ pub(super) async fn push_and_record(
             failures.push((target.clone(), msg));
         }
     }
-    record_outcome(pool, booking_uid, &failures, kind, Utc::now()).await;
+    let attempts = record_outcome(pool, booking_uid, &failures, kind, Utc::now()).await;
+    if kind == PushKind::Retry && attempts >= ALERT_AFTER_ATTEMPTS {
+        alert_hosts_once(pool, key, booking_uid, details, &failures).await;
+    }
     failures
+}
+
+/// Failed attempts after which the host is emailed: the initial push and two
+/// retries, about 20 minutes after the booking. Late enough that a brief
+/// outage resolves on its own without bothering anyone, early enough that a
+/// meeting later the same day is not missed. Retries go on after the email.
+pub(super) const ALERT_AFTER_ATTEMPTS: i64 = 3;
+
+/// Email every host whose calendar is still missing the booking, once per
+/// booking: `writeback_alerted_at` is claimed atomically before sending, and
+/// only cleared when a write-back succeeds. Left unclaimed while SMTP is not
+/// configured, so a later retry can still send it.
+async fn alert_hosts_once(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    booking_uid: &str,
+    details: &crate::email::BookingDetails,
+    failures: &[(String, String)],
+) {
+    let Ok(Some(smtp)) = crate::email::load_smtp_config(pool, key).await else {
+        tracing::warn!(
+            uid = %booking_uid,
+            "calendar write-back still failing and SMTP is unconfigured, so the host cannot be emailed"
+        );
+        return;
+    };
+    let claimed = sqlx::query(
+        "UPDATE bookings SET writeback_alerted_at = datetime('now') \
+         WHERE uid = ? AND writeback_alerted_at IS NULL",
+    )
+    .bind(booking_uid)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected() == 1)
+    .unwrap_or(false);
+    if !claimed {
+        return;
+    }
+
+    let mut hosts: Vec<&str> = failures.iter().map(|(user, _)| user.as_str()).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    for host_id in hosts {
+        let error = summarize(
+            &failures
+                .iter()
+                .filter(|(user, _)| user == host_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let recipient: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT name, COALESCE(booking_email, email), language FROM users WHERE id = ?",
+        )
+        .bind(host_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        let Some((name, email, language)) = recipient else {
+            continue;
+        };
+        let host_details = crate::email::BookingDetails {
+            host_name: name,
+            host_email: email,
+            host_language: crate::email::supported_language(language),
+            ..details.clone()
+        };
+        // Inline: this runs from the background loop, off any request path,
+        // and `send_email` bounds each attempt.
+        super::log_email_result(
+            crate::email::send_host_writeback_failure(&smtp, &host_details, &error).await,
+            "host_writeback_failure",
+            booking_uid,
+        );
+    }
 }
 
 /// Store the outcome of a write-back attempt. Success clears every trace of

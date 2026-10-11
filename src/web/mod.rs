@@ -2899,14 +2899,15 @@ async fn dashboard_bookings(
     .await
     .unwrap_or_default();
 
-    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String)> =
+    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String, Option<String>)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, b.guest_phone, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, b.reschedule_by_host,
                     COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                     COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                     COALESCE(r.name, '') AS resource_name,
                     et.sms_phone_mode,
-                    COALESCE(b.notes, '') AS notes
+                    COALESCE(b.notes, '') AS notes,
+                    b.writeback_error
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -3026,11 +3027,15 @@ async fn dashboard_bookings(
                 resource_name,
                 sms_phone_mode,
                 notes,
+                writeback_error,
             )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
                     id => id,
+                    // The booking is confirmed but not on the host's
+                    // calendar; retried in the background (#162).
+                    writeback_error => writeback_error.as_deref().unwrap_or(""),
                     guest_name => name,
                     guest_email => email,
                     guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },

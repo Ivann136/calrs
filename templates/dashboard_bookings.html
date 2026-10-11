@@ -65,10 +65,14 @@
           {% if b.awaiting_reschedule is defined and b.awaiting_reschedule %}
             <span class="badge badge-warning" style="margin-left: 0.25rem;">{{ t("bookings-badge-awaiting-reschedule") }}</span>
           {% endif %}
+          {% if b.writeback_error %}
+            <span class="badge badge-error" style="margin-left: 0.25rem;" title="{{ b.writeback_error }}">{{ t("bookings-badge-writeback-failed") }}</span>
+          {% endif %}
         </div>
         <div style="color: var(--text-muted); font-size: 0.85rem;">
           {{ b.start_at }} &middot; {{ b.guest_email }}{% if b.guest_phone %} &middot; {{ b.guest_phone }}{% endif %}
         </div>
+        {% if b.writeback_error %}<div class="writeback-error" style="color: var(--error-text); font-size: 0.75rem; overflow-wrap: anywhere;">{{ t("bookings-writeback-failed-detail", error=b.writeback_error) }}</div>{% endif %}
         {% if b.start_at_guest %}<div style="color: var(--text-muted); font-size: 0.75rem;">{{ t("bookings-guest-booked") }} {{ b.start_at_guest }}</div>{% endif %}
         {% if b.resource_name %}<div style="color: var(--text-muted); font-size: 0.75rem;">{{ t("bookings-resource") }} {{ b.resource_name }}</div>{% endif %}
         {% if b.notes %}<div class="booking-notes" tabindex="0"><strong>{{ t("confirmed-detail-notes") }}</strong> {{ b.notes }}</div>{% endif %}

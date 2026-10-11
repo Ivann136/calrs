@@ -304,3 +304,105 @@ async fn retries_stop_after_the_last_attempt() {
     );
     assert_eq!(dav.puts() as i64, writeback::MAX_ATTEMPTS);
 }
+
+/// Exhausting the retries emails the host exactly once, in the host's own
+/// language, and later failed retries do not email again.
+#[tokio::test]
+async fn persistent_writeback_failure_emails_the_host_once() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let _guard = crate::test_support::EnvGuard::new();
+    let (pool, _dav, host, id, uid) = writeback_fixture(DavMode::Drop).await;
+    sqlx::query("UPDATE users SET language = 'fr', name = 'Hélène Hôte' WHERE id = ?")
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (port, mails) = spawn_capturing_mta().await;
+    use_capturing_mta(&pool, port).await;
+
+    push_fresh(&pool, &host, &uid).await;
+    for _ in 1..writeback::MAX_ATTEMPTS {
+        let later = Utc::now() + Duration::days(1);
+        writeback::retry_failed_writebacks(&pool, &[0u8; 32], later).await;
+    }
+    let (_, attempts, next, _, _) = writeback_state(&pool, &id).await;
+    assert_eq!(attempts, writeback::MAX_ATTEMPTS);
+    assert_eq!(next, None);
+
+    // Inline sends: every message has been delivered by now.
+    let body = mail_to(&mails, "host@wb.test").await;
+    assert!(body.contains("Une réservation manque"), "in French: {body}");
+    assert!(body.contains("Work calendar"), "names the failing source: {body}");
+    let alerted: Option<String> =
+        sqlx::query_scalar("SELECT writeback_alerted_at FROM bookings WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(alerted.is_some());
+    assert_eq!(
+        mails.lock().unwrap().len(),
+        1,
+        "one email for the whole failure, not one per retry"
+    );
+}
+
+/// Before the alert threshold nobody is emailed: a brief outage that a
+/// retry fixes stays quiet.
+#[tokio::test]
+async fn a_writeback_fixed_by_a_retry_sends_no_email() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let _guard = crate::test_support::EnvGuard::new();
+    let (pool, dav, host, _id, uid) = writeback_fixture(DavMode::Reject).await;
+    let (port, mails) = spawn_capturing_mta().await;
+    use_capturing_mta(&pool, port).await;
+
+    push_fresh(&pool, &host, &uid).await;
+    writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::hours(1))
+        .await;
+    dav.set_mode(DavMode::Ok);
+    writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::hours(2))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(mails.lock().unwrap().is_empty());
+}
+
+/// The bookings dashboard flags a booking whose write-back is failing, with
+/// the error.
+#[tokio::test]
+async fn bookings_dashboard_flags_failed_writebacks() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    let id = insert_v1_booking(
+        &pool,
+        &et_id,
+        "flagged@wb.test",
+        Utc::now() + Duration::days(3),
+        30,
+        "confirmed",
+        &[(
+            "writeback_error",
+            Some("Work calendar: PUT returned 400 Bad Request".into()),
+        )],
+    )
+    .await;
+    insert_v1_booking(
+        &pool,
+        &et_id,
+        "fine@wb.test",
+        Utc::now() + Duration::days(4),
+        30,
+        "confirmed",
+        &[],
+    )
+    .await;
+
+    let response = app
+        .oneshot(get_authed("/dashboard/bookings", &session))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = body_string(response).await;
+    assert_eq!(body.matches("not in your calendar").count(), 1, "{body}");
+    assert!(body.contains("PUT returned 400 Bad Request"), "{body}");
+    assert!(!id.is_empty());
+}
