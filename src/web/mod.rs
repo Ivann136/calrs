@@ -433,7 +433,7 @@ async fn google_meet_location_error(
 /// names.
 async fn dynamic_group_google_meet_error_page(
     state: &AppState,
-    headers: &HeaderMap,
+    lang: &str,
     location_type: &str,
     owner_user_id: &str,
 ) -> Option<Html<String>> {
@@ -443,7 +443,6 @@ async fn dynamic_group_google_meet_error_page(
     if crate::google_meet::user_has_google_writeback(&state.pool, owner_user_id).await {
         return None;
     }
-    let lang = crate::i18n::detect_from_headers(headers);
     let title = crate::i18n::translate(lang, "google-meet-unavailable-title", None);
     let message = crate::i18n::translate(lang, "google-meet-dynamic-group-unavailable", None);
     let tmpl = match state.templates.get_template("booking_action_error.html") {
@@ -736,7 +735,9 @@ async fn pending_host_recipients(
         .fetch_optional(pool)
         .await
         .unwrap_or(None);
-        out.extend(row);
+        out.extend(row.map(|(name, email, language)| {
+            (name, email, crate::email::supported_language(language))
+        }));
     }
     out
 }
@@ -1311,7 +1312,7 @@ async fn send_due_reminders(pool: SqlitePool, secret_key: [u8; 32]) {
             reminder_minutes: None,
             additional_attendees: vec![],
             guest_language: guest_language.clone(),
-            host_language: host_language.clone(),
+            host_language: crate::email::supported_language(host_language.clone()),
             host_timezone: stored_tz_str.to_string(),
             resource_name: booking_resource_label(&pool, uid).await,
         };
@@ -5326,7 +5327,7 @@ async fn cancel_booking(
         reason,
         cancelled_by_host: true,
         guest_language,
-        host_language: user.language.clone(),
+        host_language: crate::email::supported_language(user.language.clone()),
         host_timezone: stored_tz.name().to_string(),
     };
 
@@ -10661,12 +10662,12 @@ async fn team_profile_page(
 async fn show_group_slots(
     State(state): State<Arc<AppState>>,
     optional_auth: crate::auth::OptionalAuthUser,
-    headers: HeaderMap,
     Path((team_slug, slug)): Path<(String, String)>,
     Query(query): Query<SlotsQuery>,
 ) -> Response {
     let embed = query.embed_params();
-    let lang = crate::i18n::detect_from_headers(&headers);
+    // The visitor rule, as the team profile and the booking POST use.
+    let lang = optional_auth.lang;
     let et: Option<(String, String, String, Option<String>, i32, i32, i32, i32, String, Option<String>, String, String, String, String, Option<String>, String)> = sqlx::query_as(
         "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.location_type, et.location_value, t.name, et.visibility, et.scheduling_mode, t.visibility, t.invite_token, et.default_calendar_view
          FROM event_types et
@@ -11002,12 +11003,12 @@ async fn show_group_slots(
 async fn show_group_book_form(
     State(state): State<Arc<AppState>>,
     optional_auth: crate::auth::OptionalAuthUser,
-    headers: HeaderMap,
     Path((team_slug, slug)): Path<(String, String)>,
     Query(query): Query<BookQuery>,
 ) -> Response {
     let embed = query.embed_params();
-    let lang = crate::i18n::detect_from_headers(&headers);
+    // The visitor rule, as the team profile and the booking POST use.
+    let lang = optional_auth.lang;
     let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, String, i32, String, Option<String>, String, String)> = sqlx::query_as(
         "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, t.name, et.visibility, et.max_additional_guests, t.visibility, t.invite_token, t.id, et.sms_phone_mode
          FROM event_types et
@@ -11206,16 +11207,17 @@ async fn handle_group_booking(
     if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
         return resp;
     }
-    let lang = crate::i18n::detect_from_headers(&headers);
+    // The visitor's language, as the GET form computed it.
+    let lang = optional_auth.lang;
     let captcha_cfg = state.captcha_config.read().await;
     if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
         .await
         .is_err()
     {
         tracing::warn!("captcha failed on group booking");
-        return render_booking_action_error_keys(
+        return render_booking_action_error_keys_in(
             &state,
-            &headers,
+            lang,
             "bae-title-captcha",
             "bae-body-go-back",
         );
@@ -11234,7 +11236,7 @@ async fn handle_group_booking(
     }
 
     if let Err(e) = validate_booking_input(&form.name, &form.email, &form.notes) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
     }
 
     let et: Option<(String, String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, String, Option<String>)> = sqlx::query_as(
@@ -11303,9 +11305,9 @@ async fn handle_group_booking(
     ) {
         Ok(emails) => emails,
         Err(e) => {
-            return render_booking_action_error(
+            return render_booking_action_error_in(
                 &state,
-                &headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-booking", None),
                 &e,
             )
@@ -11378,7 +11380,7 @@ async fn handle_group_booking(
         }
     };
     if let Err(e) = validate_date_not_too_far(date) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
     }
     let start_time = match NaiveTime::parse_from_str(&form.time, "%H:%M") {
         Ok(t) => t,
@@ -11547,9 +11549,9 @@ async fn handle_group_booking(
         .await
     {
         let _ = tx.rollback().await;
-        return render_booking_action_error_keys(
+        return render_booking_action_error_keys_in(
             &state,
-            &headers,
+            lang,
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
@@ -11600,7 +11602,7 @@ async fn handle_group_booking(
     ) {
         Ok(value) => value,
         Err((title, message)) => {
-            return render_booking_action_error(&state, &headers, &title, &message);
+            return render_booking_action_error_in(&state, lang, &title, &message);
         }
     };
 
@@ -11792,7 +11794,13 @@ async fn handle_group_booking(
         let host_recipients = if is_collective {
             member_contacts
                 .iter()
-                .map(|(_, name, email, language)| (name.clone(), email.clone(), language.clone()))
+                .map(|(_, name, email, language)| {
+                    (
+                        name.clone(),
+                        email.clone(),
+                        crate::email::supported_language(language.clone()),
+                    )
+                })
                 .collect()
         } else {
             vec![(
@@ -11884,7 +11892,7 @@ async fn redirect_user_profile_trailing_slash(uri: axum::http::Uri) -> Redirect 
 
 async fn user_profile(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path(username): Path<String>,
 ) -> impl IntoResponse {
     let user: Option<(
@@ -11893,25 +11901,28 @@ async fn user_profile(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        String,
     )> = sqlx::query_as(
-        "SELECT id, name, title, bio, avatar_path FROM users WHERE username = ? AND enabled = 1",
+        "SELECT id, name, title, bio, avatar_path, language, public_page_language FROM users WHERE username = ? AND enabled = 1",
     )
     .bind(&username)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
 
-    let (user_id, user_name, user_title, user_bio, avatar_path) = match user {
-        Some(u) => u,
-        None => {
-            return Html(crate::i18n::translate(
-                crate::i18n::detect_from_headers(&headers),
-                "error-user-not-found",
-                None,
-            ))
-        }
-    };
-    let lang = user_page_lang(&state.pool, &username, &headers).await;
+    let (user_id, user_name, user_title, user_bio, avatar_path, host_language, page_mode) =
+        match user {
+            Some(u) => u,
+            None => {
+                return Html(crate::i18n::translate(
+                    visitor.lang,
+                    "error-user-not-found",
+                    None,
+                ))
+            }
+        };
+    let lang = user_page_lang(host_language.as_deref(), &page_mode, visitor.lang);
 
     let event_types: Vec<(String, String, Option<String>, i32)> = sqlx::query_as(
         "SELECT et.slug, et.title, et.description, et.duration_min
@@ -11959,18 +11970,17 @@ async fn user_profile(
 
 async fn show_dynamic_group_slots(
     state: &AppState,
-    headers: &HeaderMap,
+    lang: &'static str,
     combined_username: &str,
     slug: &str,
     query: &SlotsQuery,
 ) -> Html<String> {
-    let lang = crate::i18n::detect_from_headers(headers);
     let usernames = match parse_dynamic_group_usernames(combined_username, lang) {
         Ok(u) => u,
         Err(e) => {
-            return render_booking_action_error_html(
+            return render_booking_action_error_html_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-link", None),
                 &e,
             )
@@ -11979,9 +11989,9 @@ async fn show_dynamic_group_slots(
     let dg_users = match validate_dynamic_group_users(&state.pool, &usernames, lang).await {
         Ok(u) => u,
         Err(e) => {
-            return render_booking_action_error_html(
+            return render_booking_action_error_html_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-link", None),
                 &e,
             )
@@ -12041,7 +12051,7 @@ async fn show_dynamic_group_slots(
     }
 
     if let Some(html) =
-        dynamic_group_google_meet_error_page(state, headers, &loc_type, &owner_user_id).await
+        dynamic_group_google_meet_error_page(state, lang, &loc_type, &owner_user_id).await
     {
         return html;
     }
@@ -12213,18 +12223,17 @@ async fn show_dynamic_group_slots(
 
 async fn show_dynamic_group_book_form(
     state: &AppState,
-    headers: &HeaderMap,
+    lang: &'static str,
     combined_username: &str,
     slug: &str,
     query: &BookQuery,
 ) -> Html<String> {
-    let lang = crate::i18n::detect_from_headers(headers);
     let usernames = match parse_dynamic_group_usernames(combined_username, lang) {
         Ok(u) => u,
         Err(e) => {
-            return render_booking_action_error_html(
+            return render_booking_action_error_html_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-link", None),
                 &e,
             )
@@ -12233,9 +12242,9 @@ async fn show_dynamic_group_book_form(
     let dg_users = match validate_dynamic_group_users(&state.pool, &usernames, lang).await {
         Ok(u) => u,
         Err(e) => {
-            return render_booking_action_error_html(
+            return render_booking_action_error_html_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-link", None),
                 &e,
             )
@@ -12287,7 +12296,7 @@ async fn show_dynamic_group_book_form(
     }
 
     if let Some(html) =
-        dynamic_group_google_meet_error_page(state, headers, &loc_type, &dg_users[0].0).await
+        dynamic_group_google_meet_error_page(state, lang, &loc_type, &dg_users[0].0).await
     {
         return html;
     }
@@ -12379,11 +12388,11 @@ async fn handle_dynamic_group_booking(
     slug: &str,
     form: &BookForm,
 ) -> Response {
-    let lang = crate::i18n::detect_from_headers(headers);
     // Rate limit by IP
     let client_ip = client_ip_for_rate_limit(headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
+        let lang = crate::auth::visitor_lang(&state.pool, headers).await;
         return Html(crate::i18n::translate(
             lang,
             "error-too-many-bookings",
@@ -12392,16 +12401,18 @@ async fn handle_dynamic_group_booking(
         .into_response();
     }
 
+    // Past the gates: the visitor's language, as the GET form computed it.
+    let lang = crate::auth::visitor_lang(&state.pool, headers).await;
     if let Err(e) = validate_booking_input(&form.name, &form.email, &form.notes) {
-        return render_booking_action_error_keys(state, headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(state, lang, "bae-title-invalid-booking", e);
     }
 
     let usernames = match parse_dynamic_group_usernames(combined_username, lang) {
         Ok(u) => u,
         Err(e) => {
-            return render_booking_action_error(
+            return render_booking_action_error_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-link", None),
                 &e,
             )
@@ -12410,9 +12421,9 @@ async fn handle_dynamic_group_booking(
     let dg_users = match validate_dynamic_group_users(&state.pool, &usernames, lang).await {
         Ok(u) => u,
         Err(e) => {
-            return render_booking_action_error(
+            return render_booking_action_error_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-link", None),
                 &e,
             )
@@ -12475,7 +12486,7 @@ async fn handle_dynamic_group_booking(
     {
         let title = crate::i18n::translate(lang, "google-meet-unavailable-title", None);
         let message = crate::i18n::translate(lang, "google-meet-dynamic-group-unavailable", None);
-        return render_booking_action_error(state, headers, &title, &message);
+        return render_booking_action_error_in(state, lang, &title, &message);
     }
 
     let needs_approval = requires_confirmation != 0;
@@ -12489,9 +12500,9 @@ async fn handle_dynamic_group_booking(
     ) {
         Ok(emails) => emails,
         Err(e) => {
-            return render_booking_action_error(
+            return render_booking_action_error_in(
                 state,
-                headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-booking", None),
                 &e,
             )
@@ -12505,7 +12516,7 @@ async fn handle_dynamic_group_booking(
         }
     };
     if let Err(e) = validate_date_not_too_far(date) {
-        return render_booking_action_error_keys(state, headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(state, lang, "bae-title-invalid-booking", e);
     }
     let start_time = match NaiveTime::parse_from_str(&form.time, "%H:%M") {
         Ok(t) => t,
@@ -12583,9 +12594,9 @@ async fn handle_dynamic_group_booking(
     // single assignee on the booking, so per-member caps fall back to
     // event-type-wide here.
     if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, None).await {
-        return render_booking_action_error_keys(
+        return render_booking_action_error_keys_in(
             state,
-            headers,
+            lang,
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
@@ -12658,7 +12669,7 @@ async fn handle_dynamic_group_booking(
     ) {
         Ok(value) => value,
         Err((title, message)) => {
-            return render_booking_action_error(state, headers, &title, &message);
+            return render_booking_action_error_in(state, lang, &title, &message);
         }
     };
 
@@ -12885,15 +12896,36 @@ async fn handle_dynamic_group_booking(
 // --- User-scoped booking handlers ---
 
 /// Language of a host's public pages under `/u/{username}`: the profile,
-/// slots, booking form, and the booking POST with the page it answers with.
-/// GET and POST both call this, so `bookings.language` (the page language,
-/// #209) always matches what the guest saw.
+/// slots, booking form, and the booking POST with every page it answers
+/// with. GET and POST both call this with the host's `users.language` and
+/// `users.public_page_language` (selected by the queries they already run),
+/// so `bookings.language` (the page language, #209) always matches what the
+/// guest saw.
 ///
-/// `users.public_page_language` picks the rule: 'visitor' (the default) uses
-/// the visitor's browser language, exactly as team and legacy pages do;
-/// 'host' uses the host's saved language (#76), falling back to the
-/// visitor's when the host has none.
-async fn user_page_lang(pool: &SqlitePool, username: &str, headers: &HeaderMap) -> &'static str {
+/// 'visitor' (the default) gives `visitor`, the rule every public guest page
+/// uses (`auth::visitor_lang_for`); 'host' gives the host's saved language
+/// (#76), or `visitor` when the host has none.
+fn user_page_lang(host_language: Option<&str>, mode: &str, visitor: &'static str) -> &'static str {
+    if normalize_public_page_language(mode) == Some("host") {
+        if let Some(code) = host_language.and_then(crate::i18n::supported_code) {
+            return code;
+        }
+    }
+    visitor
+}
+
+/// [`user_page_lang`] from scratch, for the error pages the `/u/` booking
+/// POST may have to show before its own queries run (a failed captcha, the
+/// rate limit). Only those failure paths pay for this lookup.
+async fn user_page_lang_lookup(
+    pool: &SqlitePool,
+    username: &str,
+    headers: &HeaderMap,
+) -> &'static str {
+    let visitor = crate::auth::visitor_lang(pool, headers).await;
+    if username.contains('+') {
+        return visitor;
+    }
     let row: Option<(Option<String>, String)> = sqlx::query_as(
         "SELECT language, public_page_language FROM users WHERE username = ? AND enabled = 1",
     )
@@ -12902,16 +12934,14 @@ async fn user_page_lang(pool: &SqlitePool, username: &str, headers: &HeaderMap) 
     .await
     .unwrap_or(None);
     match row {
-        Some((host_language, mode)) if mode == "host" => {
-            crate::i18n::resolve(host_language.as_deref().map(str::trim), headers)
-        }
-        _ => crate::i18n::detect_from_headers(headers),
+        Some((host_language, mode)) => user_page_lang(host_language.as_deref(), &mode, visitor),
+        None => visitor,
     }
 }
 
 async fn show_slots_for_user(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<SlotsQuery>,
 ) -> Response {
@@ -12921,32 +12951,40 @@ async fn show_slots_for_user(
     // render with full chrome and don't autosize. The embed generator only
     // produces single-user/team links.
     if username.contains('+') {
-        return show_dynamic_group_slots(&state, &headers, &username, &slug, &query)
+        return show_dynamic_group_slots(&state, visitor.lang, &username, &slug, &query)
             .await
             .into_response();
     }
 
-    let user: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, name, title, avatar_path FROM users WHERE username = ? AND enabled = 1",
+    let user: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, name, title, avatar_path, language, public_page_language FROM users WHERE username = ? AND enabled = 1",
     )
     .bind(&username)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
 
-    let (host_user_id, host_name, host_title, host_avatar_path) = match user {
-        Some(user) => user,
-        None => {
-            return Html(crate::i18n::translate(
-                crate::i18n::detect_from_headers(&headers),
-                "error-user-not-found",
-                None,
-            ))
-            .into_response()
-        }
-    };
+    let (host_user_id, host_name, host_title, host_avatar_path, host_language, page_mode) =
+        match user {
+            Some(user) => user,
+            None => {
+                return Html(crate::i18n::translate(
+                    visitor.lang,
+                    "error-user-not-found",
+                    None,
+                ))
+                .into_response()
+            }
+        };
 
-    let lang = user_page_lang(&state.pool, &username, &headers).await;
+    let lang = user_page_lang(host_language.as_deref(), &page_mode, visitor.lang);
 
     let et: Option<(String, String, String, Option<String>, i32, i32, i32, i32, String, Option<String>, String, String)> = sqlx::query_as(
         "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.location_type, et.location_value, et.visibility, et.default_calendar_view
@@ -13154,19 +13192,19 @@ async fn show_slots_for_user(
 
 async fn show_book_form_for_user(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<BookQuery>,
 ) -> Response {
     let embed = query.embed_params();
     if username.contains('+') {
-        return show_dynamic_group_book_form(&state, &headers, &username, &slug, &query)
+        return show_dynamic_group_book_form(&state, visitor.lang, &username, &slug, &query)
             .await
             .into_response();
     }
 
-    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, String)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, et.sms_phone_mode
+    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, et.sms_phone_mode, u.language, u.public_page_language
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -13189,11 +13227,13 @@ async fn show_book_form_for_user(
         visibility,
         max_additional_guests,
         sms_phone_mode,
+        host_language,
+        page_mode,
     ) = match et {
         Some(e) => e,
         None => {
             return Html(crate::i18n::translate(
-                crate::i18n::detect_from_headers(&headers),
+                visitor.lang,
                 "error-event-type-not-found",
                 None,
             ))
@@ -13201,7 +13241,7 @@ async fn show_book_form_for_user(
         }
     };
 
-    let lang = user_page_lang(&state.pool, &username, &headers).await;
+    let lang = user_page_lang(host_language.as_deref(), &page_mode, visitor.lang);
 
     // Validate invite token for private event types
     let invite_guest_name;
@@ -13353,9 +13393,10 @@ async fn handle_booking_for_user(
         .is_err()
     {
         tracing::warn!("captcha failed on user booking");
-        return render_booking_action_error_keys(
+        let lang = user_page_lang_lookup(&state.pool, &username, &headers).await;
+        return render_booking_action_error_keys_in(
             &state,
-            &headers,
+            lang,
             "bae-title-captcha",
             "bae-body-go-back",
         );
@@ -13370,20 +13411,21 @@ async fn handle_booking_for_user(
     let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
+        let lang = user_page_lang_lookup(&state.pool, &username, &headers).await;
         return Html(crate::i18n::translate(
-            crate::i18n::detect_from_headers(&headers),
+            lang,
             "error-too-many-bookings",
             None,
         ))
         .into_response();
     }
 
-    if let Err(e) = validate_booking_input(&form.name, &form.email, &form.notes) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
-    }
+    // Past the gates: the visitor's own language, then this host's page
+    // language from the row below, as the GET form computed it.
+    let visitor = crate::auth::visitor_lang(&state.pool, &headers).await;
 
-    let et: Option<(String, String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, Option<String>, String)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, u.id, et.reminder_minutes, et.visibility, et.max_additional_guests, u.language, et.sms_phone_mode
+    let et: Option<(String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT et.id, et.title, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, u.id, et.reminder_minutes, et.visibility, et.max_additional_guests, u.language, et.sms_phone_mode, u.public_page_language
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -13397,7 +13439,6 @@ async fn handle_booking_for_user(
 
     let (
         et_id,
-        _et_slug,
         et_title,
         duration,
         buffer_before,
@@ -13412,11 +13453,12 @@ async fn handle_booking_for_user(
         max_additional_guests,
         user_lang,
         sms_phone_mode,
+        page_mode,
     ) = match et {
         Some(e) => e,
         None => {
             return Html(crate::i18n::translate(
-                crate::i18n::detect_from_headers(&headers),
+                visitor,
                 "error-event-type-not-found",
                 None,
             ))
@@ -13424,7 +13466,11 @@ async fn handle_booking_for_user(
         }
     };
 
-    let lang = user_page_lang(&state.pool, &username, &headers).await;
+    let lang = user_page_lang(user_lang.as_deref(), &page_mode, visitor);
+
+    if let Err(e) = validate_booking_input(&form.name, &form.email, &form.notes) {
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
+    }
     let needs_approval = requires_confirmation != 0;
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
     let phone_to_store = match resolve_guest_phone(
@@ -13435,7 +13481,7 @@ async fn handle_booking_for_user(
     ) {
         Ok(value) => value,
         Err((title, message)) => {
-            return render_booking_action_error(&state, &headers, &title, &message);
+            return render_booking_action_error_in(&state, lang, &title, &message);
         }
     };
 
@@ -13448,9 +13494,9 @@ async fn handle_booking_for_user(
     ) {
         Ok(emails) => emails,
         Err(e) => {
-            return render_booking_action_error(
+            return render_booking_action_error_in(
                 &state,
-                &headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-booking", None),
                 &e,
             )
@@ -13502,7 +13548,7 @@ async fn handle_booking_for_user(
         }
     };
     if let Err(e) = validate_date_not_too_far(date) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
     }
     let start_time = match NaiveTime::parse_from_str(&form.time, "%H:%M") {
         Ok(t) => t,
@@ -13598,9 +13644,9 @@ async fn handle_booking_for_user(
     // team assignee, so per-member caps degrade to event-type-wide here.
     if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, None).await {
         let _ = tx.rollback().await;
-        return render_booking_action_error_keys(
+        return render_booking_action_error_keys_in(
             &state,
-            &headers,
+            lang,
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
@@ -13774,7 +13820,7 @@ async fn handle_booking_for_user(
             additional_attendees: additional_attendees.clone(),
             guest_language: Some(lang.to_string()),
             // Selected with the event type: the host's saved language.
-            host_language: user_lang.clone(),
+            host_language: crate::email::supported_language(user_lang.clone()),
             host_timezone: host_tz.name().to_string(),
             resource_name: booking_resource_label(&state.pool, &uid).await,
         };
@@ -15628,11 +15674,12 @@ async fn get_custom_colors(pool: &SqlitePool) -> (String, String, String, String
 
 async fn show_slots(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path(slug): Path<String>,
     Query(query): Query<SlotsQuery>,
 ) -> impl IntoResponse {
-    let lang = crate::i18n::detect_from_headers(&headers);
+    // The visitor rule, as the booking POST uses.
+    let lang = visitor.lang;
     let et: Option<(String, String, String, Option<String>, i32, i32, i32, i32, String, String)> = sqlx::query_as(
         "SELECT id, slug, title, description, duration_min, buffer_before, buffer_after, min_notice_min, visibility, default_calendar_view
          FROM event_types WHERE slug = ? AND enabled = 1",
@@ -15822,11 +15869,12 @@ impl BookQuery {
 
 async fn show_book_form(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path(slug): Path<String>,
     Query(query): Query<BookQuery>,
 ) -> impl IntoResponse {
-    let lang = crate::i18n::detect_from_headers(&headers);
+    // The visitor rule, as the booking POST uses.
+    let lang = visitor.lang;
     let et: Option<(String, String, String, Option<String>, i32, i32, String, bool)> = sqlx::query_as(
         "SELECT id, slug, title, description, duration_min, max_additional_guests, visibility, sms_phone_mode
          FROM event_types WHERE slug = ? AND enabled = 1",
@@ -16177,16 +16225,16 @@ async fn handle_booking(
     if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
         return resp;
     }
-    let lang = crate::i18n::detect_from_headers(&headers);
     let captcha_cfg = state.captcha_config.read().await;
     if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
         .await
         .is_err()
     {
         tracing::warn!("captcha failed on booking");
-        return render_booking_action_error_keys(
+        let lang = crate::auth::visitor_lang(&state.pool, &headers).await;
+        return render_booking_action_error_keys_in(
             &state,
-            &headers,
+            lang,
             "bae-title-captcha",
             "bae-body-go-back",
         );
@@ -16196,6 +16244,7 @@ async fn handle_booking(
     let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         tracing::warn!(ip = %client_ip, "rate limited");
+        let lang = crate::auth::visitor_lang(&state.pool, &headers).await;
         return Html(crate::i18n::translate(
             lang,
             "error-too-many-bookings",
@@ -16204,8 +16253,11 @@ async fn handle_booking(
         .into_response();
     }
 
+    // Past the gates: the visitor's language, as the GET form computed it.
+    let lang = crate::auth::visitor_lang(&state.pool, &headers).await;
+
     if let Err(e) = validate_booking_input(&form.name, &form.email, &form.notes) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
     }
 
     #[allow(clippy::type_complexity)]
@@ -16271,7 +16323,7 @@ async fn handle_booking(
     ) {
         Ok(value) => value,
         Err((title, message)) => {
-            return render_booking_action_error(&state, &headers, &title, &message);
+            return render_booking_action_error_in(&state, lang, &title, &message);
         }
     };
 
@@ -16289,9 +16341,9 @@ async fn handle_booking(
     ) {
         Ok(emails) => emails,
         Err(e) => {
-            return render_booking_action_error(
+            return render_booking_action_error_in(
                 &state,
-                &headers,
+                lang,
                 &crate::i18n::translate(lang, "bae-title-invalid-booking", None),
                 &e,
             )
@@ -16315,7 +16367,7 @@ async fn handle_booking(
         }
     };
     if let Err(e) = validate_date_not_too_far(date) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
     }
     let start_time = match NaiveTime::parse_from_str(&form.time, "%H:%M") {
         Ok(t) => t,
@@ -16415,9 +16467,9 @@ async fn handle_booking(
     // team assignee, so per-member caps degrade to event-type-wide here.
     if would_exceed_frequency_limit(&state.pool, &et_id, slot_start, None).await {
         let _ = tx.rollback().await;
-        return render_booking_action_error_keys(
+        return render_booking_action_error_keys_in(
             &state,
-            &headers,
+            lang,
             "bae-title-unavailable",
             "bae-body-unavailable",
         );
@@ -20374,8 +20426,9 @@ async fn approve_booking_by_token(
                 user_id = %user_id,
                 "could not resolve the booking's host identity; falling back to the event type owner"
             );
-            let (_, email, language) = host_contact(&state.pool, &user_id).await;
-            (host_name, email, language)
+            host_contact(&state.pool, &user_id)
+                .await
+                .unwrap_or((host_name, String::new(), None))
         }
     };
 
@@ -20920,14 +20973,23 @@ async fn booking_ics(
         .into_response()
 }
 
+/// Language of a guest token page (cancel, reschedule, pick a new time): the
+/// language stored with the booking, so the page agrees with the emails the
+/// guest gets about it (#209); the visitor rule for bookings made before the
+/// column existed, or when the token matches no booking.
+fn token_page_lang(stored: Option<&str>, visitor: &'static str) -> &'static str {
+    stored
+        .and_then(crate::i18n::supported_code)
+        .unwrap_or(visitor)
+}
+
 async fn guest_cancel_form(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path(token): Path<String>,
 ) -> impl IntoResponse {
-    let lang = crate::i18n::detect_from_headers(&headers);
-    let booking: Option<(String, String, String, String, String, String)> = sqlx::query_as(
-        "SELECT b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, u.name
+    let booking: Option<(String, String, String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, u.name, b.language
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -20939,33 +21001,40 @@ async fn guest_cancel_form(
     .await
     .unwrap_or(None);
 
-    let (guest_name, _guest_email, start_at, end_at, event_title, host_name) = match booking {
-        Some(b) => b,
-        None => {
-            // Check if already cancelled
-            let status_row: Option<(String,)> =
-                sqlx::query_as("SELECT status FROM bookings WHERE cancel_token = ?")
-                    .bind(&token)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .unwrap_or(None);
+    let (guest_name, _guest_email, start_at, end_at, event_title, host_name, booking_language) =
+        match booking {
+            Some(b) => b,
+            None => {
+                // Check if already cancelled
+                let status_row: Option<(String, Option<String>)> =
+                    sqlx::query_as("SELECT status, language FROM bookings WHERE cancel_token = ?")
+                        .bind(&token)
+                        .fetch_optional(&state.pool)
+                        .await
+                        .unwrap_or(None);
 
-            let (title_key, message_key) = match status_row {
-                Some((status,)) if status == "cancelled" => {
-                    ("bae-title-already-cancelled", "bae-body-already-cancelled")
-                }
-                Some((status,)) if status == "declined" => {
-                    ("bae-title-booking-declined", "bae-body-declined-by-host")
-                }
-                _ => (
-                    "bae-title-invalid-link",
-                    "bae-body-cancel-link-invalid-short",
-                ),
-            };
+                let lang = token_page_lang(
+                    status_row.as_ref().and_then(|(_, l)| l.as_deref()),
+                    visitor.lang,
+                );
+                let (title_key, message_key) = match status_row {
+                    Some((status, _)) if status == "cancelled" => {
+                        ("bae-title-already-cancelled", "bae-body-already-cancelled")
+                    }
+                    Some((status, _)) if status == "declined" => {
+                        ("bae-title-booking-declined", "bae-body-declined-by-host")
+                    }
+                    _ => (
+                        "bae-title-invalid-link",
+                        "bae-body-cancel-link-invalid-short",
+                    ),
+                };
 
-            return render_booking_action_error_keys(&state, &headers, title_key, message_key);
-        }
-    };
+                return render_booking_action_error_keys_in(&state, lang, title_key, message_key);
+            }
+        };
+
+    let lang = token_page_lang(booking_language.as_deref(), visitor.lang);
 
     // Block the GET form before any state mutation if the booking falls
     // inside the host's configured cancel-notice window.
@@ -21010,6 +21079,7 @@ async fn guest_cancel_form(
 
 async fn guest_cancel_booking(
     State(state): State<Arc<AppState>>,
+    visitor: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path(token): Path<String>,
     Form(form): Form<CancelForm>,
@@ -21017,11 +21087,10 @@ async fn guest_cancel_booking(
     if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
         return resp;
     }
-    let lang = crate::i18n::detect_from_headers(&headers);
     #[allow(clippy::type_complexity)]
-    let booking: Option<(String, String, String, String, String, String, String, String, String, String, String, Option<String>, String, Option<String>)> =
+    let booking: Option<(String, String, String, String, String, String, String, String, String, String, String, Option<String>, String, Option<String>, Option<String>)> =
         sqlx::query_as(
-            "SELECT b.id, b.uid, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, u.name, COALESCE(u.booking_email, u.email), COALESCE(b.guest_timezone, 'UTC'), et.id, b.guest_phone, et.sms_phone_mode, u.language
+            "SELECT b.id, b.uid, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, u.name, COALESCE(u.booking_email, u.email), COALESCE(b.guest_timezone, 'UTC'), et.id, b.guest_phone, et.sms_phone_mode, u.language, b.language
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -21048,17 +21117,21 @@ async fn guest_cancel_booking(
         guest_phone,
         sms_phone_mode,
         host_language,
+        booking_language,
     ) = match booking {
         Some(b) => b,
         None => {
-            return render_booking_action_error_keys(
+            return render_booking_action_error_keys_in(
                 &state,
-                &headers,
+                visitor.lang,
                 "bae-title-invalid-link",
                 "bae-body-cancel-link-invalid",
             );
         }
     };
+
+    // The page and the emails both use the language the guest booked in.
+    let lang = token_page_lang(booking_language.as_deref(), visitor.lang);
 
     // Defensive notice-window check on POST too: the GET may have been
     // cached, or the cutoff may have rolled over between page load and
@@ -21102,7 +21175,7 @@ async fn guest_cancel_booking(
             }
             _ => ("bae-title-already-cancelled", "bae-body-already-cancelled"),
         };
-        return render_booking_action_error_keys(&state, &headers, title_key, message_key);
+        return render_booking_action_error_keys_in(&state, lang, title_key, message_key);
     }
 
     tracing::info!(booking_id = %bid, "booking cancelled by guest");
@@ -21132,11 +21205,8 @@ async fn guest_cancel_booking(
     let reason = form.reason.filter(|r| !r.trim().is_empty());
 
     // The language the guest booked in, as every other guest email uses,
-    // not the browser this cancel happens to come from (#209). Bookings
-    // made before the column existed fall back to the cancel page's.
-    let guest_language = crate::email::stored_booking_language(&state.pool, &bid)
-        .await
-        .or_else(|| Some(lang.to_string()));
+    // not the browser this cancel happens to come from (#209): the page's.
+    let guest_language = Some(lang.to_string());
 
     // Built before the SMTP block so the SMS path can borrow the same strings.
     let details = crate::email::CancellationDetails {
@@ -21154,7 +21224,7 @@ async fn guest_cancel_booking(
         reason: reason.clone(),
         cancelled_by_host: false,
         guest_language,
-        host_language,
+        host_language: crate::email::supported_language(host_language),
         host_timezone: stored_tz.name().to_string(),
     };
 
@@ -21238,14 +21308,13 @@ struct RescheduleForm {
 /// Guest reschedule: show slot picker or confirmation page
 async fn guest_reschedule_slots(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    visitor: crate::auth::OptionalAuthUser,
     Path(token): Path<String>,
     Query(query): Query<RescheduleQuery>,
 ) -> impl IntoResponse {
-    let lang = crate::i18n::detect_from_headers(&headers);
     // Look up booking by reschedule_token
-    let booking: Option<(String, String, String, String, String, String)> = sqlx::query_as(
-        "SELECT b.id, b.guest_name, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.event_type_id, b.uid
+    let booking: Option<(String, String, String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT b.id, b.guest_name, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.event_type_id, b.uid, b.language
              FROM bookings b
              WHERE b.reschedule_token = ? AND b.status IN ('confirmed', 'pending')",
     )
@@ -21254,17 +21323,20 @@ async fn guest_reschedule_slots(
     .await
     .unwrap_or(None);
 
-    let (booking_id, _guest_name, start_at, end_at, et_id_raw, uid) = match booking {
-        Some(b) => b,
-        None => {
-            return render_booking_action_error_keys(
-                &state,
-                &headers,
-                "bae-title-invalid-link",
-                "bae-body-reschedule-link-invalid",
-            );
-        }
-    };
+    let (booking_id, _guest_name, start_at, end_at, et_id_raw, uid, booking_language) =
+        match booking {
+            Some(b) => b,
+            None => {
+                return render_booking_action_error_keys_in(
+                    &state,
+                    visitor.lang,
+                    "bae-title-invalid-link",
+                    "bae-body-reschedule-link-invalid",
+                );
+            }
+        };
+
+    let lang = token_page_lang(booking_language.as_deref(), visitor.lang);
 
     // Block the slot picker before any costly work (CalDAV sync, slot
     // computation, template render) if the booking falls inside the host's
@@ -21573,12 +21645,11 @@ async fn guest_reschedule_booking(
     if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
         return resp;
     }
-    let lang = crate::i18n::detect_from_headers(&headers);
     // Rate limit
     let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
         return Html(crate::i18n::translate(
-            lang,
+            crate::auth::visitor_lang(&state.pool, &headers).await,
             "error-too-many-requests",
             None,
         ))
@@ -21639,14 +21710,23 @@ async fn guest_reschedule_booking(
     ) = match booking {
         Some(b) => b,
         None => {
-            return render_booking_action_error_keys(
+            return render_booking_action_error_keys_in(
                 &state,
-                &headers,
+                crate::auth::visitor_lang(&state.pool, &headers).await,
                 "bae-title-invalid-link",
                 "bae-body-reschedule-link-invalid",
             );
         }
     };
+
+    // Past the rate limit: the page and every email use the language stored
+    // with the booking, as the slot picker did (#209).
+    let lang = token_page_lang(
+        crate::email::stored_booking_language(&state.pool, &booking_id)
+            .await
+            .as_deref(),
+        crate::auth::visitor_lang(&state.pool, &headers).await,
+    );
 
     // Defensive notice-window check on POST too: the GET may have been
     // cached, or the cutoff may have rolled over between page load and
@@ -21683,7 +21763,7 @@ async fn guest_reschedule_booking(
         }
     };
     if let Err(e) = validate_date_not_too_far(date) {
-        return render_booking_action_error_keys(&state, &headers, "bae-title-invalid-booking", e);
+        return render_booking_action_error_keys_in(&state, lang, "bae-title-invalid-booking", e);
     }
     let start_time = match NaiveTime::parse_from_str(&form.time, "%H:%M") {
         Ok(t) => t,
@@ -21931,13 +22011,14 @@ async fn guest_reschedule_booking(
                 user_id = %host_user_id,
                 "could not resolve the booking's host identity; falling back to the event type owner"
             );
-            let (_, email, language) = host_contact(&state.pool, &host_user_id).await;
-            (host_name, email, language)
+            host_contact(&state.pool, &host_user_id).await.unwrap_or((
+                host_name,
+                String::new(),
+                None,
+            ))
         }
     };
-    let booking_language = crate::email::stored_booking_language(&state.pool, &booking_id)
-        .await
-        .or_else(|| Some(lang.to_string()));
+    let booking_language = Some(lang.to_string());
 
     // Legacy values use the event-type timezone; new values are UTC. Convert into the
     // guest's tz so `RescheduleDetails` carries guest-local wall-clock for
@@ -22500,30 +22581,25 @@ async fn booking_host_identity(
         }
     }
 
-    let host_id = assigned.or(owner_id)?;
-    let (name, email, language): (String, String, Option<String>) = sqlx::query_as(
-        "SELECT name, COALESCE(booking_email, email), language FROM users WHERE id = ?",
-    )
-    .bind(&host_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()?;
-    Some((name, email, crate::email::supported_language(language)))
+    host_contact(pool, &assigned.or(owner_id)?).await
 }
 
-/// Name, booking address and saved language of one user, for the fallbacks
-/// when `booking_host_identity` cannot resolve a booking's host.
-async fn host_contact(pool: &SqlitePool, user_id: &str) -> (String, String, Option<String>) {
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+/// Name, booking address and normalised saved language of one user: the
+/// single query behind `booking_host_identity`'s non-collective case and the
+/// fallbacks its callers take when it resolves nothing.
+async fn host_contact(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Option<(String, String, Option<String>)> {
+    let (name, email, language): (String, String, Option<String>) = sqlx::query_as(
         "SELECT name, COALESCE(booking_email, email), language FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await
-    .unwrap_or(None);
-    let (name, email, language) = row.unwrap_or_default();
-    (name, email, crate::email::supported_language(language))
+    .ok()
+    .flatten()?;
+    Some((name, email, crate::email::supported_language(language)))
 }
 
 /// Eligible members of the collective team booking identified by `booking_uid`.
@@ -24312,10 +24388,26 @@ fn render_booking_action_error_keys(
     title_key: &str,
     message_key: &str,
 ) -> axum::response::Response {
-    let lang = crate::i18n::detect_from_headers(headers);
-    render_booking_action_error(
+    render_booking_action_error_keys_in(
         state,
-        headers,
+        crate::i18n::detect_from_headers(headers),
+        title_key,
+        message_key,
+    )
+}
+
+/// [`render_booking_action_error_keys`] in a given language: the booking
+/// POSTs and the guest token pages answer in the language of the page the
+/// guest came from, which is not always the browser's.
+fn render_booking_action_error_keys_in(
+    state: &AppState,
+    lang: &str,
+    title_key: &str,
+    message_key: &str,
+) -> axum::response::Response {
+    render_booking_action_error_in(
+        state,
+        lang,
         &crate::i18n::translate(lang, title_key, None),
         &crate::i18n::translate(lang, message_key, None),
     )
@@ -24330,6 +24422,16 @@ fn render_booking_action_error(
     render_booking_action_error_html(state, headers, title, message).into_response()
 }
 
+/// [`render_booking_action_error`] in a given language.
+fn render_booking_action_error_in(
+    state: &AppState,
+    lang: &str,
+    title: &str,
+    message: &str,
+) -> axum::response::Response {
+    render_booking_action_error_html_in(state, lang, title, message).into_response()
+}
+
 /// Same page as `render_booking_action_error`, for handlers whose signature is
 /// `Html<String>` rather than `Response`.
 fn render_booking_action_error_html(
@@ -24338,7 +24440,21 @@ fn render_booking_action_error_html(
     title: &str,
     message: &str,
 ) -> Html<String> {
-    let lang = crate::i18n::detect_from_headers(headers);
+    render_booking_action_error_html_in(
+        state,
+        crate::i18n::detect_from_headers(headers),
+        title,
+        message,
+    )
+}
+
+/// [`render_booking_action_error_html`] in a given language.
+fn render_booking_action_error_html_in(
+    state: &AppState,
+    lang: &str,
+    title: &str,
+    message: &str,
+) -> Html<String> {
     let tmpl = match state.templates.get_template("booking_action_error.html") {
         Ok(t) => t,
         Err(e) => return internal_error_html("internal", &e),
@@ -35498,6 +35614,9 @@ mod tests {
             "render_booking_action_error(",
             "render_booking_action_error_html(",
             "render_booking_action_error_keys(",
+            "render_booking_action_error_in(",
+            "render_booking_action_error_html_in(",
+            "render_booking_action_error_keys_in(",
         ];
 
         let src = std::fs::read_to_string("src/web/mod.rs").expect("read source");
@@ -37583,14 +37702,33 @@ mod tests {
         );
     }
 
-    /// Pages that follow the browser (team, legacy) store the browser's
-    /// language, even when a logged-in host with a saved preference books
-    /// on a client's behalf from that browser.
+    /// Pages on the visitor rule (team, legacy) store the visitor's
+    /// language: the browser's for an anonymous guest, and a logged-in
+    /// visitor's own saved preference over it.
     #[tokio::test]
-    async fn browser_language_page_stores_the_browser_language() {
+    async fn visitor_rule_page_stores_the_visitor_language() {
         let _env = crate::test_support::ENV_LOCK.lock().await;
         let (app, pool, session, _) = setup_test_app().await;
         set_user_language(&pool, "test@example.com", "fr").await;
+
+        let csrf = "csrf-page-lang-anon";
+        app.clone()
+            .oneshot(book_request(
+                "/test-meeting/book",
+                csrf,
+                "",
+                "en-US,en;q=0.9",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_language(&pool, "guest@test.com").await.as_deref(),
+            Some("en")
+        );
+        sqlx::query("DELETE FROM bookings")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let csrf = "csrf-page-lang-en";
         let response = app
@@ -37605,12 +37743,13 @@ mod tests {
         assert!(response.status() == 200 || response.status().is_redirection());
         assert_eq!(
             stored_language(&pool, "guest@test.com").await.as_deref(),
-            Some("en")
+            Some("fr")
         );
     }
 
-    /// A guest who booked in French and cancels from an English browser is
-    /// told in French: the stored booking language, like every guest email.
+    /// A guest who booked in French and cancels from an English browser sees
+    /// the cancel page in French and is told in French: the stored booking
+    /// language, like every guest email.
     #[tokio::test]
     async fn guest_cancel_emails_in_the_booking_language() {
         let _env = crate::test_support::ENV_LOCK.lock().await;
@@ -37633,6 +37772,18 @@ mod tests {
             .await
             .unwrap();
 
+        let page = body_string(
+            app.clone()
+                .oneshot(get_with_language(
+                    &format!("/booking/cancel/{}", cancel_tok),
+                    "en-US,en;q=0.9",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(page.contains("<html lang=\"fr\">"), "{page}");
+
         let csrf = "csrf-cancel-lang";
         let response = app
             .oneshot(
@@ -37648,11 +37799,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+        let done = body_string(response).await;
+        assert!(done.contains("<html lang=\"fr\">"), "{done}");
 
         let guest = mail_to(&mails, "guest@test.com").await;
         assert!(guest.contains("Bonjour Guest,"), "{guest}");
         assert!(guest.contains("<html lang=\"fr\">"), "{guest}");
         assert!(!guest.contains("Hi Guest"), "{guest}");
+    }
+
+    /// A logged-in visitor with a saved German preference and an English
+    /// browser sees every team page in German, and the booking stores 'de'.
+    #[tokio::test]
+    async fn logged_in_visitor_sees_team_pages_in_their_saved_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        seed_team_event_type(&pool).await;
+        let visitor = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled, language) VALUES (?, 'visitor@test.com', 'Visitor', 'user', 'local', 'visitor', 1, 'de')")
+            .bind(&visitor)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
+            .bind(&session)
+            .bind(&visitor)
+            .bind(
+                (Utc::now() + Duration::days(1))
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cookie = format!("__Host-calrs_session={}", session);
+
+        for uri in [
+            "/team/horizon-team".to_string(),
+            "/team/horizon-team/team-sync".to_string(),
+            format!(
+                "/team/horizon-team/team-sync/book?date={}&time=10:00",
+                far_future_monday()
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri(&uri)
+                .header("cookie", &cookie)
+                .header("accept-language", "en-US,en;q=0.9")
+                .body(Body::empty())
+                .unwrap();
+            let body = body_string(app.clone().oneshot(request).await.unwrap()).await;
+            assert!(body.contains("<html lang=\"de\">"), "{uri}: {body}");
+        }
+
+        let csrf = "csrf-team-visitor-de";
+        let response = app
+            .oneshot(book_request(
+                "/team/horizon-team/team-sync/book",
+                csrf,
+                &format!("; {}", cookie),
+                "en-US,en;q=0.9",
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+        assert_eq!(
+            stored_language(&pool, "guest@test.com").await.as_deref(),
+            Some("de")
+        );
+    }
+
+    /// On a host-language `/u/` page, a rejected booking answers fully in the
+    /// page's language, not the browser's.
+    #[tokio::test]
+    async fn host_mode_booking_error_page_uses_the_page_language() {
+        let (app, pool, _, _) = setup_test_app().await;
+        set_user_language(&pool, "test@example.com", "fr").await;
+        set_public_page_language(&pool, "host").await;
+
+        let csrf = "csrf-host-mode-error";
+        let body = format!(
+            "_csrf={}&date={}&time=10:00&name=Guest&email=not-an-email&tz=UTC",
+            csrf,
+            far_future_monday()
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/u/testuser/test-meeting/book")
+            .header("cookie", format!("__Host-calrs_csrf={}", csrf))
+            .header("accept-language", "en-US,en;q=0.9")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let page = body_string(app.oneshot(request).await.unwrap()).await;
+        assert!(page.contains("<html lang=\"fr\">"), "{page}");
+        assert!(page.contains("Détails de réservation invalides"), "{page}");
+        assert!(
+            page.contains("Veuillez saisir une adresse e-mail valide."),
+            "{page}"
+        );
+        assert!(!page.contains("Invalid booking details"), "{page}");
     }
 
     // --- Public booking page language setting ---

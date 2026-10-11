@@ -316,7 +316,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                         location: None,
                         reminder_minutes: None,
                         additional_attendees: vec![],
-                        host_language,
+                        host_language: crate::email::supported_language(host_language),
                         host_timezone: host_timezone.unwrap_or_default(),
                         ..Default::default()
                     };
@@ -514,7 +514,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                                     pool, &full_id,
                                 )
                                 .await,
-                                host_language,
+                                host_language: crate::email::supported_language(host_language),
                                 host_timezone: host_timezone.unwrap_or_default(),
                             };
 

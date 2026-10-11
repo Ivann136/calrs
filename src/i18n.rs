@@ -134,6 +134,17 @@ pub fn is_supported(code: &str) -> bool {
     SUPPORTED_LANGS.iter().any(|(c, _, _)| *c == code)
 }
 
+/// The bundled locale code for a stored value (trimmed), when calrs ships
+/// it. The `&'static str` lets a stored language stand in for one detected
+/// from a request.
+pub fn supported_code(code: &str) -> Option<&'static str> {
+    let code = code.trim();
+    SUPPORTED_LANGS
+        .iter()
+        .find(|(c, _, _)| *c == code)
+        .map(|(c, _, _)| *c)
+}
+
 /// Resolve the language to use for rendering. The user's saved preference
 /// (when set and supported) wins over `Accept-Language`. Pass `None` for
 /// `user_pref` to skip straight to header detection (e.g. for guests).
@@ -541,8 +552,11 @@ mod tests {
         let mut keys = Vec::new();
         // Helpers that take message ids as arguments instead of resolving them
         // inline. Add one here when you add one to the code.
-        const KEY_TAKING_HELPERS: &[&str] =
-            &["render_booking_action_error_keys(", "status_subject("];
+        const KEY_TAKING_HELPERS: &[&str] = &[
+            "render_booking_action_error_keys(",
+            "render_booking_action_error_keys_in(",
+            "status_subject(",
+        ];
         for call in KEY_TAKING_HELPERS {
             let mut i = 0;
             while let Some(pos) = src[i..].find(call) {

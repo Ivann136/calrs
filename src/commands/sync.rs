@@ -1054,6 +1054,7 @@ async fn cancel_orphaned_booking(
         host_timezone,
         host_language,
     ) = booking;
+    let host_language = crate::email::supported_language(host_language);
 
     // Confirm-before-cancel: if we have a client and a stored calendar href for
     // this booking, verify that the resource is actually 404 on the server.
