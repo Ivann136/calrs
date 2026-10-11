@@ -545,18 +545,15 @@ mod tests {
 
     /// Message ids passed to `translate(lang, "key", ..)` or `tr1(lang, "key", ..)`,
     /// plus the two indirect forms: the key pairs handed to
-    /// `render_booking_action_error_keys(state, headers, "title", "body")`, and the
+    /// `render_booking_action_error_keys_in(state, lang, "title", "body")`, and the
     /// keys the booking-form validators return as `Err("key")`. Both reach Fluent
     /// through a variable, so without this pass a typo renders the raw id.
     fn find_rust_keys(src: &str) -> Vec<String> {
         let mut keys = Vec::new();
         // Helpers that take message ids as arguments instead of resolving them
         // inline. Add one here when you add one to the code.
-        const KEY_TAKING_HELPERS: &[&str] = &[
-            "render_booking_action_error_keys(",
-            "render_booking_action_error_keys_in(",
-            "status_subject(",
-        ];
+        const KEY_TAKING_HELPERS: &[&str] =
+            &["render_booking_action_error_keys_in(", "status_subject("];
         for call in KEY_TAKING_HELPERS {
             let mut i = 0;
             while let Some(pos) = src[i..].find(call) {

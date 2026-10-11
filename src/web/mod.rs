@@ -11898,6 +11898,7 @@ async fn user_profile(
     headers: HeaderMap,
     Path(username): Path<String>,
 ) -> impl IntoResponse {
+    let visitor = crate::i18n::detect_from_headers(&headers);
     let user: Option<(
         String,
         String,
@@ -11919,17 +11920,13 @@ async fn user_profile(
             Some(u) => u,
             None => {
                 return Html(crate::i18n::translate(
-                    crate::i18n::detect_from_headers(&headers),
+                    visitor,
                     "error-user-not-found",
                     None,
                 ))
             }
         };
-    let lang = user_page_lang(
-        host_language.as_deref(),
-        &page_mode,
-        crate::i18n::detect_from_headers(&headers),
-    );
+    let lang = user_page_lang(host_language.as_deref(), &page_mode, visitor);
 
     let event_types: Vec<(String, String, Option<String>, i32)> = sqlx::query_as(
         "SELECT et.slug, et.title, et.description, et.duration_min
@@ -12950,7 +12947,10 @@ async fn user_page_lang_lookup(
 }
 
 /// [`user_page_lang_lookup`] for the legacy single-user routes, where the
-/// host is the owner of the event type with this slug.
+/// host is the owner of the event type with this slug. The legacy routes
+/// resolve a slug shared by several accounts to its oldest row (`ORDER BY
+/// et.rowid`), here and in their main queries, so an error page never picks
+/// a different owner than the page it answers.
 async fn legacy_page_lang_lookup(
     pool: &SqlitePool,
     slug: &str,
@@ -12961,7 +12961,8 @@ async fn legacy_page_lang_lookup(
         "SELECT u.language, u.public_page_language FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          LEFT JOIN users u ON u.id = a.user_id
-         WHERE et.slug = ? AND et.enabled = 1",
+         WHERE et.slug = ? AND et.enabled = 1
+         ORDER BY et.rowid LIMIT 1",
     )
     .bind(slug)
     .fetch_optional(pool)
@@ -12983,21 +12984,16 @@ async fn show_slots_for_user(
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<SlotsQuery>,
 ) -> Response {
+    let visitor = crate::i18n::detect_from_headers(&headers);
     let embed = query.embed_params();
     // Dynamic group pages (`alice+bob`) intentionally return before embed
     // threading: embedding ad-hoc combined links is out of scope, so these
     // render with full chrome and don't autosize. The embed generator only
     // produces single-user/team links.
     if username.contains('+') {
-        return show_dynamic_group_slots(
-            &state,
-            crate::i18n::detect_from_headers(&headers),
-            &username,
-            &slug,
-            &query,
-        )
-        .await
-        .into_response();
+        return show_dynamic_group_slots(&state, visitor, &username, &slug, &query)
+            .await
+            .into_response();
     }
 
     let user: Option<(
@@ -13020,7 +13016,7 @@ async fn show_slots_for_user(
             Some(user) => user,
             None => {
                 return Html(crate::i18n::translate(
-                    crate::i18n::detect_from_headers(&headers),
+                    visitor,
                     "error-user-not-found",
                     None,
                 ))
@@ -13028,11 +13024,7 @@ async fn show_slots_for_user(
             }
         };
 
-    let lang = user_page_lang(
-        host_language.as_deref(),
-        &page_mode,
-        crate::i18n::detect_from_headers(&headers),
-    );
+    let lang = user_page_lang(host_language.as_deref(), &page_mode, visitor);
 
     let et: Option<(String, String, String, Option<String>, i32, i32, i32, i32, String, Option<String>, String, String)> = sqlx::query_as(
         "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.location_type, et.location_value, et.visibility, et.default_calendar_view
@@ -13244,17 +13236,12 @@ async fn show_book_form_for_user(
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<BookQuery>,
 ) -> Response {
+    let visitor = crate::i18n::detect_from_headers(&headers);
     let embed = query.embed_params();
     if username.contains('+') {
-        return show_dynamic_group_book_form(
-            &state,
-            crate::i18n::detect_from_headers(&headers),
-            &username,
-            &slug,
-            &query,
-        )
-        .await
-        .into_response();
+        return show_dynamic_group_book_form(&state, visitor, &username, &slug, &query)
+            .await
+            .into_response();
     }
 
     let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, String, Option<String>, String)> = sqlx::query_as(
@@ -13287,7 +13274,7 @@ async fn show_book_form_for_user(
         Some(e) => e,
         None => {
             return Html(crate::i18n::translate(
-                crate::i18n::detect_from_headers(&headers),
+                visitor,
                 "error-event-type-not-found",
                 None,
             ))
@@ -13295,11 +13282,7 @@ async fn show_book_form_for_user(
         }
     };
 
-    let lang = user_page_lang(
-        host_language.as_deref(),
-        &page_mode,
-        crate::i18n::detect_from_headers(&headers),
-    );
+    let lang = user_page_lang(host_language.as_deref(), &page_mode, visitor);
 
     // Validate invite token for private event types
     let invite_guest_name;
@@ -15744,7 +15727,8 @@ async fn show_slots(
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          LEFT JOIN users u ON u.id = a.user_id
-         WHERE et.slug = ? AND et.enabled = 1",
+         WHERE et.slug = ? AND et.enabled = 1
+         ORDER BY et.rowid LIMIT 1",
     )
     .bind(&slug)
     .fetch_optional(&state.pool)
@@ -15950,7 +15934,8 @@ async fn show_book_form(
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          LEFT JOIN users u ON u.id = a.user_id
-         WHERE et.slug = ? AND et.enabled = 1",
+         WHERE et.slug = ? AND et.enabled = 1
+         ORDER BY et.rowid LIMIT 1",
     )
     .bind(&slug)
     .fetch_optional(&state.pool)
@@ -16364,7 +16349,8 @@ async fn handle_booking(
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          LEFT JOIN users u ON u.id = a.user_id
-         WHERE et.slug = ? AND et.enabled = 1",
+         WHERE et.slug = ? AND et.enabled = 1
+         ORDER BY et.rowid LIMIT 1",
     )
     .bind(&slug)
     .fetch_optional(&state.pool)
@@ -20254,29 +20240,38 @@ struct DeclineForm {
     reason: Option<String>,
 }
 
-/// Render an error page for token-based actions (shared by approve form and handler).
 /// Language of the host's approve and decline pages: the saved language of
-/// the booking's host (the one the approval email went to, see
-/// `booking_host_identity`), else the browser's.
+/// the booking's single host (the assigned member, else the event type's
+/// owner), in one query. A collective booking has several approvers and the
+/// link does not say which one clicked, so it uses the browser's language, as
+/// does a host with no saved language.
 async fn host_token_page_lang(
     pool: &SqlitePool,
     confirm_token: &str,
     headers: &HeaderMap,
 ) -> &'static str {
-    let uid: Option<String> =
-        sqlx::query_scalar("SELECT uid FROM bookings WHERE confirm_token = ?")
-            .bind(confirm_token)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-    if let Some(uid) = uid {
-        if let Some((_, _, Some(language))) = booking_host_identity(pool, &uid).await {
-            if let Some(code) = crate::i18n::supported_code(&language) {
-                return code;
-            }
-        }
-    }
-    crate::i18n::detect_from_headers(headers)
+    let language: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT CASE
+                  WHEN b.assigned_user_id IS NOT NULL THEN au.language
+                  WHEN et.scheduling_mode = 'collective' AND et.team_id IS NOT NULL THEN NULL
+                  ELSE ou.language
+                END
+         FROM bookings b
+         JOIN event_types et ON et.id = b.event_type_id
+         JOIN accounts a ON a.id = et.account_id
+         LEFT JOIN users ou ON ou.id = a.user_id
+         LEFT JOIN users au ON au.id = b.assigned_user_id
+         WHERE b.confirm_token = ?",
+    )
+    .bind(confirm_token)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    language
+        .flatten()
+        .as_deref()
+        .and_then(crate::i18n::supported_code)
+        .unwrap_or_else(|| crate::i18n::detect_from_headers(headers))
 }
 
 /// Language of the claim pages: the saved language of the watcher the claim
@@ -20306,6 +20301,7 @@ async fn claim_page_lang(
     crate::i18n::detect_from_headers(headers)
 }
 
+/// Render an error page for token-based actions (shared by approve form and handler).
 fn render_token_error(
     state: &AppState,
     lang: &str,
@@ -21135,6 +21131,7 @@ async fn guest_cancel_form(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> impl IntoResponse {
+    let visitor = crate::i18n::detect_from_headers(&headers);
     let booking: Option<(String, String, String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, u.name, b.language
              FROM bookings b
@@ -21160,10 +21157,8 @@ async fn guest_cancel_form(
                         .await
                         .unwrap_or(None);
 
-                let lang = token_page_lang(
-                    status_row.as_ref().and_then(|(_, l)| l.as_deref()),
-                    crate::i18n::detect_from_headers(&headers),
-                );
+                let lang =
+                    token_page_lang(status_row.as_ref().and_then(|(_, l)| l.as_deref()), visitor);
                 let (title_key, message_key) = match status_row {
                     Some((status, _)) if status == "cancelled" => {
                         ("bae-title-already-cancelled", "bae-body-already-cancelled")
@@ -21181,10 +21176,7 @@ async fn guest_cancel_form(
             }
         };
 
-    let lang = token_page_lang(
-        booking_language.as_deref(),
-        crate::i18n::detect_from_headers(&headers),
-    );
+    let lang = token_page_lang(booking_language.as_deref(), visitor);
 
     // Block the GET form before any state mutation if the booking falls
     // inside the host's configured cancel-notice window.
@@ -21464,6 +21456,7 @@ async fn guest_reschedule_slots(
     Path(token): Path<String>,
     Query(query): Query<RescheduleQuery>,
 ) -> impl IntoResponse {
+    let visitor = crate::i18n::detect_from_headers(&headers);
     // Look up booking by reschedule_token
     let booking: Option<(String, String, String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT b.id, b.guest_name, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.event_type_id, b.uid, b.language
@@ -21481,17 +21474,14 @@ async fn guest_reschedule_slots(
             None => {
                 return render_booking_action_error_keys_in(
                     &state,
-                    crate::i18n::detect_from_headers(&headers),
+                    visitor,
                     "bae-title-invalid-link",
                     "bae-body-reschedule-link-invalid",
                 );
             }
         };
 
-    let lang = token_page_lang(
-        booking_language.as_deref(),
-        crate::i18n::detect_from_headers(&headers),
-    );
+    let lang = token_page_lang(booking_language.as_deref(), visitor);
 
     // Block the slot picker before any costly work (CalDAV sync, slot
     // computation, template render) if the booking falls inside the host's
@@ -21876,10 +21866,10 @@ async fn guest_reschedule_booking(
 
     // Past the rate limit: the page and every email use the language stored
     // with the booking, as the slot picker did (#209).
-    let lang = stored_language
-        .as_deref()
-        .and_then(crate::i18n::supported_code)
-        .unwrap_or_else(|| crate::i18n::detect_from_headers(&headers));
+    let lang = token_page_lang(
+        stored_language.as_deref(),
+        crate::i18n::detect_from_headers(&headers),
+    );
 
     // Defensive notice-window check on POST too: the GET may have been
     // cached, or the cutoff may have rolled over between page load and
@@ -24537,28 +24527,11 @@ async fn claim_booking(
     .into_response()
 }
 
-/// Same as [`render_booking_action_error`], but takes Fluent message ids.
-///
-/// Almost every caller has a fixed pair of ids rather than a sentence. The
-/// string-taking form stays for `resolve_guest_phone`, which picks its own
-/// wording and hands back a pair that is already translated.
-fn render_booking_action_error_keys(
-    state: &AppState,
-    headers: &HeaderMap,
-    title_key: &str,
-    message_key: &str,
-) -> axum::response::Response {
-    render_booking_action_error_keys_in(
-        state,
-        crate::i18n::detect_from_headers(headers),
-        title_key,
-        message_key,
-    )
-}
-
-/// [`render_booking_action_error_keys`] in a given language: the booking
-/// POSTs and the guest token pages answer in the language of the page the
-/// guest came from, which is not always the browser's.
+/// The booking error page, from Fluent message ids, in `lang`. The booking
+/// POSTs and the token pages answer in the language of the page the visitor
+/// came from, which is not always the browser's, so the language is always
+/// passed in. The string-taking form stays for `resolve_guest_phone`, which
+/// picks its own wording and hands back a pair that is already translated.
 fn render_booking_action_error_keys_in(
     state: &AppState,
     lang: &str,
@@ -24573,16 +24546,7 @@ fn render_booking_action_error_keys_in(
     )
 }
 
-fn render_booking_action_error(
-    state: &AppState,
-    headers: &HeaderMap,
-    title: &str,
-    message: &str,
-) -> axum::response::Response {
-    render_booking_action_error_html(state, headers, title, message).into_response()
-}
-
-/// [`render_booking_action_error`] in a given language.
+/// The booking error page from already-translated strings, in `lang`.
 fn render_booking_action_error_in(
     state: &AppState,
     lang: &str,
@@ -24592,23 +24556,8 @@ fn render_booking_action_error_in(
     render_booking_action_error_html_in(state, lang, title, message).into_response()
 }
 
-/// Same page as `render_booking_action_error`, for handlers whose signature is
-/// `Html<String>` rather than `Response`.
-fn render_booking_action_error_html(
-    state: &AppState,
-    headers: &HeaderMap,
-    title: &str,
-    message: &str,
-) -> Html<String> {
-    render_booking_action_error_html_in(
-        state,
-        crate::i18n::detect_from_headers(headers),
-        title,
-        message,
-    )
-}
-
-/// [`render_booking_action_error_html`] in a given language.
+/// Same page as `render_booking_action_error_in`, for handlers whose
+/// signature is `Html<String>` rather than `Response`.
 fn render_booking_action_error_html_in(
     state: &AppState,
     lang: &str,
@@ -35771,9 +35720,6 @@ mod tests {
     #[test]
     fn booking_action_error_call_sites_pass_no_english() {
         const HELPERS: &[&str] = &[
-            "render_booking_action_error(",
-            "render_booking_action_error_html(",
-            "render_booking_action_error_keys(",
             "render_booking_action_error_in(",
             "render_booking_action_error_html_in(",
             "render_booking_action_error_keys_in(",
@@ -38220,6 +38166,44 @@ mod tests {
             .await;
             assert!(page.contains("<html lang=\"fr\">"), "{uri}: {page}");
         }
+    }
+
+    /// A collective booking has several approvers and the shared link cannot
+    /// tell which one clicked, so its approve page follows the browser, even
+    /// when the owner has a saved language.
+    #[tokio::test]
+    async fn collective_approve_page_follows_the_browser() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        set_user_language(&pool, "test@example.com", "fr").await;
+        let team_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO teams (id, name, slug, visibility) VALUES (?, 'Crew', 'crew', 'public')",
+        )
+        .bind(&team_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE event_types SET team_id = ?, scheduling_mode = 'collective' WHERE id = ?",
+        )
+        .bind(&team_id)
+        .bind(&et_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_pending_french_booking(&pool, &et_id, "uid-collective-page-lang").await;
+
+        let page = body_string(
+            app.oneshot(get_with_language(
+                "/booking/approve/confirm-uid-collective-page-lang",
+                "de-DE,de;q=0.9",
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(page.contains("<html lang=\"de\">"), "{page}");
     }
 
     /// The claim page is in the claiming watcher's saved language, like the
