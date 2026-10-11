@@ -7,12 +7,18 @@ pub struct CaptchaConfig {
     pub site_key: String,
     pub secret: String,
     pub widget_url: String,
+    /// Where the widget fetches its WASM solver, exposed to it as
+    /// `window.CAP_CUSTOM_WASM_URL`. `None` keeps the widget's default (the
+    /// jsDelivr CDN). Always an absolute http(s) URL when set.
+    pub wasm_url: Option<String>,
 }
 
 pub struct CaptchaVars {
     pub enabled: bool,
     pub api_endpoint: String,
     pub widget_url: String,
+    /// Empty when no custom WASM URL is configured.
+    pub wasm_url: String,
 }
 
 impl CaptchaVars {
@@ -27,6 +33,10 @@ impl CaptchaVars {
                 .as_ref()
                 .map(|c| c.widget_url.clone())
                 .unwrap_or_else(|| DEFAULT_WIDGET_URL.to_string()),
+            wasm_url: config
+                .as_ref()
+                .and_then(|c| c.wasm_url.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -52,6 +62,21 @@ impl CaptchaConfig {
     pub fn instance_origin(&self) -> String {
         extract_origin(&self.instance_url)
     }
+
+    /// Origin of the custom WASM URL, for Content-Security-Policy connect-src
+    /// (the widget fetches the binary with `fetch()`). `None` when unset.
+    pub fn wasm_origin(&self) -> Option<String> {
+        self.wasm_url
+            .as_deref()
+            .map(extract_origin)
+            .filter(|o| !o.is_empty())
+    }
+}
+
+/// Whether `url` is an absolute http(s) URL with a host, the only shape the
+/// captcha URL fields accept.
+pub fn is_http_url(url: &str) -> bool {
+    !extract_origin(url.trim()).is_empty()
 }
 
 fn extract_origin(url: &str) -> String {
@@ -61,7 +86,9 @@ fn extract_origin(url: &str) -> String {
     if !matches!(parsed.scheme(), "http" | "https") {
         return String::new();
     }
-    let host = parsed.host_str().unwrap_or("");
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        return String::new();
+    };
     match parsed.port() {
         Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
         None => format!("{}://{}", parsed.scheme(), host),
@@ -74,16 +101,17 @@ pub async fn load_captcha_config(pool: &SqlitePool, key: &[u8; 32]) -> Option<Ca
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT captcha_instance_url, captcha_site_key, captcha_secret, captcha_widget_url \
-             FROM auth_config WHERE id = 'singleton'",
+        "SELECT captcha_instance_url, captcha_site_key, captcha_secret, captcha_widget_url, \
+             captcha_wasm_url FROM auth_config WHERE id = 'singleton'",
     )
     .fetch_optional(pool)
     .await
     .ok()
     .flatten();
 
-    let (instance_url, site_key, secret_enc, widget_url) = row?;
+    let (instance_url, site_key, secret_enc, widget_url, wasm_url) = row?;
     let instance_url = instance_url.filter(|s| !s.trim().is_empty())?;
     let site_key = site_key.filter(|s| !s.trim().is_empty())?;
     let secret_enc = secret_enc.filter(|s| !s.trim().is_empty())?;
@@ -91,12 +119,18 @@ pub async fn load_captcha_config(pool: &SqlitePool, key: &[u8; 32]) -> Option<Ca
     let widget_url = widget_url
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_WIDGET_URL.to_string());
+    // The admin form refuses anything else, so this only drops a value written
+    // to the database by hand.
+    let wasm_url = wasm_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| is_http_url(s));
 
     Some(CaptchaConfig {
         instance_url,
         site_key,
         secret,
         widget_url,
+        wasm_url,
     })
 }
 
@@ -197,6 +231,39 @@ mod tests {
         assert_eq!(extract_origin(""), "");
     }
 
+    #[test]
+    fn is_http_url_accepts_only_absolute_http_urls() {
+        assert!(is_http_url(
+            "https://cap.example.com/assets/cap_wasm_bg.wasm"
+        ));
+        assert!(is_http_url("http://10.0.0.5:3000/cap_wasm_bg.wasm"));
+        assert!(!is_http_url(""));
+        assert!(!is_http_url("/assets/cap_wasm_bg.wasm"));
+        assert!(!is_http_url("javascript:alert(1)"));
+        assert!(!is_http_url("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn wasm_origin_is_none_without_a_wasm_url() {
+        let mut cfg = CaptchaConfig {
+            instance_url: "https://cap.example.com".to_string(),
+            site_key: "key".to_string(),
+            secret: "s".to_string(),
+            widget_url: DEFAULT_WIDGET_URL.to_string(),
+            wasm_url: None,
+        };
+        assert_eq!(cfg.wasm_origin(), None);
+        cfg.wasm_url = Some("https://assets.example.com:8443/cap/cap_wasm_bg.wasm".to_string());
+        assert_eq!(
+            cfg.wasm_origin().as_deref(),
+            Some("https://assets.example.com:8443")
+        );
+        assert_eq!(
+            CaptchaVars::from_config(&Some(cfg)).wasm_url,
+            "https://assets.example.com:8443/cap/cap_wasm_bg.wasm"
+        );
+    }
+
     // --- api_endpoint tests ---
 
     #[test]
@@ -206,6 +273,7 @@ mod tests {
             site_key: "mykey".to_string(),
             secret: "s".to_string(),
             widget_url: DEFAULT_WIDGET_URL.to_string(),
+            wasm_url: None,
         };
         assert_eq!(cfg.api_endpoint(), "https://cap.example.com/mykey/");
     }
@@ -217,6 +285,7 @@ mod tests {
             site_key: "mykey".to_string(),
             secret: "s".to_string(),
             widget_url: DEFAULT_WIDGET_URL.to_string(),
+            wasm_url: None,
         };
         assert_eq!(cfg.api_endpoint(), "https://cap.example.com/mykey/");
     }
@@ -236,6 +305,7 @@ mod tests {
             site_key: "key".to_string(),
             secret: "secret".to_string(),
             widget_url: DEFAULT_WIDGET_URL.to_string(),
+            wasm_url: None,
         });
         assert!(verify(&cfg, None).await.is_err());
     }
@@ -247,6 +317,7 @@ mod tests {
             site_key: "key".to_string(),
             secret: "secret".to_string(),
             widget_url: DEFAULT_WIDGET_URL.to_string(),
+            wasm_url: None,
         });
         assert!(verify(&cfg, Some("")).await.is_err());
         assert!(verify(&cfg, Some("   ")).await.is_err());

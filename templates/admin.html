@@ -400,6 +400,11 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
       <input type="url" name="captcha_widget_url" value="{{ captcha_widget_url }}" placeholder="https://cdn.jsdelivr.net/npm/cap-widget">
       <span style="font-size: 0.8rem; color: var(--text-muted);">{{ t("admin-widget-url-help") }}</span>
     </div>
+    <div class="form-group">
+      <label>{{ t("admin-wasm-url") }} <span class="hint">{{ t("team-form-optional") }}</span></label>
+      <input type="url" name="captcha_wasm_url" value="{{ captcha_wasm_url }}" placeholder="https://captcha.example.com/assets/cap_wasm_bg.wasm">
+      <span style="font-size: 0.8rem; color: var(--text-muted);">{{ t("admin-wasm-url-help") }}</span>
+    </div>
     <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">{{ t("admin-captcha-disable-help") }}</p>
     <button type="submit" class="slot-btn" style="cursor: pointer; font-weight: 600; color: var(--accent); border-color: var(--accent);">{{ t("admin-save-captcha") }}</button>
   </form>

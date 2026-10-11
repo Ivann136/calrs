@@ -305,6 +305,7 @@
     {% if captcha_enabled %}
     <div class="form-group">
       <label>{{ t("captcha-label") }}</label>
+      {% if captcha_wasm_url %}<script>window.CAP_CUSTOM_WASM_URL = {{ captcha_wasm_url | tojson }};</script>{% endif %}
       <script src="{{ captcha_widget_url }}"></script>
       <cap-widget
         data-cap-api-endpoint="{{ captcha_api_endpoint }}"
