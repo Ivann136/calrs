@@ -28294,6 +28294,84 @@ mod tests {
 
     // --- Template rendering regression tests ---
 
+    /// Maximum `<a>` nesting depth in rendered HTML. HTML parsers close an
+    /// open anchor when they meet another `<a>`, so anything above 1 means the
+    /// browser will tear the outer element apart.
+    fn max_anchor_depth(html: &str) -> usize {
+        let lower = html.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"</a>") {
+                depth = depth.saturating_sub(1);
+                i += 4;
+            } else if bytes[i..].starts_with(b"<a") && matches!(bytes.get(i + 2), Some(b' ' | b'>'))
+            {
+                depth += 1;
+                max = max.max(depth);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        max
+    }
+
+    /// Regression test for #239: an event-type description containing a
+    /// markdown link must not produce an `<a>` nested inside the card link on
+    /// the user and team profile pages, and the description link must survive.
+    #[test]
+    fn profile_cards_do_not_nest_description_links() {
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        env.set_loader(minijinja::path_loader("templates"));
+        crate::i18n::register(&mut env);
+
+        let description =
+            crate::utils::render_inline_markdown("See [the agenda](https://example.com/agenda)");
+        assert!(description.contains("<a "), "markdown should render a link");
+        let event_types = vec![context! {
+            slug => "intro",
+            title => "Intro Call",
+            duration_min => 30,
+            description => description,
+            visibility => "public",
+        }];
+
+        let profile = env
+            .get_template("profile.html")
+            .expect("profile.html should load")
+            .render(context! {
+                host_name => "Alice",
+                username => "alice",
+                event_types => event_types.clone(),
+                lang => "en",
+            })
+            .expect("profile.html should render");
+        let team = env
+            .get_template("team_profile.html")
+            .expect("team_profile.html should load")
+            .render(context! {
+                team_name => "Sales",
+                team_slug => "sales",
+                event_types => event_types,
+                lang => "en",
+            })
+            .expect("team_profile.html should render");
+
+        for (name, html, href) in [
+            ("profile.html", &profile, "href=\"/u/alice/intro\""),
+            ("team_profile.html", &team, "href=\"/team/sales/intro\""),
+        ] {
+            assert_eq!(max_anchor_depth(html), 1, "{name} nests an <a> in an <a>");
+            assert!(
+                html.contains("https://example.com/agenda"),
+                "{name} must keep the description link"
+            );
+            assert!(html.contains(href), "{name} must keep the card link");
+        }
+    }
+
     /// Render slots.html WITHOUT reschedule context and verify slot links
     /// point to /book and not to a JSON object.
     /// Regression test for: default(value='') rendering as {"value": ""}
