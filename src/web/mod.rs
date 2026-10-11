@@ -5372,20 +5372,36 @@ async fn cancel_booking(
         host_timezone: stored_tz.name().to_string(),
     };
 
+    // The guest's copy names the host the invite named, whoever clicked:
+    // its CANCEL must carry the original ORGANIZER, or calendar clients
+    // that match on UID + ORGANIZER ignore it and leave the event in the
+    // guest's calendar. For a collective booking that is the stored
+    // organizer (#161), not the member cancelling. It is also the sender
+    // and Reply-To (#221). The host's own copy stays theirs.
+    let guest_details = match booking_host_identity(&state.pool, &details.uid).await {
+        Some((host_name, host_email, _)) => crate::email::CancellationDetails {
+            host_name,
+            host_email,
+            ..details.clone()
+        },
+        None => details.clone(),
+    };
+
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
         let details = details.clone();
+        let guest_details = guest_details.clone();
         spawn_emails(async move {
             if was_pending {
                 log_email_result(
-                    crate::email::send_guest_decline_notice(&smtp_config, &details).await,
+                    crate::email::send_guest_decline_notice(&smtp_config, &guest_details).await,
                     "guest_decline_notice",
                     &details.uid,
                 );
             } else {
                 log_email_result(
-                    crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                    crate::email::send_guest_cancellation(&smtp_config, &guest_details).await,
                     "guest_cancellation",
                     &details.uid,
                 );
@@ -5403,7 +5419,7 @@ async fn cancel_booking(
     // cancellation: the guest never had a confirmed slot to begin with, so the
     // distinction doesn't matter to them.
     if let Some(ctx) = crate::sms::SmsContext::for_cancellation(
-        &details,
+        &guest_details,
         guest_phone.as_deref(),
         crate::sms::collects_phone(&sms_phone_mode),
     ) {
@@ -22677,7 +22693,7 @@ async fn host_reschedule_booking(
     .await
     .unwrap_or(None);
 
-    let (bid, _uid, guest_name, guest_email, start_at, end_at, event_title, guest_timezone, et_id) =
+    let (bid, uid, guest_name, guest_email, start_at, end_at, event_title, guest_timezone, et_id) =
         match booking {
             Some(b) => b,
             None => return Redirect::to("/dashboard/bookings").into_response(),
@@ -22728,6 +22744,18 @@ async fn host_reschedule_booking(
         let (date, start_time, end_time) =
             booking_strings_in_guest_tz(&start_at, &end_at, host_tz, guest_tz_parsed);
 
+        // Named after, and replying to, the host the invite named (the
+        // stored organizer of a collective booking, #161), like every other
+        // email about this booking.
+        let (host_name, host_email) = match booking_host_identity(&state.pool, &uid).await {
+            Some((name, email, _)) => (name, email),
+            None => (
+                user.name.clone(),
+                user.booking_email
+                    .clone()
+                    .unwrap_or_else(|| user.email.clone()),
+            ),
+        };
         let details = crate::email::BookingDetails {
             utc_times: crate::booking_time::ics_times(&start_at, &end_at),
             event_title,
@@ -22737,11 +22765,8 @@ async fn host_reschedule_booking(
             guest_name,
             guest_email,
             guest_timezone,
-            host_name: user.name.clone(),
-            host_email: user
-                .booking_email
-                .clone()
-                .unwrap_or_else(|| user.email.clone()),
+            host_name,
+            host_email,
             uid: String::new(),
             notes: None,
             location: None,
@@ -22802,7 +22827,7 @@ async fn host_reschedule_booking(
 ///
 /// Returns `None` only when the booking or its host row is gone, so callers
 /// can keep whatever they resolved themselves.
-async fn booking_host_identity(
+pub(crate) async fn booking_host_identity(
     pool: &SqlitePool,
     booking_uid: &str,
 ) -> Option<(String, String, Option<String>)> {

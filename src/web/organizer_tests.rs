@@ -476,3 +476,146 @@ async fn personal_and_round_robin_bookings_store_no_organizer() {
         assert_eq!(stored_organizer(&pool, &id).await, (None, None, None));
     }
 }
+
+/// The ORGANIZER line of the calendar attachment in a captured email,
+/// whatever transfer encoding lettre picked for it.
+fn ics_organizer_in_mail(mail: &str) -> Option<String> {
+    use base64::Engine;
+    let find = |text: &str| {
+        text.lines()
+            .find(|l| l.starts_with("ORGANIZER"))
+            .map(|l| l.trim_end().to_string())
+    };
+    if let Some(line) = find(mail) {
+        return Some(line);
+    }
+    // Base64 parts: decode every run of base64 lines and look inside.
+    let mut chunk = String::new();
+    for line in mail.lines().chain(std::iter::once("")) {
+        let line = line.trim_end();
+        let is_b64 = !line.is_empty()
+            && line
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=');
+        if is_b64 {
+            chunk.push_str(line);
+            continue;
+        }
+        if !chunk.is_empty() {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&chunk) {
+                if let Some(found) = find(&String::from_utf8_lossy(&bytes)) {
+                    return Some(found);
+                }
+            }
+            chunk.clear();
+        }
+    }
+    None
+}
+
+/// A collective booking cancelled from the dashboard by a member who is not
+/// its organizer: the guest's CANCEL must still name the original organizer.
+/// Calendar clients match a cancellation on UID + ORGANIZER and may ignore
+/// one from someone else, leaving the event in the guest's calendar. The
+/// decline of a pending request replies to the organizer the same way.
+#[tokio::test]
+async fn dashboard_cancel_by_another_member_keeps_the_original_organizer() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let (app, pool, session, _) = setup_test_app().await;
+    let (port, mails) = spawn_capturing_mta().await;
+    use_capturing_mta(&pool, port).await;
+    let (team_id, team_et) = seed_team_event_type(&pool).await;
+    sqlx::query("UPDATE event_types SET scheduling_mode = 'collective' WHERE id = ?")
+        .bind(&team_et)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Bob sorts before "Test User", the event type owner who will cancel.
+    add_named_member(&pool, &team_id, "Bob", "bob@test.com").await;
+
+    let csrf = "csrf-161-dash";
+    let response = app
+        .clone()
+        .oneshot(post_form_unauthed(
+            "/team/horizon-team/team-sync/book",
+            csrf,
+            &book_body(csrf),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let booking_id: String =
+        sqlx::query_scalar("SELECT id FROM bookings WHERE event_type_id = ?")
+            .bind(&team_et)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let confirmation = take_guest_mail(&mails).await;
+    let original = ics_organizer_in_mail(&confirmation)
+        .unwrap_or_else(|| panic!("no ORGANIZER in the confirmation: {confirmation}"));
+    assert_eq!(
+        original,
+        "ORGANIZER;CN=Bob & Test User:mailto:bob@test.com"
+    );
+
+    // Ann joins and sorts first, so even a fresh resolution would differ.
+    add_named_member(&pool, &team_id, "Ann", "ann@test.com").await;
+
+    let csrf = "csrf-161-dash-cancel";
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            &format!("/dashboard/bookings/{booking_id}/cancel"),
+            &session,
+            csrf,
+            &format!("_csrf={csrf}"),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    assert_eq!(booking_status(&pool, &booking_id).await, "cancelled");
+    let cancelled = take_guest_mail(&mails).await;
+    assert_eq!(
+        ics_organizer_in_mail(&cancelled).as_deref(),
+        Some(original.as_str()),
+        "{cancelled}"
+    );
+    assert_eq!(mail_header(&cancelled, "Reply-To"), Some("bob@test.com"));
+
+    // A request made after Ann joined has her as organizer; declined from
+    // the dashboard by the owner, it still replies to her, not to him.
+    sqlx::query("UPDATE event_types SET requires_confirmation = 1 WHERE id = ?")
+        .bind(&team_et)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let csrf = "csrf-161-dash-pending";
+    app.clone()
+        .oneshot(post_form_unauthed(
+            "/team/horizon-team/team-sync/book",
+            csrf,
+            &book_body(csrf).replace("time=10:00", "time=14:00"),
+        ))
+        .await
+        .unwrap();
+    let pending_id: String = sqlx::query_scalar(
+        "SELECT id FROM bookings WHERE event_type_id = ? AND status = 'pending'",
+    )
+    .bind(&team_et)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    take_guest_mail(&mails).await;
+    let csrf = "csrf-161-dash-decline";
+    app.oneshot(post_form(
+        &format!("/dashboard/bookings/{pending_id}/cancel"),
+        &session,
+        csrf,
+        &format!("_csrf={csrf}"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(booking_status(&pool, &pending_id).await, "declined");
+    let declined = take_guest_mail(&mails).await;
+    assert_eq!(mail_header(&declined, "Reply-To"), Some("ann@test.com"));
+}
