@@ -102,6 +102,8 @@ calrs/
 │   ├── 059_resource_sync_error.sql ← last_sync_error on resources (feed failure indicator)
 │   ├── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_phone_mode on event_types, sms_config + sms_usage tables, sms_allow_all_users on auth_config
 │   ├── 063_booking_horizon.sql   ← booking_horizon_days on event_types (NULL = unlimited)
+│   ├── 068_writeback_failures.sql ← writeback_error/attempts/next_attempt_at/alerted_at on bookings (#162)
+│   └── 069_source_sync_errors.sql ← last_sync_error, sync_failing_since, failure count, alert stamp on caldav_sources (#162)
 │   ├── 064_booking_time_version.sql ← time_version on bookings (0 = legacy wall clock, 1 = UTC)
 │   ├── 065_pending_slot_hold.sql ← pending_blocks_slot + pending_expiry_hours on event_types; pending_expires_at, pending_since, pending_reminder_sent_at on bookings
 │   ├── 066_public_page_language.sql ← public_page_language on users ('visitor' default / 'host') for /u/{username} and legacy /{slug} pages
@@ -172,11 +174,13 @@ calrs/
     ├── caldav/
     │   └── mod.rs                ← CalDAV client: discovery, calendar list, event fetch, write-back
     ├── web/
-    │   └── mod.rs                ← Axum web server: dashboard, booking, admin panel, token actions
+    │   ├── mod.rs                ← Axum web server: dashboard, booking, admin panel, token actions
+    │   └── writeback.rs          ← write-back failure record, retry sweep, host alert (#162)
     └── commands/
         ├── mod.rs                ← re-exports all subcommands
         ├── source.rs             ← `calrs source add/list/remove/test`
         ├── sync.rs               ← `calrs sync [--full]` — pull CalDAV → SQLite
+        ├── sync_health.rs        ← source sync failure record + owner alert (#162)
         ├── calendar.rs           ← `calrs calendar show`
         ├── event_type.rs         ← `calrs event-type create/list/slots`
         ├── booking.rs            ← `calrs booking create/list/cancel`
@@ -323,6 +327,10 @@ File: `src/web/mod.rs`, templates in `templates/`
 **Email notifications:** Booking confirmation, cancellation, pending notice, approval request (with action buttons), decline notice — all HTML emails with plain text fallback. Confirmation and cancellation include `.ics` calendar invite attachments. Location included in emails and ICS.
 
 **CalDAV write-back:** Confirmed bookings are pushed to the host's CalDAV calendar (if `write_calendar_href` is configured on the source). On cancellation, the event is deleted from CalDAV.
+
+**Write-back failures (#162):** every push goes through `caldav_push_booking` → `web::writeback::push_and_record`; do not call `caldav_push_booking_for_user` directly except for the claimant's extra copy. Each write is `providers::put_and_verify` (PUT, then `CalendarProvider::event_exists` by UID); a refused or unreadable write is a failure. The booking is **never** refused or rolled back for it (slot is held by calrs's DB, guest has the invite): the failure goes to `bookings.writeback_error`/`writeback_attempts`/`writeback_next_attempt_at`, and `retry_failed_writebacks` (in `run_reminder_loop`) retries confirmed future bookings at 5/15/30/60/120/240/480 min (8 attempts total). After `ALERT_AFTER_ATTEMPTS` (3) the failing hosts get one email (`writeback_alerted_at`, claimed atomically, cleared only on success). A fresh push restarts the attempt count. `caldav_calendar_href` is stored whenever the PUT was accepted, even if the read-back failed, so cancellation still deletes. The bookings dashboard shows a badge.
+
+**Source sync failures (#162):** `sync_source`/`sync_ews_source` record their outcome via `commands::sync_health`; `sync::sync_one_source` is the single client dispatch (background, on-demand, dashboard button, CLI) and records pre-request failures too. A failed calendar fails its source's sync. Availability keeps being served from the cache. The owner is emailed once when `sync_failure_count >= 3` and failing for over 60 min; success clears everything and re-arms. On-demand syncs skip sources that failed in the last 5 min (`last_sync_error_at`), and the background loop orders by the later of `last_synced`/`last_sync_error_at`. `calrs sync` exits 1 when any source failed.
 
 **Security hardening (1.0):**
 - **CSRF protection** — double-submit cookie pattern on all 31 POST handlers via `csrf_cookie_middleware`. Client-side JS injects `_csrf` hidden field. Multipart forms use query parameter.

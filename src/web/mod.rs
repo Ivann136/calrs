@@ -1,5 +1,6 @@
 pub mod captcha;
 pub mod meeting;
+pub(crate) mod writeback;
 
 use crate::utils::{convert_event_to_tz, parse_ical_datetime};
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -1012,7 +1013,7 @@ fn log_email_result(result: anyhow::Result<()>, email: &'static str, booking: &s
 /// up with a 504, and guests retried a booking that existed (#236). The
 /// future owns everything it needs; failures are logged via
 /// `log_email_result` inside it.
-fn spawn_emails<F>(task: F)
+pub(crate) fn spawn_emails<F>(task: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1213,13 +1214,17 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
         // the background sync below on almost every tick.
         send_due_reminders(pool.clone(), secret_key).await;
 
+        // Calendar write-backs that failed earlier and are due another try
+        // (#162).
+        writeback::retry_failed_writebacks(&pool, &secret_key, Utc::now()).await;
+
         // Background sync: pick the stalest enabled source and sync it.
         // With ctag + sync-token this is very cheap for unchanged calendars.
         let stalest: Option<(String,)> = sqlx::query_as(
             "SELECT cs.id
              FROM caldav_sources cs
              WHERE cs.enabled = 1
-             ORDER BY COALESCE(cs.last_synced, '2000-01-01') ASC
+             ORDER BY MAX(COALESCE(cs.last_synced, '2000-01-01'), COALESCE(cs.last_sync_error_at, '2000-01-01')) ASC
              LIMIT 1",
         )
         .fetch_optional(&pool)
@@ -2894,14 +2899,15 @@ async fn dashboard_bookings(
     .await
     .unwrap_or_default();
 
-    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String)> =
+    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String, Option<String>)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, b.guest_phone, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, b.reschedule_by_host,
                     COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                     COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                     COALESCE(r.name, '') AS resource_name,
                     et.sms_phone_mode,
-                    COALESCE(b.notes, '') AS notes
+                    COALESCE(b.notes, '') AS notes,
+                    b.writeback_error
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -3021,11 +3027,15 @@ async fn dashboard_bookings(
                 resource_name,
                 sms_phone_mode,
                 notes,
+                writeback_error,
             )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
                     id => id,
+                    // The booking is confirmed but not on the host's
+                    // calendar; retried in the background (#162).
+                    writeback_error => writeback_error.as_deref().unwrap_or(""),
                     guest_name => name,
                     guest_email => email,
                     guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },
@@ -3717,8 +3727,10 @@ async fn dashboard_sources(
         Option<String>,
         String,
         String,
+        Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type, cs.provider_type
+        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type, cs.provider_type, cs.last_sync_error, cs.sync_failing_since
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ?
@@ -3755,6 +3767,8 @@ async fn dashboard_sources(
                 write_cal,
                 auth_type,
                 provider_type,
+                last_sync_error,
+                sync_failing_since,
             )| {
                 let cals: Vec<minijinja::Value> = all_calendars
                     .iter()
@@ -3773,6 +3787,10 @@ async fn dashboard_sources(
                     url => url,
                     username => username,
                     last_synced => last_synced.as_deref().unwrap_or("never"),
+                    // Availability is still served from the last good sync;
+                    // this tells the owner it is stale (#162).
+                    sync_error => last_sync_error.as_deref().unwrap_or(""),
+                    sync_failing_since => sync_failing_since.as_deref().unwrap_or(""),
                     enabled => enabled,
                     write_calendar_href => write_cal.as_deref().unwrap_or(""),
                     auth_type => auth_type,
@@ -7954,45 +7972,24 @@ async fn run_sync_for_source(
     token_expires_at: Option<&str>,
     provider_type: &str,
 ) -> (Vec<String>, usize) {
-    // EWS sources go through the provider trait — no OAuth2 dispatch needed.
-    if provider_type == crate::providers::factory::kinds::EWS {
-        let enc = match password_enc {
-            Some(e) => e,
-            None => return (vec!["EWS source missing password".to_string()], 0),
-        };
-        let password = match crate::crypto::decrypt_password(key, enc) {
-            Ok(p) => p,
-            Err(e) => return (vec![format!("Decrypt failed: {}", e)], 0),
-        };
-        return run_sync(
-            pool,
-            key,
-            source_id,
-            provider_type,
-            url,
-            username,
-            &password,
-        )
-        .await;
-    }
-    let client = match crate::oauth2_caldav::build_client_for_source(
+    // Same dispatch as the background and CLI syncs, so a failure here
+    // (including credentials that no longer work) is recorded on the source
+    // too. A calendar that failed to fetch fails the sync, so "Sync
+    // complete." is only shown when every calendar synced (#162).
+    match crate::commands::sync::sync_one_source(
         pool,
         key,
         source_id,
         url,
-        auth_type,
         username,
         password_enc,
+        auth_type,
         access_token_enc,
         token_expires_at,
+        provider_type,
     )
     .await
     {
-        Ok(c) => c,
-        Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
-    };
-
-    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
         Ok(()) => {
             let cal_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
@@ -23205,16 +23202,19 @@ async fn caldav_push_booking(
     booking_uid: &str,
     details: &crate::email::BookingDetails,
 ) {
-    for target in booking_write_targets(pool, booking_uid, user_id).await {
-        caldav_push_booking_for_user(pool, key, &target, booking_uid, details).await;
-    }
+    // Records the outcome on the booking: a failure is retried from the
+    // background loop and shown to the host (#162).
+    writeback::push_and_record(
+        pool,
+        key,
+        user_id,
+        booking_uid,
+        details,
+        writeback::PushKind::Fresh,
+    )
+    .await;
 }
 
-/// Push a confirmed booking to ONE user's CalDAV calendar (every source
-/// with a write_calendar_href set for them). Most callers want
-/// [`caldav_push_booking`], which resolves the right user(s) first; this
-/// is for pushes that deliberately target a specific extra calendar
-/// (booking claims).
 /// Email the host when the Google Meet time patch failed for good.
 ///
 /// `details` carries the booking's host identity, and the skip branch only
@@ -23260,13 +23260,23 @@ async fn notify_host_meet_time_desync(
     }
 }
 
+/// Push a confirmed booking to ONE user's CalDAV calendar (every source
+/// with a write_calendar_href set for them). Most callers want
+/// [`caldav_push_booking`], which resolves the right user(s) first; this
+/// is for pushes that deliberately target a specific extra calendar
+/// (booking claims).
+///
+/// Returns one message per source the booking could not be written to (or
+/// written but not read back), empty when every write landed or the user
+/// has nothing to write to.
 async fn caldav_push_booking_for_user(
     pool: &SqlitePool,
     key: &[u8; 32],
     user_id: &str,
     booking_uid: &str,
     details: &crate::email::BookingDetails,
-) {
+) -> Vec<String> {
+    let mut failures = Vec::new();
     // Find all sources with write_calendar_href configured for this user
     let sources: Vec<(
         String,
@@ -23279,8 +23289,9 @@ async fn caldav_push_booking_for_user(
         Option<String>,
         String,
         Option<String>,
+        String,
     )> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type, cs.oauth2_provider
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type, cs.oauth2_provider, cs.name
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href IS NOT NULL",
@@ -23316,7 +23327,7 @@ async fn caldav_push_booking_for_user(
             // Silence here is what made #147 hard to diagnose.
             tracing::warn!(user_id = %user_id, uid = %booking_uid, "calendar write-back skipped: no enabled CalDAV source for this user");
         }
-        return;
+        return failures;
     }
 
     let ics = crate::email::generate_ics_caldav(details);
@@ -23333,6 +23344,7 @@ async fn caldav_push_booking_for_user(
         token_expires_at,
         provider_type,
         oauth2_provider,
+        source_name,
     ) in &sources
     {
         if crate::google_meet::should_skip_caldav_put(
@@ -23416,74 +23428,101 @@ async fn caldav_push_booking_for_user(
 
         tracing::debug!(uid = %booking_uid, calendar_href = %calendar_href, provider = %provider_type, "pushing booking to calendar");
 
-        let put_result = if provider_type == crate::providers::factory::kinds::EWS {
-            let enc = match password_enc.as_deref() {
-                Some(e) => e,
-                None => {
-                    tracing::error!(url = %url, "calendar write-back failed: EWS source missing password");
-                    continue;
-                }
-            };
-            let password = match crate::crypto::decrypt_password(key, enc) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: could not decrypt credentials");
-                    continue;
-                }
-            };
-            let client = match crate::providers::build_provider(
-                provider_type,
-                url,
-                username,
-                &password,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: unknown provider");
-                    continue;
-                }
-            };
-            client.put_event(calendar_href, booking_uid, &ics).await
-        } else {
-            let client = match crate::oauth2_caldav::build_client_for_source(
-                pool,
-                key,
-                source_id,
-                url,
-                auth_type,
-                username,
-                password_enc.as_deref(),
-                access_token_enc.as_deref(),
-                token_expires_at.as_deref(),
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: could not build client");
-                    continue;
-                }
-            };
-            client.put_event(calendar_href, booking_uid, &ics).await
+        let provider = match write_provider_for_source(
+            pool,
+            key,
+            source_id,
+            url,
+            username,
+            password_enc.as_deref(),
+            auth_type,
+            access_token_enc.as_deref(),
+            token_expires_at.as_deref(),
+            provider_type,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(url = %url, error = format!("{e:#}"), "calendar write-back failed: could not build client");
+                failures.push(format!("{source_name}: {e:#}"));
+                continue;
+            }
         };
 
-        if let Err(e) = put_result {
-            tracing::error!(uid = %booking_uid, calendar_href = %calendar_href, error = %e, "calendar write-back failed");
-            continue;
-        }
-
-        tracing::info!(uid = %booking_uid, calendar_href = %calendar_href, "calendar write-back succeeded");
+        // A 2xx on the write is not proof the host sees the event (#162):
+        // read it back by UID before calling it written.
+        let written =
+            crate::providers::put_and_verify(provider.as_ref(), calendar_href, booking_uid, &ics)
+                .await;
+        let event_may_exist = match &written {
+            Ok(()) => true,
+            Err(e) => e.event_may_exist(),
+        };
 
         // Record which calendar href the booking was pushed to (last successful
         // one), unless a Meet skip already pinned the Meet-holding calendar.
-        if !preserved_meet_href {
+        // Also recorded when the write was accepted but could not be read
+        // back: the event may still be there, and cancellation keys its
+        // delete off this href.
+        if event_may_exist && !preserved_meet_href {
             let _ = sqlx::query("UPDATE bookings SET caldav_calendar_href = ? WHERE uid = ?")
                 .bind(calendar_href)
                 .bind(booking_uid)
                 .execute(pool)
                 .await;
         }
+
+        match written {
+            Ok(()) => {
+                tracing::info!(uid = %booking_uid, calendar_href = %calendar_href, "calendar write-back succeeded (verified)");
+            }
+            Err(e) => {
+                tracing::error!(uid = %booking_uid, calendar_href = %calendar_href, error = %e, "calendar write-back failed");
+                failures.push(format!("{source_name}: {e}"));
+            }
+        }
     }
+    failures
+}
+
+/// A calendar client for one of a user's sources, whatever its protocol:
+/// EWS through the provider factory, CalDAV (basic or OAuth2) through
+/// `build_client_for_source`.
+#[allow(clippy::too_many_arguments)]
+async fn write_provider_for_source(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    source_id: &str,
+    url: &str,
+    username: &str,
+    password_enc: Option<&str>,
+    auth_type: &str,
+    access_token_enc: Option<&str>,
+    token_expires_at: Option<&str>,
+    provider_type: &str,
+) -> anyhow::Result<Box<dyn crate::providers::CalendarProvider>> {
+    if provider_type == crate::providers::factory::kinds::EWS {
+        let enc = password_enc.ok_or_else(|| anyhow::anyhow!("EWS source missing password"))?;
+        let password = crate::crypto::decrypt_password(key, enc)
+            .map_err(|e| anyhow::anyhow!("could not decrypt credentials: {e}"))?;
+        return crate::providers::build_provider(provider_type, url, username, &password);
+    }
+    let client = crate::oauth2_caldav::build_client_for_source(
+        pool,
+        key,
+        source_id,
+        url,
+        auth_type,
+        username,
+        password_enc,
+        access_token_enc,
+        token_expires_at,
+    )
+    .await?;
+    Ok(Box::new(
+        crate::providers::caldav::CaldavProvider::from_client(client),
+    ))
 }
 
 /// Delete a booking from a user's CalDAV calendar by looking up their write-enabled source directly.
@@ -37359,6 +37398,7 @@ mod tests {
     }
     include!("booking_time_tests.rs");
     include!("pending_hold_tests.rs");
+    include!("writeback_tests.rs");
 
     // --- #209: guest emails sent on someone else's request keep the guest's language ---
 

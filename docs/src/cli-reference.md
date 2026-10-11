@@ -35,6 +35,8 @@ calrs sync [OPTIONS]
     --full    Full re-sync (ignore sync tokens)
 ```
 
+Exits with status 1 when any source (or any calendar of a source) failed to sync, after listing the failures, so it can be used from cron or a monitoring check.
+
 ### `calrs calendar`
 
 View synced calendar events.
