@@ -94,6 +94,26 @@ When a booking is confirmed, calrs can automatically push it to your CalDAV cale
 - If no write calendar is configured, write-back is skipped and a warning is logged (emails still work)
 - Write-back works for individual bookings, team bookings (the assigned member's calendar for round-robin, every eligible member's for collective), and pending-then-confirmed bookings
 
+### When a write-back fails
+
+After each PUT, calrs reads the event back by UID (HEAD, or PROPFIND on servers that refuse HEAD; FindItem on EWS). A write the server refused, or accepted without the event becoming readable, counts as failed.
+
+The booking stays confirmed: the slot is already blocked by calrs's own bookings table and the guest already has the invitation, so refusing the booking after the fact would only leave the guest with an invite to a meeting that no longer exists. Instead:
+
+- the failure is recorded on the booking, and the bookings dashboard shows a **"not in your calendar"** badge with the error
+- the background task of `calrs serve` retries it, for confirmed bookings that have not started yet: 5 min, 15 min, 30 min, 1 h, 2 h, 4 h and 8 h after the previous attempt, then it stops. A retry replaces the same event (the PUT is keyed on the booking UID), so retrying never duplicates it, and a cancelled booking is never retried
+- after three failed attempts (about 20 minutes) the host is emailed once, in their language, so they can add the event by hand. Retries carry on afterwards; a successful write clears the badge
+
+## When a sync fails
+
+If a source cannot be synced (server down, password changed, OAuth access revoked), calrs keeps offering slots from the last successful sync rather than refusing every booking. The failure is not silent:
+
+- the calendar sources page shows the error and since when the source has been failing
+- once a source has failed at least 3 times in a row over more than an hour, its owner is emailed once, in their language. They hear about it again only if it recovers and later fails again
+- a calendar that fails to fetch fails the sync of its source, so "Sync complete." means every calendar synced
+- slot pages retry a failing source at most every five minutes, so a dead server does not slow down every page load
+- `calrs sync` lists the sources that failed and exits with status 1
+
 ## Managing sources
 
 ```bash
