@@ -1935,10 +1935,12 @@ async fn dashboard(
         String,
         String,
         String,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title,
                 COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
-                COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz
+                COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
+                COALESCE(b.notes, '') AS notes
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -1987,7 +1989,7 @@ async fn dashboard(
     let pending_ctx: Vec<minijinja::Value> = pending_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, stored_tz, guest_tz)| {
+            |(id, name, email, start, end, title, stored_tz, guest_tz, notes)| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
@@ -1997,6 +1999,7 @@ async fn dashboard(
                     start_at => primary,
                     start_at_guest => secondary,
                     event_title => title,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -2234,11 +2237,13 @@ async fn dashboard_bookings(
         String,
         String,
         String,
+        String,
     )> = sqlx::query_as(
         "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title,
                 COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                 COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
-                COALESCE(r.name, '') AS resource_name
+                COALESCE(r.name, '') AS resource_name,
+                COALESCE(b.notes, '') AS notes
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2252,13 +2257,14 @@ async fn dashboard_bookings(
     .await
     .unwrap_or_default();
 
-    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String)> =
+    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String, String)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, b.guest_phone, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, b.reschedule_by_host,
                     COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                     COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                     COALESCE(r.name, '') AS resource_name,
-                    et.sms_phone_mode
+                    et.sms_phone_mode,
+                    COALESCE(b.notes, '') AS notes
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2276,11 +2282,12 @@ async fn dashboard_bookings(
     // Claimable bookings: unclaimed bookings on event types watched by the user's teams.
     // For team event types et.account_id may be null, so the timezone falls back to the
     // event type's own tz column (always set since migration 046's backfill).
-    let claimable_bookings: Vec<(String, String, String, String, String, String, String, String, String, String)> =
+    let claimable_bookings: Vec<(String, String, String, String, String, String, String, String, String, String, String)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, et.title, t.name, bct.token, \
                     COALESCE(NULLIF(et.timezone, ''), 'UTC') AS stored_tz, \
-                    COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz \
+                    COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz, \
+                    COALESCE(b.notes, '') AS notes \
              FROM bookings b \
              JOIN event_types et ON et.id = b.event_type_id \
              JOIN event_type_watchers ew ON ew.event_type_id = et.id \
@@ -2306,7 +2313,7 @@ async fn dashboard_bookings(
     let claimable_ctx: Vec<minijinja::Value> = claimable_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, team_name, token, stored_tz, guest_tz)| {
+            |(id, name, email, start, end, title, team_name, token, stored_tz, guest_tz, notes)| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
@@ -2318,6 +2325,7 @@ async fn dashboard_bookings(
                     event_title => title,
                     team_name => team_name,
                     claim_token => token,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -2326,7 +2334,7 @@ async fn dashboard_bookings(
     let pending_ctx: Vec<minijinja::Value> = pending_bookings
         .iter()
         .map(
-            |(id, name, email, start, end, title, stored_tz, guest_tz, resource_name)| {
+            |(id, name, email, start, end, title, stored_tz, guest_tz, resource_name, notes)| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
                 context! {
@@ -2337,6 +2345,7 @@ async fn dashboard_bookings(
                     start_at_guest => secondary,
                     event_title => title,
                     resource_name => resource_name,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -2358,6 +2367,7 @@ async fn dashboard_bookings(
                 guest_tz,
                 resource_name,
                 sms_phone_mode,
+                notes,
             )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
@@ -2371,6 +2381,7 @@ async fn dashboard_bookings(
                     event_title => title,
                     awaiting_reschedule => *resched != 0,
                     resource_name => resource_name,
+                    notes => notes.trim(),
                 }
             },
         )
@@ -33462,6 +33473,63 @@ mod tests {
             body.contains("Pending Guest"),
             "Pending bookings should appear in pending approval section"
         );
+    }
+
+    // --- The guest's note shows on the host dashboard (#230) ---
+
+    #[tokio::test]
+    async fn dashboard_shows_the_guests_note_escaped() {
+        let (app, pool, session, et_id) = setup_test_app().await;
+
+        for (uid, email, status, notes) in [
+            (
+                "uid-note-pending",
+                "note-pending@test.com",
+                "pending",
+                "Pending note line 1\n<script>alert(1)</script>",
+            ),
+            (
+                "uid-note-confirmed",
+                "note-confirmed@test.com",
+                "confirmed",
+                "Confirmed note & agenda",
+            ),
+        ] {
+            sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token, notes) VALUES (?, ?, ?, 'Note Guest', ?, 'UTC', ?, ?, ?, ?, ?, ?, ?)")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&et_id)
+                .bind(uid)
+                .bind(email)
+                .bind(if status == "pending" { "2030-06-15T10:00:00" } else { "2030-06-16T10:00:00" })
+                .bind(if status == "pending" { "2030-06-15T10:30:00" } else { "2030-06-16T10:30:00" })
+                .bind(status)
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(notes)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/dashboard/bookings", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Pending note line 1\n&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+        assert!(body.contains("Confirmed note &amp; agenda"));
+        assert!(!body.contains("<script>alert(1)"));
+        assert!(body.contains("booking-notes"));
+
+        let response = app
+            .oneshot(get_authed("/dashboard", &session))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("Pending note line 1"));
+        assert!(!body.contains("<script>alert(1)"));
     }
 
     // --- Booking form only asks for a phone number when SMS is enabled ---
