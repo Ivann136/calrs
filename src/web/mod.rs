@@ -36261,12 +36261,17 @@ mod tests {
             "render_booking_action_error_keys_in(",
         ];
 
-        let src = std::fs::read_to_string("src/web/mod.rs").expect("read source");
-        let src = src
-            .split("\nmod tests {")
-            .next()
-            .unwrap_or(&src)
-            .to_string();
+        let src: String = web_source_files()
+            .iter()
+            .map(|file| {
+                let src = std::fs::read_to_string(file).expect("read source");
+                src.split("\nmod tests {")
+                    .next()
+                    .unwrap_or(&src)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let mut offenders = Vec::new();
         let mut checked = 0usize;
@@ -36346,8 +36351,11 @@ mod tests {
         ];
 
         let mut offenders = Vec::new();
-        for file in ["src/web/mod.rs", "src/auth.rs"] {
+        let mut files = web_source_files();
+        files.push(std::path::PathBuf::from("src/auth.rs"));
+        for file in &files {
             let src = std::fs::read_to_string(file).expect("read source");
+            let file = file.display();
             // Only the shipping code: the test module below renders templates
             // with deliberately minimal contexts.
             let src = src.split("\nmod tests {").next().unwrap_or(&src);
@@ -36508,6 +36516,32 @@ mod tests {
         }
         let mut out = Vec::new();
         walk(std::path::Path::new("templates"), &mut out);
+        out.sort();
+        out
+    }
+
+    /// The shipping `.rs` files of the web module, for the source-scanning
+    /// guards above. Test code (`tests/`, `test_support.rs`, `*_tests.rs`)
+    /// is left out: it renders templates with deliberately minimal contexts.
+    fn web_source_files() -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src/web dir") {
+                let path = entry.expect("dir entry").path();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if path.is_dir() {
+                    if name != "tests" {
+                        walk(&path, out);
+                    }
+                } else if name.ends_with(".rs")
+                    && !name.ends_with("_tests.rs")
+                    && name != "test_support.rs"
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(std::path::Path::new("src/web"), &mut out);
         out.sort();
         out
     }
