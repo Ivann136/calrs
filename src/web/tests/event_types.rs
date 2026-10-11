@@ -839,3 +839,257 @@ fn parse_optional_day_count_treats_zero_as_a_value() {
     assert_eq!(parse_optional_day_count("-1"), None);
     assert_eq!(parse_optional_day_count("abc"), None);
 }
+
+// --- Server-side validation of the event type form ---
+//
+// The red-team run created an event type with an empty title, the slug
+// "Bad Slug!" silently rewritten to "bad-slug", and a duration of -5.
+
+/// A valid event type form body, with `overrides` replacing (or adding)
+/// fields. Values are URL-encoded here.
+fn et_form_body(csrf: &str, overrides: &[(&str, &str)]) -> String {
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("_csrf", csrf),
+        ("title", "Checked Meeting"),
+        ("slug", "checked-meeting"),
+        ("duration_min", "45"),
+        ("buffer_before", "0"),
+        ("buffer_after", "0"),
+        ("min_notice_min", "60"),
+        ("location_value", "https://meet.example.com"),
+        ("avail_days", "1,2,3,4,5"),
+        ("avail_start", "09:00"),
+        ("avail_end", "17:00"),
+    ];
+    for (key, value) in overrides {
+        match fields.iter_mut().find(|(k, _)| k == key) {
+            Some(field) => field.1 = value,
+            None => fields.push((key, value)),
+        }
+    }
+    fields
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Each bad input, the Fluent key it must be refused with.
+const INVALID_EVENT_TYPE_INPUTS: &[(&str, &str, &str)] = &[
+    ("title", "   ", "form-error-event-type-title-required"),
+    ("slug", "Bad Slug!", "form-error-slug-charset"),
+    ("slug", "caf\u{e9}", "form-error-slug-charset"),
+    ("slug", "---", "form-error-slug-charset"),
+    ("duration_min", "-5", "form-error-event-type-duration"),
+    ("duration_min", "0", "form-error-event-type-duration"),
+    ("duration_min", "1441", "form-error-event-type-duration"),
+    ("duration_min", "abc", "form-error-event-type-duration"),
+    ("buffer_before", "-10", "form-error-event-type-number"),
+    ("buffer_after", "-1", "form-error-event-type-number"),
+    ("min_notice_min", "-60", "form-error-event-type-number"),
+    ("reminder_minutes", "-15", "form-error-event-type-number"),
+    (
+        "max_additional_guests",
+        "-1",
+        "form-error-event-type-number",
+    ),
+    (
+        "booking_horizon_days",
+        "-3",
+        "form-error-event-type-horizon",
+    ),
+    (
+        "booking_horizon_days",
+        "soon",
+        "form-error-event-type-horizon",
+    ),
+];
+
+async fn event_type_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM event_types")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The error page must show the message, and keep what was typed.
+fn assert_form_error(page: &str, key: &str, context: &str) {
+    let message = crate::i18n::translate("en", key, None);
+    let escaped = message.replace('\'', "&#x27;");
+    assert!(
+        page.contains(&message) || page.contains(&escaped),
+        "{context}: expected the {key} message on the re-rendered form"
+    );
+}
+
+#[tokio::test]
+async fn create_event_type_refuses_invalid_input() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let before = event_type_count(&pool).await;
+    let long_title = "x".repeat(256);
+    let mut cases: Vec<(&str, &str, &str)> = INVALID_EVENT_TYPE_INPUTS.to_vec();
+    cases.push(("title", &long_title, "form-error-event-type-title-length"));
+
+    for (field, value, key) in cases {
+        let csrf = "csrf-et-invalid";
+        let overrides = if field == "title" {
+            vec![(field, value)]
+        } else {
+            vec![("title", "Keep Me"), (field, value)]
+        };
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/dashboard/event-types/new",
+                &session,
+                csrf,
+                &et_form_body(csrf, &overrides),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{field}={value:?}");
+        let page = body_string(response).await;
+        assert_form_error(&page, key, &format!("{field}={value:?}"));
+        if field != "title" {
+            assert!(
+                page.contains("Keep Me"),
+                "{field}: the form keeps the title"
+            );
+        }
+        assert_eq!(event_type_count(&pool).await, before, "{field}={value:?}");
+    }
+
+    // The exact red-team submission.
+    let csrf = "csrf-et-redteam";
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/dashboard/event-types/new",
+            &session,
+            csrf,
+            &et_form_body(
+                csrf,
+                &[("title", ""), ("slug", "Bad Slug!"), ("duration_min", "-5")],
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(event_type_count(&pool).await, before);
+}
+
+#[tokio::test]
+async fn create_event_type_normalizes_case_and_spaces_and_derives_a_blank_slug() {
+    let (app, pool, session, _) = setup_test_app().await;
+    for (slug, title, expected) in [
+        ("  Team Sync ", "Whatever", "team-sync"),
+        ("", "Quarterly Review: Q3!", "quarterly-review-q3"),
+    ] {
+        let csrf = "csrf-et-normalize";
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/dashboard/event-types/new",
+                &session,
+                csrf,
+                &et_form_body(csrf, &[("slug", slug), ("title", title)]),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection(), "{slug:?}");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_types WHERE slug = ?")
+            .bind(expected)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "{slug:?} should be stored as {expected}");
+    }
+}
+
+#[tokio::test]
+async fn edit_event_type_refuses_invalid_input_and_keeps_the_row() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    for (field, value, key) in INVALID_EVENT_TYPE_INPUTS {
+        let csrf = "csrf-et-edit-invalid";
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/dashboard/event-types/test-meeting/edit",
+                &session,
+                csrf,
+                &et_form_body(csrf, &[("slug", "test-meeting"), (field, value)]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{field}={value:?}");
+        assert_form_error(&body_string(response).await, key, field);
+        let (slug, title, duration): (String, String, i32) =
+            sqlx::query_as("SELECT slug, title, duration_min FROM event_types WHERE id = ?")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (slug.as_str(), title.as_str(), duration),
+            ("test-meeting", "Test Meeting", 30),
+            "{field}={value:?} must not change the event type"
+        );
+    }
+}
+
+#[tokio::test]
+async fn team_event_type_create_and_edit_refuse_invalid_input() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let (team_id, team_et_id) = seed_team_event_type(&pool).await;
+    let before = event_type_count(&pool).await;
+
+    for (field, value, key) in INVALID_EVENT_TYPE_INPUTS {
+        let csrf = "csrf-team-et-invalid";
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/dashboard/group-event-types/new",
+                &session,
+                csrf,
+                &et_form_body(csrf, &[("team_id", &team_id), (field, value)]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "create {field}={value:?}");
+        assert_form_error(&body_string(response).await, key, field);
+        assert_eq!(event_type_count(&pool).await, before, "{field}={value:?}");
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/dashboard/group-event-types/{team_id}/team-sync/edit"),
+                &session,
+                csrf,
+                &et_form_body(csrf, &[("slug", "team-sync"), (field, value)]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "edit {field}={value:?}");
+        let (title, duration): (String, i32) =
+            sqlx::query_as("SELECT title, duration_min FROM event_types WHERE id = ?")
+                .bind(&team_et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((title.as_str(), duration), ("Team Sync", 30), "{field}");
+    }
+
+    // Control: a valid team create goes through.
+    let csrf = "csrf-team-et-ok";
+    let response = app
+        .oneshot(post_form(
+            "/dashboard/group-event-types/new",
+            &session,
+            csrf,
+            &et_form_body(csrf, &[("team_id", &team_id)]),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    assert_eq!(event_type_count(&pool).await, before + 1);
+}
