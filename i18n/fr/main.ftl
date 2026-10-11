@@ -1357,6 +1357,7 @@ etf-pending-expiry-hours =
 # Host, watcher and remaining guest emails (src/email.rs, #209)
 
 email-footer-sent-by = Envoyé par
+email-sender-via = { $host } via { $instance }
 email-date-at-time = { $date } à { $time }
 email-detail-phone = Téléphone :
 email-detail-expires = Expiration :
