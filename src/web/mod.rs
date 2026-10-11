@@ -3789,10 +3789,21 @@ struct SettingsForm {
     booking_email: Option<String>,
     timezone: Option<String>,
     language: Option<String>,
+    public_page_language: Option<String>,
     allow_dynamic_group: Option<String>,
     lend_resource_write: Option<String>,
     #[serde(default)]
     avail_schedule: String,
+}
+
+/// The two values of `users.public_page_language`. Anything else stored
+/// (an empty default from an old row) reads as 'visitor'.
+fn normalize_public_page_language(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "visitor" => Some("visitor"),
+        "host" => Some("host"),
+        _ => None,
+    }
 }
 
 async fn settings_page(
@@ -4050,6 +4061,7 @@ struct SettingsValues<'a> {
     booking_email: &'a str,
     timezone: &'a str,
     language: &'a str,
+    public_page_language: &'a str,
     allow_dynamic_group: bool,
     lend_resource_write: bool,
     avail_schedule: &'a str,
@@ -4071,6 +4083,8 @@ impl<'a> SettingsValues<'a> {
             booking_email: user.booking_email.as_deref().unwrap_or(""),
             timezone: &user.timezone,
             language: user.language.as_deref().unwrap_or(""),
+            public_page_language: normalize_public_page_language(&user.public_page_language)
+                .unwrap_or("visitor"),
             allow_dynamic_group: user.allow_dynamic_group,
             lend_resource_write,
             avail_schedule,
@@ -4122,6 +4136,7 @@ fn settings_render(
             tz_options => tz_options,
             form_language => values.language,
             lang_options => lang_options,
+            form_public_page_language => values.public_page_language,
             user_email => user.email,
             user_id => user.id,
             has_avatar => user.avatar_path.is_some(),
@@ -4203,6 +4218,15 @@ async fn settings_save(
         .filter(|s| crate::i18n::is_supported(s))
         .map(str::to_string);
 
+    // Only the two known values are accepted. A form without the field (an
+    // older page still open) keeps what is stored.
+    let stored_public_page_language =
+        normalize_public_page_language(&user.public_page_language).unwrap_or("visitor");
+    let public_page_language = match form.public_page_language.as_deref() {
+        None => Some(stored_public_page_language),
+        Some(value) => normalize_public_page_language(value),
+    };
+
     let allow_dynamic_group = form.allow_dynamic_group.as_deref() == Some("on");
     let lend_resource_write = form.lend_resource_write.as_deref() == Some("on");
 
@@ -4221,6 +4245,7 @@ async fn settings_save(
         booking_email: booking_email.as_deref().unwrap_or(""),
         timezone: &timezone,
         language: language.as_deref().unwrap_or(""),
+        public_page_language: public_page_language.unwrap_or(stored_public_page_language),
         allow_dynamic_group,
         lend_resource_write,
         avail_schedule: &form.avail_schedule,
@@ -4247,6 +4272,12 @@ async fn settings_save(
         let msg = crate::i18n::translate(auth_user.lang, "settings-error-name-length", None);
         return render_error(&msg, sidebar);
     }
+
+    let Some(public_page_language) = public_page_language else {
+        let msg =
+            crate::i18n::translate(auth_user.lang, "settings-error-public-page-language", None);
+        return render_error(&msg, sidebar);
+    };
 
     // Validate and update username if provided
     if let Some(ref uname) = new_username {
@@ -4291,7 +4322,7 @@ async fn settings_save(
     }
 
     let result = sqlx::query(
-        "UPDATE users SET name = ?, title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE users SET name = ?, title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&name)
     .bind(&title)
@@ -4299,6 +4330,7 @@ async fn settings_save(
     .bind(&booking_email)
     .bind(&timezone)
     .bind(&language)
+    .bind(public_page_language)
     .bind(allow_dynamic_group)
     .bind(lend_resource_write)
     .bind(&user.id)
@@ -11861,16 +11893,15 @@ async fn user_profile(
         Option<String>,
         Option<String>,
         Option<String>,
-        Option<String>,
     )> = sqlx::query_as(
-        "SELECT id, name, title, bio, avatar_path, language FROM users WHERE username = ? AND enabled = 1",
+        "SELECT id, name, title, bio, avatar_path FROM users WHERE username = ? AND enabled = 1",
     )
     .bind(&username)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
 
-    let (user_id, user_name, user_title, user_bio, avatar_path, language) = match user {
+    let (user_id, user_name, user_title, user_bio, avatar_path) = match user {
         Some(u) => u,
         None => {
             return Html(crate::i18n::translate(
@@ -11880,7 +11911,7 @@ async fn user_profile(
             ))
         }
     };
-    let lang = crate::i18n::resolve(language.as_deref(), &headers);
+    let lang = user_page_lang(&state.pool, &username, &headers).await;
 
     let event_types: Vec<(String, String, Option<String>, i32)> = sqlx::query_as(
         "SELECT et.slug, et.title, et.description, et.duration_min
@@ -12853,6 +12884,31 @@ async fn handle_dynamic_group_booking(
 
 // --- User-scoped booking handlers ---
 
+/// Language of a host's public pages under `/u/{username}`: the profile,
+/// slots, booking form, and the booking POST with the page it answers with.
+/// GET and POST both call this, so `bookings.language` (the page language,
+/// #209) always matches what the guest saw.
+///
+/// `users.public_page_language` picks the rule: 'visitor' (the default) uses
+/// the visitor's browser language, exactly as team and legacy pages do;
+/// 'host' uses the host's saved language (#76), falling back to the
+/// visitor's when the host has none.
+async fn user_page_lang(pool: &SqlitePool, username: &str, headers: &HeaderMap) -> &'static str {
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT language, public_page_language FROM users WHERE username = ? AND enabled = 1",
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    match row {
+        Some((host_language, mode)) if mode == "host" => {
+            crate::i18n::resolve(host_language.as_deref().map(str::trim), headers)
+        }
+        _ => crate::i18n::detect_from_headers(headers),
+    }
+}
+
 async fn show_slots_for_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -12870,21 +12926,15 @@ async fn show_slots_for_user(
             .into_response();
     }
 
-    let user: Option<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
-        "SELECT id, name, title, avatar_path, language FROM users WHERE username = ? AND enabled = 1",
+    let user: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, title, avatar_path FROM users WHERE username = ? AND enabled = 1",
     )
     .bind(&username)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
 
-    let (host_user_id, host_name, host_title, host_avatar_path, user_lang) = match user {
+    let (host_user_id, host_name, host_title, host_avatar_path) = match user {
         Some(user) => user,
         None => {
             return Html(crate::i18n::translate(
@@ -12896,7 +12946,7 @@ async fn show_slots_for_user(
         }
     };
 
-    let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
+    let lang = user_page_lang(&state.pool, &username, &headers).await;
 
     let et: Option<(String, String, String, Option<String>, i32, i32, i32, i32, String, Option<String>, String, String)> = sqlx::query_as(
         "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.location_type, et.location_value, et.visibility, et.default_calendar_view
@@ -13115,8 +13165,8 @@ async fn show_book_form_for_user(
             .into_response();
     }
 
-    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, Option<String>, String)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, u.language, et.sms_phone_mode
+    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, et.sms_phone_mode
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -13138,7 +13188,6 @@ async fn show_book_form_for_user(
         loc_value,
         visibility,
         max_additional_guests,
-        user_lang,
         sms_phone_mode,
     ) = match et {
         Some(e) => e,
@@ -13152,7 +13201,7 @@ async fn show_book_form_for_user(
         }
     };
 
-    let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
+    let lang = user_page_lang(&state.pool, &username, &headers).await;
 
     // Validate invite token for private event types
     let invite_guest_name;
@@ -13375,7 +13424,7 @@ async fn handle_booking_for_user(
         }
     };
 
-    let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
+    let lang = user_page_lang(&state.pool, &username, &headers).await;
     let needs_approval = requires_confirmation != 0;
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
     let phone_to_store = match resolve_guest_phone(
@@ -37443,9 +37492,25 @@ mod tests {
             .unwrap()
     }
 
-    /// A user's booking page is shown in the host's saved language (#76), so
-    /// that is what the booking stores and what the guest is emailed in,
-    /// whatever the guest's browser says: page and emails agree.
+    async fn set_public_page_language(pool: &SqlitePool, mode: &str) {
+        sqlx::query("UPDATE users SET public_page_language = ? WHERE email = 'test@example.com'")
+            .bind(mode)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn get_with_language(uri: &str, accept: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("accept-language", accept)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// With "always my language", a user's booking page is shown in the
+    /// host's saved language (#76), so that is what the booking stores and
+    /// what the guest is emailed in, whatever the guest's browser says.
     #[tokio::test]
     async fn user_page_booking_stores_the_language_the_form_was_shown_in() {
         let _env = crate::test_support::ENV_LOCK.lock().await;
@@ -37453,6 +37518,7 @@ mod tests {
         let (port, mails) = spawn_capturing_mta().await;
         use_capturing_mta(&pool, port).await;
         set_user_language(&pool, "test@example.com", "fr").await;
+        set_public_page_language(&pool, "host").await;
 
         let form = app
             .clone()
@@ -37494,12 +37560,13 @@ mod tests {
     }
 
     /// A browser language calrs does not ship falls back like the page does:
-    /// on a French host's page, French.
+    /// on the page of a host who chose "always my language", French.
     #[tokio::test]
     async fn unsupported_browser_language_stores_the_page_language() {
         let _env = crate::test_support::ENV_LOCK.lock().await;
         let (app, pool, _, _) = setup_test_app().await;
         set_user_language(&pool, "test@example.com", "fr").await;
+        set_public_page_language(&pool, "host").await;
 
         let csrf = "csrf-page-lang-ja";
         app.oneshot(book_request(
@@ -37586,5 +37653,137 @@ mod tests {
         assert!(guest.contains("Bonjour Guest,"), "{guest}");
         assert!(guest.contains("<html lang=\"fr\">"), "{guest}");
         assert!(!guest.contains("Hi Guest"), "{guest}");
+    }
+
+    // --- Public booking page language setting ---
+
+    /// By default a user's pages follow the visitor: a French-speaking host's
+    /// pages are English for an English browser, the booking stores 'en',
+    /// and only the host's own email is French.
+    #[tokio::test]
+    async fn user_pages_follow_the_visitor_by_default() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        set_user_language(&pool, "test@example.com", "fr").await;
+
+        for uri in [
+            "/u/testuser".to_string(),
+            "/u/testuser/test-meeting".to_string(),
+            format!(
+                "/u/testuser/test-meeting/book?date={}&time=10:00",
+                far_future_monday()
+            ),
+        ] {
+            let body = body_string(
+                app.clone()
+                    .oneshot(get_with_language(&uri, "en-US,en;q=0.9"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(body.contains("<html lang=\"en\">"), "{uri}: {body}");
+        }
+
+        let csrf = "csrf-public-visitor";
+        let response = app
+            .oneshot(book_request(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                "",
+                "en-US,en;q=0.9",
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+        assert_eq!(
+            stored_language(&pool, "guest@test.com").await.as_deref(),
+            Some("en")
+        );
+        let guest = mail_to(&mails, "guest@test.com").await;
+        assert!(guest.contains("Hi Guest,"), "{guest}");
+        let host = mail_to(&mails, "test@example.com").await;
+        assert!(host.contains("Nouvelle réservation !"), "{host}");
+    }
+
+    /// "Always my language" with no saved language falls back to the
+    /// visitor's.
+    #[tokio::test]
+    async fn host_mode_without_a_saved_language_follows_the_visitor() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, _) = setup_test_app().await;
+        set_public_page_language(&pool, "host").await;
+
+        let body = body_string(
+            app.clone()
+                .oneshot(get_with_language(
+                    "/u/testuser/test-meeting",
+                    "de-DE,de;q=0.9",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("<html lang=\"de\">"), "{body}");
+
+        let csrf = "csrf-public-host-none";
+        app.oneshot(book_request(
+            "/u/testuser/test-meeting/book",
+            csrf,
+            "",
+            "de-DE,de;q=0.9",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_language(&pool, "guest@test.com").await.as_deref(),
+            Some("de")
+        );
+    }
+
+    async fn stored_public_page_language(pool: &SqlitePool) -> String {
+        sqlx::query_scalar(
+            "SELECT public_page_language FROM users WHERE email = 'test@example.com'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_save_the_public_page_language_and_reject_unknown_values() {
+        let (app, pool, session, _) = setup_test_app().await;
+        assert_eq!(stored_public_page_language(&pool).await, "visitor");
+
+        let csrf = "csrf-settings-public-lang";
+        let body = format!(
+            "_csrf={}&name=Test+User&booking_email=&public_page_language=host",
+            csrf
+        );
+        let response = app
+            .clone()
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let page = body_string(response).await;
+        assert!(page.contains("<option value=\"host\" selected>"), "{page}");
+        assert_eq!(stored_public_page_language(&pool).await, "host");
+
+        let body = format!(
+            "_csrf={}&name=Test+User&booking_email=&public_page_language=guest",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        let page = body_string(response).await;
+        assert!(
+            page.contains("Pick a valid public booking page language."),
+            "{page}"
+        );
+        assert_eq!(stored_public_page_language(&pool).await, "host");
     }
 }
