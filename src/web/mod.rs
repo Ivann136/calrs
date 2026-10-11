@@ -4280,7 +4280,9 @@ async fn settings_save(
         return render_error(&msg, sidebar);
     };
 
-    // Validate and update username if provided
+    // Validate the username if provided. It is written by the single UPDATE
+    // below, together with every other field, so a later validation failure
+    // cannot leave a half-saved row behind.
     if let Some(ref uname) = new_username {
         if uname.len() < 2 {
             let msg =
@@ -4301,11 +4303,6 @@ async fn settings_save(
                     crate::i18n::translate(auth_user.lang, "settings-error-username-taken", None);
                 return render_error(&msg, sidebar);
             }
-            let _ = sqlx::query("UPDATE users SET username = ? WHERE id = ?")
-                .bind(uname)
-                .bind(&user.id)
-                .execute(&state.pool)
-                .await;
         }
     }
 
@@ -4323,9 +4320,10 @@ async fn settings_save(
     }
 
     let result = sqlx::query(
-        "UPDATE users SET name = ?, title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE users SET name = ?, username = COALESCE(?, username), title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, public_page_language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&name)
+    .bind(&new_username)
     .bind(&title)
     .bind(&bio)
     .bind(&booking_email)
@@ -32448,6 +32446,63 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(name.unwrap(), "Updated Name");
+    }
+
+    #[tokio::test]
+    async fn settings_failed_save_does_not_write_the_username() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let csrf = "test-csrf-settings-208";
+        let body = format!(
+            "_csrf={}&name=Test+User&username=brand-new-name&booking_email=not-an-email",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let resp_body = body_string(response).await;
+        assert!(
+            !resp_body.contains("Settings saved"),
+            "a rejected booking email must not report a save"
+        );
+
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "the username must not be written by a failed save"
+        );
+        assert_ne!(after.as_deref(), Some("brand-new-name"));
+    }
+
+    #[tokio::test]
+    async fn settings_save_writes_the_username_with_the_rest() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-settings-208-ok";
+        let body = format!(
+            "_csrf={}&name=Test+User&username=brand-new-name&booking_email=",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.as_deref(), Some("brand-new-name"));
     }
 
     #[tokio::test]
