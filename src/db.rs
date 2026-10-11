@@ -288,6 +288,10 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             "068_writeback_failures",
             include_str!("../migrations/068_writeback_failures.sql"),
         ),
+        (
+            "069_source_sync_errors",
+            include_str!("../migrations/069_source_sync_errors.sql"),
+        ),
     ];
 
     let mut applied_count = 0u32;
@@ -897,7 +901,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 68, "All 68 migrations should be tracked");
+        assert_eq!(count.0, 69, "All 69 migrations should be tracked");
     }
 
     #[tokio::test]
@@ -993,7 +997,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 68, "Still 68 migrations after second run");
+        assert_eq!(count.0, 69, "Still 69 migrations after second run");
     }
 
     #[tokio::test]

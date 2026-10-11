@@ -1013,7 +1013,7 @@ fn log_email_result(result: anyhow::Result<()>, email: &'static str, booking: &s
 /// up with a 504, and guests retried a booking that existed (#236). The
 /// future owns everything it needs; failures are logged via
 /// `log_email_result` inside it.
-fn spawn_emails<F>(task: F)
+pub(crate) fn spawn_emails<F>(task: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1224,7 +1224,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             "SELECT cs.id
              FROM caldav_sources cs
              WHERE cs.enabled = 1
-             ORDER BY COALESCE(cs.last_synced, '2000-01-01') ASC
+             ORDER BY MAX(COALESCE(cs.last_synced, '2000-01-01'), COALESCE(cs.last_sync_error_at, '2000-01-01')) ASC
              LIMIT 1",
         )
         .fetch_optional(&pool)
@@ -3727,8 +3727,10 @@ async fn dashboard_sources(
         Option<String>,
         String,
         String,
+        Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type, cs.provider_type
+        "SELECT cs.id, cs.name, cs.url, cs.username, cs.last_synced, cs.enabled, cs.write_calendar_href, cs.auth_type, cs.provider_type, cs.last_sync_error, cs.sync_failing_since
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ?
@@ -3765,6 +3767,8 @@ async fn dashboard_sources(
                 write_cal,
                 auth_type,
                 provider_type,
+                last_sync_error,
+                sync_failing_since,
             )| {
                 let cals: Vec<minijinja::Value> = all_calendars
                     .iter()
@@ -3783,6 +3787,10 @@ async fn dashboard_sources(
                     url => url,
                     username => username,
                     last_synced => last_synced.as_deref().unwrap_or("never"),
+                    // Availability is still served from the last good sync;
+                    // this tells the owner it is stale (#162).
+                    sync_error => last_sync_error.as_deref().unwrap_or(""),
+                    sync_failing_since => sync_failing_since.as_deref().unwrap_or(""),
                     enabled => enabled,
                     write_calendar_href => write_cal.as_deref().unwrap_or(""),
                     auth_type => auth_type,
@@ -7964,45 +7972,24 @@ async fn run_sync_for_source(
     token_expires_at: Option<&str>,
     provider_type: &str,
 ) -> (Vec<String>, usize) {
-    // EWS sources go through the provider trait — no OAuth2 dispatch needed.
-    if provider_type == crate::providers::factory::kinds::EWS {
-        let enc = match password_enc {
-            Some(e) => e,
-            None => return (vec!["EWS source missing password".to_string()], 0),
-        };
-        let password = match crate::crypto::decrypt_password(key, enc) {
-            Ok(p) => p,
-            Err(e) => return (vec![format!("Decrypt failed: {}", e)], 0),
-        };
-        return run_sync(
-            pool,
-            key,
-            source_id,
-            provider_type,
-            url,
-            username,
-            &password,
-        )
-        .await;
-    }
-    let client = match crate::oauth2_caldav::build_client_for_source(
+    // Same dispatch as the background and CLI syncs, so a failure here
+    // (including credentials that no longer work) is recorded on the source
+    // too. A calendar that failed to fetch fails the sync, so "Sync
+    // complete." is only shown when every calendar synced (#162).
+    match crate::commands::sync::sync_one_source(
         pool,
         key,
         source_id,
         url,
-        auth_type,
         username,
         password_enc,
+        auth_type,
         access_token_enc,
         token_expires_at,
+        provider_type,
     )
     .await
     {
-        Ok(c) => c,
-        Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
-    };
-
-    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
         Ok(()) => {
             let cal_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")

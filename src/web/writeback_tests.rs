@@ -406,3 +406,168 @@ async fn bookings_dashboard_flags_failed_writebacks() {
     assert!(body.contains("PUT returned 400 Bad Request"), "{body}");
     assert!(!id.is_empty());
 }
+
+// --- Calendar source sync failures (#162) ---
+
+/// A host whose only source points at a closed loopback port, so every sync
+/// fails fast with a connection error. Returns (pool, host id, source id).
+async fn failing_source_fixture() -> (SqlitePool, String, String) {
+    let pool = setup_test_db().await;
+    let host = insert_role_user(&pool, "owner@sync.test", "user").await;
+    sqlx::query("UPDATE users SET name = 'Olga Owner', language = 'de' WHERE id = ?")
+        .bind(&host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_personal_et(&pool, &host, "sync").await;
+    let source_id = seed_write_source(&pool, &host, "http://127.0.0.1:1/dav/").await;
+    (pool, host, source_id)
+}
+
+async fn sync_once(pool: &SqlitePool, source_id: &str) -> anyhow::Result<()> {
+    let (url, password_enc): (String, Option<String>) =
+        sqlx::query_as("SELECT url, password_enc FROM caldav_sources WHERE id = ?")
+            .bind(source_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    crate::commands::sync::sync_one_source(
+        pool,
+        &[0u8; 32],
+        source_id,
+        &url,
+        "u",
+        password_enc.as_deref(),
+        "basic",
+        None,
+        None,
+        "caldav",
+    )
+    .await
+}
+
+async fn source_health(pool: &SqlitePool, source_id: &str) -> (Option<String>, i64, Option<String>) {
+    sqlx::query_as(
+        "SELECT last_sync_error, sync_failure_count, sync_alerted_at FROM caldav_sources WHERE id = ?",
+    )
+    .bind(source_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn backdate_failing_since(pool: &SqlitePool, source_id: &str) {
+    sqlx::query(
+        "UPDATE caldav_sources SET sync_failing_since = datetime('now', '-2 hours') WHERE id = ?",
+    )
+    .bind(source_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Mails to `email` once the background sends settle.
+async fn settled_mail_count(mails: &std::sync::Mutex<Vec<CapturedMail>>, email: &str) -> usize {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    mails
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.rcpt.iter().any(|r| r.contains(email)))
+        .count()
+}
+
+/// Failures are recorded; the owner is emailed once the failure has lasted
+/// an hour over three attempts, not before and not twice; a recovery clears
+/// everything and re-arms the alert.
+#[tokio::test]
+async fn source_sync_failure_is_recorded_alerted_once_and_cleared() {
+    let _env = crate::test_support::ENV_LOCK.lock().await;
+    let _guard = crate::test_support::EnvGuard::new();
+    let (pool, _host, source_id) = failing_source_fixture().await;
+    let (port, mails) = spawn_capturing_mta().await;
+    use_capturing_mta(&pool, port).await;
+
+    for _ in 0..3 {
+        assert!(sync_once(&pool, &source_id).await.is_err());
+    }
+    let (error, count, alerted) = source_health(&pool, &source_id).await;
+    assert!(error.is_some());
+    assert_eq!(count, 3);
+    assert_eq!(alerted, None, "three quick failures are not an hour yet");
+    assert_eq!(settled_mail_count(&mails, "owner@sync.test").await, 0);
+
+    backdate_failing_since(&pool, &source_id).await;
+    assert!(sync_once(&pool, &source_id).await.is_err());
+    let body = mail_to(&mails, "owner@sync.test").await;
+    assert!(
+        body.contains("Eine Kalenderquelle synchronisiert nicht mehr"),
+        "in the owner's language: {body}"
+    );
+    assert!(body.contains("Work calendar"), "{body}");
+    assert!(sync_once(&pool, &source_id).await.is_err());
+    assert_eq!(
+        settled_mail_count(&mails, "owner@sync.test").await,
+        1,
+        "one email per failure run"
+    );
+
+    // Recovery clears the record and re-arms the alert.
+    crate::commands::sync_health::record_sync_outcome(&pool, &[0u8; 32], &source_id, &Ok(()))
+        .await;
+    assert_eq!(source_health(&pool, &source_id).await, (None, 0, None));
+
+    // Failing again for long enough alerts again.
+    for _ in 0..3 {
+        assert!(sync_once(&pool, &source_id).await.is_err());
+    }
+    backdate_failing_since(&pool, &source_id).await;
+    assert!(sync_once(&pool, &source_id).await.is_err());
+    assert_eq!(settled_mail_count(&mails, "owner@sync.test").await, 2);
+}
+
+/// On-demand syncs (slot pages) do not retry a source that failed within
+/// the last five minutes, so a dead server does not slow every page load.
+#[tokio::test]
+async fn on_demand_sync_backs_off_after_a_failure() {
+    let (pool, host, source_id) = failing_source_fixture().await;
+    crate::commands::sync::sync_if_stale(&pool, &[0u8; 32], &host).await;
+    assert_eq!(source_health(&pool, &source_id).await.1, 1);
+    crate::commands::sync::sync_if_stale(&pool, &[0u8; 32], &host).await;
+    assert_eq!(
+        source_health(&pool, &source_id).await.1,
+        1,
+        "not retried within the stale window"
+    );
+}
+
+/// The calendar sources page shows a failing source's error.
+#[tokio::test]
+async fn sources_dashboard_shows_the_sync_error() {
+    let (app, pool, session, _et_id) = setup_test_app().await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'testuser'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let source_id = seed_write_source(&pool, &user_id, "http://127.0.0.1:1/dav/").await;
+    sqlx::query(
+        "UPDATE caldav_sources SET last_sync_error = 'PROPFIND returned 401 Unauthorized', \
+         sync_failing_since = '2026-10-11 08:00:00', sync_failure_count = 4 WHERE id = ?",
+    )
+    .bind(&source_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(get_authed("/dashboard/sources", &session))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("Sync failing since 2026-10-11 08:00:00 UTC"),
+        "{body}"
+    );
+    assert!(body.contains("PROPFIND returned 401 Unauthorized"), "{body}");
+}

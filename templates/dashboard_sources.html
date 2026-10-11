@@ -17,6 +17,7 @@
           {% endif %}
           <div style="color: var(--text-muted); font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ s.url }}</div>
           <div style="color: var(--text-muted); font-size: 0.75rem;">{% if s.auth_type == "oauth2" %}<span style="background: var(--accent); color: white; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.7rem; font-weight: 600;">OAuth2</span> {{ s.username }}{% else %}{{ s.username }}{% endif %} &middot; {{ t("sources-last-sync") }} {{ s.last_synced }}</div>
+          {% if s.sync_error %}<div class="source-sync-error" style="color: var(--error-text); font-size: 0.75rem; overflow-wrap: anywhere;">{{ t("sources-sync-failing", since=s.sync_failing_since, error=s.sync_error) }}</div>{% endif %}
         </div>
         <div style="display: flex; gap: 0.375rem; align-items: center; flex-shrink: 0; margin-left: 0.75rem;">
           <form method="post" action="/dashboard/sources/{{ s.id }}/sync" style="margin: 0;">

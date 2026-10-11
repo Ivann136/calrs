@@ -1574,6 +1574,60 @@ fn compose_host_writeback_failure(details: &BookingDetails, error: &str) -> Comp
     .compose()
 }
 
+/// A calendar source that keeps failing to sync, for its owner (#162).
+#[derive(Clone, Debug)]
+pub struct SourceSyncFailure {
+    pub owner_name: String,
+    pub owner_email: String,
+    /// The owner's saved language (`users.language`); English when `None`.
+    pub language: Option<String>,
+    pub source_name: String,
+    pub error: String,
+    pub failing_since: String,
+}
+
+/// Tell a source's owner that it has stopped syncing.
+pub async fn send_source_sync_failure(
+    config: &SmtpConfig,
+    alert: &SourceSyncFailure,
+) -> Result<()> {
+    let to = format!("{} <{}>", alert.owner_name, alert.owner_email).parse()?;
+    send_composed(
+        config,
+        Sender::Instance,
+        to,
+        compose_source_sync_failure(alert),
+        None,
+    )
+    .await
+}
+
+fn compose_source_sync_failure(alert: &SourceSyncFailure) -> ComposedEmail {
+    let lang = lang_or_en(alert.language.as_deref());
+    let action = t(lang, "email-source-failure-action");
+    EmailParts {
+        lang,
+        subject: ta(
+            lang,
+            "email-source-failure-subject",
+            [("source", &alert.source_name)],
+        ),
+        heading: t(lang, "email-source-failure-heading"),
+        message: t(lang, "email-source-failure-intro"),
+        accent: "#f59e0b",
+        rows: vec![
+            row(t(lang, "email-detail-source"), &alert.source_name),
+            row(t(lang, "email-detail-failing-since"), &alert.failing_since),
+            row(t(lang, "email-detail-error"), &alert.error),
+        ],
+        plain_lines: vec![],
+        footer_plain: Some(action.clone()),
+        footer_html: Some(action),
+        actions: vec![],
+    }
+    .compose()
+}
+
 /// Send booking reminder to the guest
 pub async fn send_guest_reminder(
     config: &SmtpConfig,
