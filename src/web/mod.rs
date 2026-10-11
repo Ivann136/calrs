@@ -4881,6 +4881,31 @@ async fn confirm_booking(
     caldav_push_booking(&state.pool, &state.secret_key, &user.id, &uid, &details).await;
     resource_push_booking(&state.pool, &state.secret_key, &uid, &details).await;
 
+    // Confirmation SMS to the guest, the same deferred send as the token
+    // approve path: a pending booking stays silent until the host approves.
+    let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
+    )
+    .bind(&bid)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    if let Some((guest_phone, sms_phone_mode)) = sms_target {
+        if let Some(ctx) = crate::sms::SmsContext::for_booking(
+            &details,
+            guest_phone.as_deref(),
+            crate::sms::collects_phone(&sms_phone_mode),
+        ) {
+            crate::sms::notify_guest(
+                &state.pool,
+                &state.secret_key,
+                crate::sms::SmsEvent::Confirmed,
+                ctx,
+            )
+            .await;
+        }
+    }
+
     // Send confirmation emails
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
@@ -35470,6 +35495,98 @@ mod tests {
         assert!(mail.contains("Bonjour Guest,"), "{mail}");
         assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
         assert!(!mail.contains("Hi Guest,"), "{mail}");
+    }
+
+    /// Approving from the dashboard sends the guest the confirmation SMS, like
+    /// the approve link in the host's email always did.
+    #[tokio::test]
+    async fn dashboard_approval_texts_the_guest() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+
+        // A webhook gateway that records each request body and accepts it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = received.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+
+        sqlx::query(
+            "INSERT INTO sms_config (id, provider, sender, base_url, default_country_code) \
+             VALUES ('cfg', 'webhook', 'calrs', ?, '+33')",
+        )
+        .bind(format!("http://127.0.0.1:{port}/sms"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-sms-approve").await;
+        sqlx::query("UPDATE bookings SET guest_phone = '+33612345678' WHERE id = ?")
+            .bind(&booking_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "test-csrf-sms-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "expected one SMS: {requests:?}");
+        assert!(requests[0].contains("+33612345678"), "{}", requests[0]);
+        let usage: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sms_usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(usage.0, 1, "the accepted SMS should be recorded");
     }
 
     /// Same for the decline link in the host's approval email.
