@@ -65,6 +65,49 @@ struct EventTypeRow {
     active: String,
 }
 
+/// Bookings that make the host of `et_id` busy around a window, as raw
+/// (start_at, end_at) strings for `booking_time::busy_range`. The host is the
+/// event type owner, and the rule is the web slot engine's
+/// (`booking_time::USER_BUSY_BOOKINGS`): their own bookings, bookings assigned
+/// to them on other people's team event types, unassigned collective team
+/// bookings, and pending requests whose event type holds the slot. Bookings
+/// of other users on the same instance do not count. The window bounds are
+/// ISO local times and are widened by two days on each side, like the web
+/// path, because stored times may be UTC.
+pub(crate) async fn host_busy_bookings(
+    pool: &SqlitePool,
+    et_id: &str,
+    window_start_iso: &str,
+    window_end_iso: &str,
+) -> Result<Vec<(String, String)>> {
+    let host: Option<String> = sqlx::query_scalar(
+        "SELECT a.user_id FROM event_types et JOIN accounts a ON a.id = et.account_id WHERE et.id = ?",
+    )
+    .bind(et_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    let Some(host) = host else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query_as(&format!(
+        "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b
+         JOIN event_types et ON et.id = b.event_type_id
+         JOIN accounts a ON a.id = et.account_id
+         WHERE {}
+           AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')",
+        crate::booking_time::USER_BUSY_BOOKINGS
+    ))
+    .bind(&host)
+    .bind(&host)
+    .bind(&host)
+    .bind(window_end_iso)
+    .bind(window_start_iso)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Fetch non-recurring, busy (non-cancelled, OPAQUE) events for `et_id` whose
 /// stored time range overlaps `[window_start, window_end]`.
 ///
@@ -261,20 +304,11 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
                 })
                 .collect();
 
-            // Bookings (already in host-local time, no conversion needed).
-            // Pending requests block too when their event type holds the
-            // slot (`pending_blocks_slot`), as on the web slot pages.
-            let booking_busy: Vec<(String, String)> = sqlx::query_as(
-                "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b
-                 JOIN event_types et ON et.id = b.event_type_id
-                 WHERE (b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1))
-                   AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')",
-            )
-            .bind(&end_iso)
-            .bind(&now_iso)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+            // The host's bookings, converted by `busy_range` at the
+            // comparison below (UTC rows) or kept as wall clock (legacy rows).
+            let booking_busy = host_busy_bookings(pool, &et_id, &now_iso, &end_iso)
+                .await
+                .unwrap_or_default();
 
             busy_events.extend(booking_busy);
 
@@ -776,5 +810,53 @@ mod tests {
                 .unwrap();
         assert_eq!(horizon, Some(5));
         assert_eq!(clamp_days_to_horizon(30, horizon), 6);
+    }
+
+    /// The CLI used to count every booking on the instance as busy for every
+    /// host. It now follows the web rule: only what makes this host busy.
+    #[tokio::test]
+    async fn host_busy_bookings_only_counts_the_host() {
+        let pool = setup_db().await;
+        sqlx::raw_sql(
+            "INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES
+                 ('host', 'host@x', 'Host', 'admin', 'local', 'host', 1),
+                 ('other', 'other@x', 'Other', 'user', 'local', 'other', 1);
+             INSERT INTO accounts (id, name, email, timezone, user_id) VALUES
+                 ('acc-host', 'Host', 'host@x', 'UTC', 'host'),
+                 ('acc-other', 'Other', 'other@x', 'UTC', 'other');
+             INSERT INTO event_types (id, account_id, slug, title, duration_min) VALUES
+                 ('et-host', 'acc-host', 'mine', 'Mine', 30),
+                 ('et-other', 'acc-other', 'theirs', 'Theirs', 30);
+             INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, assigned_user_id) VALUES
+                 ('own', 'et-host', 'u1', 'G', 'g@x', 'UTC', '2030-03-18T09:00:00', '2030-03-18T09:30:00', 'confirmed', 'c1', 'r1', NULL),
+                 ('assigned-to-host', 'et-other', 'u2', 'G', 'g@x', 'UTC', '2030-03-18T10:00:00', '2030-03-18T10:30:00', 'confirmed', 'c2', 'r2', 'host'),
+                 ('someone-elses', 'et-other', 'u3', 'G', 'g@x', 'UTC', '2030-03-18T11:00:00', '2030-03-18T11:30:00', 'confirmed', 'c3', 'r3', NULL),
+                 ('own-but-assigned-away', 'et-host', 'u4', 'G', 'g@x', 'UTC', '2030-03-18T12:00:00', '2030-03-18T12:30:00', 'confirmed', 'c4', 'r4', 'other'),
+                 ('held', 'et-host', 'u5', 'G', 'g@x', 'UTC', '2030-03-18T13:00:00', '2030-03-18T13:30:00', 'pending', 'c5', 'r5', NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut starts: Vec<String> = host_busy_bookings(
+            &pool,
+            "et-host",
+            "2030-03-18T00:00:00",
+            "2030-03-18T23:59:59",
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+        starts.sort();
+        assert_eq!(
+            starts,
+            vec![
+                "2030-03-18T09:00:00",
+                "2030-03-18T10:00:00",
+                "2030-03-18T13:00:00"
+            ]
+        );
     }
 }

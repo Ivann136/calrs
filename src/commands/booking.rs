@@ -185,10 +185,14 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
             }
 
             // Validate: no conflicts with existing bookings
-            let booking_conflicts: Vec<(String, String)> =
-                sqlx::query_as("SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b JOIN event_types et ON et.id = b.event_type_id WHERE b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1)")
-                    .fetch_all(pool)
-                    .await?;
+            // Only the host's own busy bookings, same rule as the web path.
+            let booking_conflicts = crate::commands::event_type::host_busy_bookings(
+                pool,
+                &et_id,
+                &buf_start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                &buf_end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            )
+            .await?;
 
             for (bs, be) in &booking_conflicts {
                 if let Some((s, e)) = crate::booking_time::busy_range(bs, be, host_tz) {
