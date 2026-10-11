@@ -4,6 +4,27 @@ use chrono::{DateTime, Duration, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use sqlx::SqlitePool;
 
+/// SQL condition selecting the bookings that make one user busy. Expects the
+/// aliases `b` (bookings), `et` (its event type) and `a` (that event type's
+/// account), and binds the user id three times.
+///
+/// A booking makes a user busy when it is assigned to them, or when it is
+/// unassigned and they own the event type (personal bookings), or when it is
+/// an unassigned team booking (collective mode) and they are a member of that
+/// team. An assigned booking must NOT mark the event type owner busy: on a
+/// round-robin team the owner stays free when another member took the
+/// booking (#146). Pending requests count when their own event type holds
+/// the slot (`pending_blocks_slot`, #234).
+///
+/// Shared by the web slot engine, the troubleshoot view and the CLI so the
+/// three can never disagree about who is busy.
+pub const USER_BUSY_BOOKINGS: &str = "(b.assigned_user_id = ?
+        OR (b.assigned_user_id IS NULL AND a.user_id = ?)
+        OR (b.assigned_user_id IS NULL AND et.team_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM team_members tm
+              WHERE tm.team_id = et.team_id AND tm.user_id = ?)))
+   AND (b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1))";
+
 pub fn naive(value: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(value.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))

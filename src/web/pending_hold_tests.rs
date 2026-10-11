@@ -736,3 +736,54 @@ async fn team_event_type_form_persists_the_pending_settings() {
     .unwrap();
     assert_eq!(stored, (0, Some(4)));
 }
+
+#[tokio::test]
+async fn troubleshoot_counts_the_same_bookings_as_the_slot_pages() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'testuser'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let bob = insert_role_user(&pool, "bob@test.com", "user").await;
+    let bobs_et = insert_personal_et(&pool, &bob, "bobs-team-sync").await;
+    // Assigned to testuser on someone else's event type: testuser is busy.
+    insert_v1_booking(
+        &pool,
+        &bobs_et,
+        "assigned@test.com",
+        utc(2030, 3, 18, 11, 0),
+        30,
+        "confirmed",
+        &[
+            ("assigned_user_id", Some(user_id)),
+            ("guest_name", Some("Assigned Guest".into())),
+        ],
+    )
+    .await;
+    // On testuser's own event type but assigned to bob: testuser is free.
+    insert_v1_booking(
+        &pool,
+        &et_id,
+        "bobs@test.com",
+        utc(2030, 3, 18, 14, 0),
+        30,
+        "confirmed",
+        &[
+            ("assigned_user_id", Some(bob)),
+            ("guest_name", Some("Bobs Guest".into())),
+        ],
+    )
+    .await;
+
+    let response = app
+        .oneshot(get_authed(
+            "/dashboard/troubleshoot?date=2030-03-18&event_type=test-meeting",
+            &session,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = body_string(response).await;
+    assert!(body.contains("Assigned Guest"), "{body}");
+    assert!(!body.contains("Bobs Guest"), "{body}");
+}

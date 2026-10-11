@@ -14083,19 +14083,15 @@ async fn fetch_busy_times_for_user_ex(
     // (`pending_blocks_slot`, on by default): otherwise a second guest is
     // offered the slot, fills the form, and is bounced at submit, and an
     // overlapping slot on another event type could be requested as well (#234).
-    let bookings: Vec<(String, String)> = sqlx::query_as(
+    let bookings: Vec<(String, String)> = sqlx::query_as(&format!(
         "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
-         WHERE (b.assigned_user_id = ?
-                OR (b.assigned_user_id IS NULL AND a.user_id = ?)
-                OR (b.assigned_user_id IS NULL AND et.team_id IS NOT NULL AND EXISTS (
-                      SELECT 1 FROM team_members tm
-                      WHERE tm.team_id = et.team_id AND tm.user_id = ?)))
-           AND (b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1))
+         WHERE {}
            AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
            AND (? = '' OR b.id != ?)",
-    )
+        crate::booking_time::USER_BUSY_BOOKINGS
+    ))
     .bind(user_id)
     .bind(user_id)
     .bind(user_id)
@@ -16723,18 +16719,21 @@ async fn troubleshoot(
         }
     }
 
-    // Bookings for this date. Pending requests only block when their event
-    // type holds the slot (`pending_blocks_slot`), same as the slot pages.
-    let bookings: Vec<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.guest_name, et2.title, b.status
+    // Bookings for this date: the same bookings that make this user busy on
+    // the slot pages (their own, the ones assigned to them on someone else's
+    // team event type, unassigned collective ones, and held pending requests).
+    let bookings: Vec<(String, String, String, String, String)> = sqlx::query_as(&format!(
+        "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at, b.guest_name, et.title, b.status
          FROM bookings b
-         JOIN event_types et2 ON et2.id = b.event_type_id
-         JOIN accounts a ON a.id = et2.account_id
-         WHERE a.user_id = ?
-           AND (b.status = 'confirmed' OR (b.status = 'pending' AND et2.pending_blocks_slot = 1))
+         JOIN event_types et ON et.id = b.event_type_id
+         JOIN accounts a ON a.id = et.account_id
+         WHERE {}
            AND b.start_at < strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at > strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
          ORDER BY b.start_at",
-    )
+        crate::booking_time::USER_BUSY_BOOKINGS
+    ))
+    .bind(&user.id)
+    .bind(&user.id)
     .bind(&user.id)
     .bind(&day_end_iso)
     .bind(&day_start_iso)
