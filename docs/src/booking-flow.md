@@ -198,9 +198,9 @@ All emails are sent as **HTML with plain text fallback**. They include event tit
 
 Every email is written in its reader's language, in any of the languages calrs ships:
 
-- **Guests** (and the additional attendees they add) get the language the booking page was shown in when they booked, whoever triggers the email. That is the guest's own language (their saved language when they are logged in to calrs, otherwise their browser's), unless the host chose **Always my language** under **Public booking page language** in Profile & Settings: their `/u/{username}` pages, and so their guests' emails, then use the host's own saved language. The email goes out whoever triggers it: the guest themselves, the host approving, declining, cancelling or asking for a new time, the reminder task, or a calendar sync noticing the host deleted the event.
+- **Guests** (and the additional attendees they add) get the language the booking page was shown in when they booked, whoever triggers the email. That is the guest's browser language, unless the host chose **Always my language** under **Public booking page language** in Profile & Settings: their own booking pages (`/u/{username}`, and the legacy `/{slug}` routes), and so their guests' emails, then use the host's own saved language. Being logged in to calrs does not change the language of a booking page: a staff member booking on a client's behalf books in the client's browser language, not their own. The email goes out whoever triggers it: the guest themselves, the host approving, declining, cancelling or asking for a new time, the reminder task, or a calendar sync noticing the host deleted the event.
 - **Hosts, team members and watchers** get the language they chose in **Profile & Settings**. With none set, they get English. On a collective team booking each member receives the host email in their own language.
-- The guest's cancel and reschedule pages use that same language, so they match the emails.
+- The guest's cancel and reschedule pages use that same language, so they match the emails. The host's approve and decline pages use the host's language, and claim pages the watcher's.
 - **Invites** follow the language of the person sending them, who also writes the optional personal message.
 
 The admin SMTP test email is English.

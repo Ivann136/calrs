@@ -434,23 +434,6 @@ async fn resolve_session_user(
     Some((real_user, None))
 }
 
-/// The one language rule for public guest pages: a logged-in visitor's own
-/// saved preference when calrs ships it, otherwise their browser's
-/// `Accept-Language`. Never the host's (that is `web::user_page_lang`'s
-/// opt-in 'host' mode). `OptionalAuthUser::lang` is this.
-pub fn visitor_lang_for(user: Option<&User>, headers: &HeaderMap) -> &'static str {
-    crate::i18n::resolve(user.and_then(|u| u.language.as_deref()), headers)
-}
-
-/// [`visitor_lang_for`] for a handler without an `OptionalAuthUser`, such as
-/// a booking POST that resolves it only once its rate-limit and captcha
-/// gates have passed. Without a session cookie this does no query.
-pub async fn visitor_lang(pool: &SqlitePool, headers: &HeaderMap) -> &'static str {
-    let jar = CookieJar::from_headers(headers);
-    let user = resolve_session_user(pool, &jar).await.map(|(u, _)| u);
-    visitor_lang_for(user.as_ref(), headers)
-}
-
 /// Extractor that requires an authenticated user. Redirects to /auth/login if not authenticated.
 /// Supports admin impersonation: if the `__Host-calrs_impersonate` cookie is set and the real user is
 /// an admin, returns the impersonated user instead.
@@ -506,7 +489,10 @@ impl FromRequestParts<Arc<AppState>> for OptionalAuthUser {
             Some((u, info)) => (Some(u), info),
             None => (None, None),
         };
-        let lang = visitor_lang_for(user.as_ref(), &parts.headers);
+        let lang = crate::i18n::resolve(
+            user.as_ref().and_then(|u| u.language.as_deref()),
+            &parts.headers,
+        );
         Ok(OptionalAuthUser {
             user,
             impersonation,
