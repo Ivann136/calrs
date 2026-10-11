@@ -1437,18 +1437,30 @@
       nav.appendChild(s);
     }
 
-    // Next week
-    var nextBtn = document.createElement('a');
-    nextBtn.href = '#';
-    nextBtn.innerHTML = '&rarr;';
-    nextBtn.addEventListener('click', function(e) {
-      e.preventDefault();
-      var targetDate = new Date(dates[6].date);
-      targetDate.setDate(targetDate.getDate() + 1);
-      weekStart = targetDate;
-      ensureMonthLoaded(targetDate, function() { buildWeekView(); });
-    });
-    nav.appendChild(nextBtn);
+    // Next week: gated like the month view's arrow, so a booking horizon
+    // stops week paging too. Allowed while the next week starts in the
+    // loaded month, or in the next month when the server says it exists.
+    var nextWeekStart = new Date(dates[6].date);
+    nextWeekStart.setDate(nextWeekStart.getDate() + 1);
+    var nextWeekMonth = nextWeekStart.getFullYear() + '-' + (nextWeekStart.getMonth() < 9 ? '0' : '') + (nextWeekStart.getMonth() + 1);
+    var canGoNext = nextWeekMonth === monthYear ||
+      (calData.hasNextMonth && calData.nextMonth === nextWeekMonth);
+    if (canGoNext) {
+      var nextBtn = document.createElement('a');
+      nextBtn.href = '#';
+      nextBtn.innerHTML = '&rarr;';
+      nextBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        weekStart = nextWeekStart;
+        ensureMonthLoaded(nextWeekStart, function() { buildWeekView(); });
+      });
+      nav.appendChild(nextBtn);
+    } else {
+      var n = document.createElement('span');
+      n.className = 'disabled';
+      n.innerHTML = '&rarr;';
+      nav.appendChild(n);
+    }
   }
 
   // Ensure data is loaded for the month containing targetDate

@@ -1002,7 +1002,7 @@ pub async fn send_guest_confirmation_ex(
             .subject(format!("{} \u{2014} {}", details.event_title, details.date))
             .multipart(MultiPart::mixed().multipart(body2).singlepart(att2))?;
         if let Err(e) = send_email(config, email2).await {
-            tracing::warn!(attendee = %attendee_email, error = %e, "failed to send attendee confirmation");
+            tracing::warn!(attendee = %attendee_email, error = format!("{e:#}"), "failed to send attendee confirmation");
         }
     }
 
@@ -2620,25 +2620,20 @@ async fn send_email_with_timeouts(
             tracing::debug!(to = %to_display, "email delivered");
             Ok(())
         }
-        Ok(Err(e)) => {
-            tracing::error!(to = %to_display, error = %e, "email delivery failed");
-            Err(e.into())
-        }
-        Err(_) => {
-            tracing::error!(
-                to = %to_display,
-                host = %config.host,
-                port = config.port,
-                timeout_secs = send_timeout.as_secs(),
-                "email delivery timed out"
-            );
-            anyhow::bail!(
-                "SMTP server {}:{} did not complete the delivery within {}s",
-                config.host,
-                config.port,
-                send_timeout.as_secs_f32()
-            )
-        }
+        // Not logged here: every caller logs the error once, with what it
+        // knows about the email (kind, booking). The recipient and server go
+        // into the error so that line has them too; log it with `{:#}`.
+        Ok(Err(e)) => Err(anyhow::Error::new(e).context(format!(
+            "delivery to {} via {}:{} failed",
+            to_display, config.host, config.port
+        ))),
+        Err(_) => anyhow::bail!(
+            "delivery to {} timed out: SMTP server {}:{} did not complete it within {}s",
+            to_display,
+            config.host,
+            config.port,
+            send_timeout.as_secs_f32()
+        ),
     }
 }
 
@@ -3508,7 +3503,7 @@ mod tests {
         .expect("send timed out")
         .expect_err("a no-auth relay cannot satisfy configured credentials");
         assert!(
-            err.to_string().contains("authentication mechanism"),
+            format!("{err:#}").contains("authentication mechanism"),
             "unexpected error: {err}"
         );
 
