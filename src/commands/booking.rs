@@ -500,6 +500,10 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                                 uid,
                                 reason,
                                 cancelled_by_host: true,
+                                guest_language: crate::email::stored_booking_language(
+                                    pool, &full_id,
+                                )
+                                .await,
                                 host_timezone: host_timezone.unwrap_or_default(),
                                 ..Default::default()
                             };

@@ -4869,6 +4869,9 @@ async fn confirm_booking(
         location: location_display,
         reminder_minutes: None,
         additional_attendees: vec![],
+        // The host clicked approve, so the request carries the host's
+        // language; the guest's is the one stored with the booking (#209).
+        guest_language: crate::email::stored_booking_language(&state.pool, &bid).await,
         host_timezone: stored_tz.name().to_string(),
         resource_name: booking_resource_label(&state.pool, &uid).await,
         ..Default::default()
@@ -19346,13 +19349,7 @@ async fn approve_booking_by_token(
     )
     .await;
 
-    let guest_language: Option<String> =
-        sqlx::query_scalar("SELECT language FROM bookings WHERE id = ?")
-            .bind(&bid)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None)
-            .flatten();
+    let guest_language = crate::email::stored_booking_language(&state.pool, &bid).await;
 
     let details = crate::email::BookingDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
@@ -19621,6 +19618,9 @@ async fn decline_booking_by_token(
             uid: String::new(),
             reason: reason.clone(),
             cancelled_by_host: true,
+            // `lang` above is the host's (they clicked the link); the guest
+            // reads this email in the language they booked in (#209).
+            guest_language: crate::email::stored_booking_language(&state.pool, &bid).await,
             host_timezone: stored_tz.name().to_string(),
             ..Default::default()
         };
@@ -20919,6 +20919,9 @@ async fn guest_reschedule_booking(
                 location: loc_value,
                 reminder_minutes: None,
                 additional_attendees: vec![],
+                guest_language: crate::email::stored_booking_language(&state.pool, &booking_id)
+                    .await
+                    .or_else(|| Some(lang.to_string())),
                 host_timezone: host_tz.name().to_string(),
                 resource_name: booking_resource_label(&state.pool, &uid).await,
                 ..Default::default()
@@ -35296,4 +35299,223 @@ mod tests {
         assert_eq!(parse_optional_day_count("abc"), None);
     }
     include!("booking_time_tests.rs");
+
+    // --- #209: guest emails sent on someone else's request keep the guest's language ---
+
+    /// One message as an anonymous loopback MTA received it.
+    struct CapturedMail {
+        rcpt: Vec<String>,
+        data: String,
+    }
+
+    /// Anonymous loopback MTA (no AUTH, no STARTTLS) that accepts any number
+    /// of connections and keeps every message, so a handler test can read
+    /// the emails it sent. calrs opens one connection per email.
+    async fn spawn_capturing_mta() -> (u16, Arc<std::sync::Mutex<Vec<CapturedMail>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mails = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = mails.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let (read_half, mut write) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    let _ = write.write_all(b"220 fake.local ESMTP\r\n").await;
+                    let mut rcpt = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let upper = line.trim_end().to_ascii_uppercase();
+                        let reply: &[u8] = if upper.starts_with("EHLO") {
+                            b"250-fake.local\r\n250 8BITMIME\r\n"
+                        } else if upper.starts_with("RCPT TO") {
+                            rcpt.push(line.trim_end().to_string());
+                            b"250 OK\r\n"
+                        } else if upper == "DATA" {
+                            let _ = write.write_all(b"354 go ahead\r\n").await;
+                            let mut data = String::new();
+                            loop {
+                                let mut body = String::new();
+                                match reader.read_line(&mut body).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                                if body.trim_end() == "." {
+                                    break;
+                                }
+                                data.push_str(&body);
+                            }
+                            sink.lock().unwrap().push(CapturedMail {
+                                rcpt: std::mem::take(&mut rcpt),
+                                data,
+                            });
+                            b"250 queued\r\n"
+                        } else if upper == "QUIT" {
+                            let _ = write.write_all(b"221 bye\r\n").await;
+                            break;
+                        } else {
+                            b"250 OK\r\n"
+                        };
+                        let _ = write.write_all(reply).await;
+                    }
+                });
+            }
+        });
+        (port, mails)
+    }
+
+    /// Point the instance's SMTP config at the capturing MTA.
+    async fn use_capturing_mta(pool: &SqlitePool, port: u16) {
+        let password_enc = crate::crypto::encrypt_password(&[0u8; 32], "").unwrap();
+        sqlx::query(
+            "INSERT INTO smtp_config (id, host, port, username, password_enc, from_email, tls_mode, enabled) \
+             VALUES (?, '127.0.0.1', ?, '', ?, 'noreply@test.com', 'none', 1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(port as i64)
+        .bind(&password_enc)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Undo quoted-printable transfer encoding so assertions can match the
+    /// text the recipient reads, accents included.
+    fn decode_quoted_printable(raw: &str) -> String {
+        let joined = raw.replace("=\r\n", "").replace("=\n", "");
+        let bytes = joined.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'=' && i + 2 < bytes.len() {
+                if let Ok(b) = u8::from_str_radix(&joined[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The decoded body of the one email addressed to `email`. Booking emails
+    /// are sent from a background task (#236), so wait for it to arrive.
+    async fn mail_to(mails: &std::sync::Mutex<Vec<CapturedMail>>, email: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mails = mails.lock().unwrap();
+                let found: Vec<&CapturedMail> = mails
+                    .iter()
+                    .filter(|m| m.rcpt.iter().any(|r| r.contains(email)))
+                    .collect();
+                if !found.is_empty() || std::time::Instant::now() >= deadline {
+                    assert_eq!(found.len(), 1, "expected one email to {email}");
+                    return decode_quoted_printable(&found[0].data);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn insert_pending_french_booking(pool: &SqlitePool, et_id: &str, uid: &str) -> String {
+        let booking_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token, confirm_token, language) VALUES (?, ?, ?, 'Guest', 'guest@test.com', 'UTC', '2026-06-15T10:00:00', '2026-06-15T10:30:00', 'pending', ?, ?, ?, 'fr')")
+            .bind(&booking_id)
+            .bind(et_id)
+            .bind(uid)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(format!("confirm-{uid}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        booking_id
+    }
+
+    /// The host approving from the dashboard browses in their own language;
+    /// the guest still gets the confirmation in the language they booked in.
+    /// Before #209 this path never read `bookings.language` and fell back to
+    /// English.
+    #[tokio::test]
+    async fn dashboard_approval_emails_the_guest_in_the_booking_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-209-approve").await;
+
+        let csrf = "test-csrf-209-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert!(mail.contains("Bonjour Guest,"), "{mail}");
+        assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
+        assert!(!mail.contains("Hi Guest,"), "{mail}");
+    }
+
+    /// Same for the decline link in the host's approval email.
+    #[tokio::test]
+    async fn token_decline_emails_the_guest_in_the_booking_language() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        insert_pending_french_booking(&pool, &et_id, "uid-209-decline").await;
+
+        let csrf = "test-csrf-209-decline";
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/booking/decline/confirm-uid-209-decline",
+                csrf,
+                &format!("_csrf={}&reason=Conflit", csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert!(mail.contains("Bonjour Guest,"), "{mail}");
+        assert!(
+            mail.contains("Cette réservation a été refusée par l'hôte."),
+            "{mail}"
+        );
+        assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
+        assert!(!mail.contains("has been declined"), "{mail}");
+    }
+
+    /// Pages declare the language they are rendered in, so browsers pick the
+    /// right spell-check dictionary (#209).
+    #[tokio::test]
+    async fn pages_declare_their_language_on_the_html_element() {
+        let (app, _, _, _) = setup_test_app().await;
+        let french = axum::http::Request::builder()
+            .uri("/auth/login")
+            .header("accept-language", "fr-FR,fr;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        let body = body_string(app.clone().oneshot(french).await.unwrap()).await;
+        assert!(body.contains("<html lang=\"fr\">"), "{body}");
+
+        let body = body_string(app.oneshot(get("/auth/login")).await.unwrap()).await;
+        assert!(body.contains("<html lang=\"en\">"), "{body}");
+    }
 }
