@@ -242,6 +242,34 @@ async fn collective_booking_keeps_its_organizer_when_the_roster_changes() {
     assert_eq!(booking_status(&pool, &booking_id).await, "cancelled");
     let cancelled = take_guest_mail(&mails).await;
     assert_eq!(mail_header(&cancelled, "Reply-To"), Some("bob@test.com"));
+
+    // Every member hosting it hears about the guest's cancellation, as they
+    // did about the booking, not the event type owner alone.
+    for member in ["bob@test.com", "ann@test.com", "test@example.com"] {
+        assert!(
+            wait_for_mail_containing(&mails, member, "cancelled their booking").await,
+            "{member} got no cancellation notice"
+        );
+    }
+}
+
+/// Whether a mail to `email` containing `text` arrives within five seconds.
+async fn wait_for_mail_containing(
+    mails: &std::sync::Mutex<Vec<CapturedMail>>,
+    email: &str,
+    text: &str,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let found = mails.lock().unwrap().iter().any(|m| {
+            m.rcpt.iter().any(|r| r.contains(email))
+                && decode_quoted_printable(&m.data).contains(text)
+        });
+        if found || std::time::Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// The snapshot outlives its user: disabling the organizer does not move

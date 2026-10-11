@@ -21472,13 +21472,30 @@ async fn guest_cancel_booking(
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
         let details = details.clone();
-        // The query above joins the assigned member, or the event type owner
-        // when there is none: that is who gets the host notice, in their
-        // language. A collective booking has no assigned member, so its
-        // notice still goes to the owner alone. The guest's copy names the
-        // host they booked with (assigned member, or the joined roster and
-        // ICS organizer for a collective booking), which is also its sender
-        // and Reply-To (#221).
+        // The host notice goes to whoever hosts the booking, each in their
+        // own language: the assigned member, every eligible member of a
+        // collective booking (as for the new-booking and expiry notices),
+        // else the event type owner. The query above (assigned member, else
+        // owner) is the fallback when none resolves. The guest's copy names
+        // the host they booked with (assigned member, or the stored roster
+        // and ICS organizer for a collective booking, #161), which is also
+        // its sender and Reply-To (#221).
+        let mut host_notices = Vec::new();
+        if let Some(owner) = &host_user_id {
+            for (name, email, language) in
+                pending_host_recipients(&state.pool, &details.uid, owner).await
+            {
+                host_notices.push(crate::email::CancellationDetails {
+                    host_name: name,
+                    host_email: email,
+                    host_language: language,
+                    ..details.clone()
+                });
+            }
+        }
+        if host_notices.is_empty() {
+            host_notices.push(details.clone());
+        }
         let guest_details = match booking_host_identity(&state.pool, &details.uid).await {
             Some((host_name, host_email, _)) => crate::email::CancellationDetails {
                 host_name,
@@ -21493,11 +21510,13 @@ async fn guest_cancel_booking(
                 "guest_cancellation",
                 &details.uid,
             );
-            log_email_result(
-                crate::email::send_host_cancellation(&smtp_config, &details).await,
-                "host_cancellation",
-                &details.uid,
-            );
+            for host_details in &host_notices {
+                log_email_result(
+                    crate::email::send_host_cancellation(&smtp_config, host_details).await,
+                    "host_cancellation",
+                    &details.uid,
+                );
+            }
         });
     }
 
