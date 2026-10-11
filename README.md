@@ -511,11 +511,11 @@ RUST_LOG=calrs=error
 ```
 2026-03-12T14:30:00Z  INFO calrs: calrs server listening on 127.0.0.1:3000
 2026-03-12T14:30:05Z  INFO calrs::auth: user login email=alice@example.com ip=192.168.1.1
-2026-03-12T14:31:00Z  INFO calrs::web: booking created booking_id=a1b2c3 event_type=intro guest=bob@example.com
+2026-03-12T14:31:00Z  INFO calrs::web::booking: booking created booking_id=a1b2c3 event_type=intro guest=bob@example.com
 2026-03-12T14:31:01Z  INFO tower_http::trace: response{method=POST path="/u/alice/intro/book" status=200 latency="45ms"}
-2026-03-12T14:31:02Z ERROR calrs::web: CalDAV write-back failed uid=a1b2c3@calrs error="connection refused"
+2026-03-12T14:31:02Z ERROR calrs::web::calendar_push: CalDAV write-back failed uid=a1b2c3@calrs error="connection refused"
 2026-03-12T14:32:00Z  WARN calrs::auth: login failed email=eve@example.com ip=10.0.0.5
-2026-03-12T15:00:00Z  WARN calrs::web: rate limited ip=10.0.0.5
+2026-03-12T15:00:00Z  WARN calrs::web::booking: rate limited ip=10.0.0.5
 ```
 
 ## CLI reference
@@ -590,13 +590,15 @@ calrs/
     ├── db.rs                SQLite connection + migrations
     ├── models.rs            Domain types
     ├── auth.rs              Authentication (local + OIDC)
-    ├── email.rs             SMTP email with .ics invites + HTML templates
+    ├── email/               SMTP email with .ics invites + HTML templates
     ├── rrule.rs             Recurring event expansion (RRULE)
     ├── utils.rs             Shared utilities (iCal splitting/parsing)
     ├── caldav/mod.rs        CalDAV client (RFC 4791) + write-back
-    ├── web/mod.rs           Axum web server + all handlers
+    ├── web/                 Axum web server, one file per area
     └── commands/            CLI subcommands
 ```
+
+Contributing code? Start with [ARCHITECTURE.md](ARCHITECTURE.md): which file owns what, the main concepts, and where to add a route, an email, a translatable string or a migration.
 
 **Storage:** SQLite (WAL mode). Single file, zero ops.
 

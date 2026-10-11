@@ -1,5 +1,7 @@
-// Calendar write-back failures: verify, record, retry (#162). Included into
+// Calendar write-back failures: verify, record, retry (#162). A child of
 // `web::tests`, so it shares that module's helpers.
+
+use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DavMode {
@@ -76,34 +78,9 @@ async fn spawn_mock_dav(mode: DavMode) -> (String, Arc<MockDav>) {
     (format!("http://127.0.0.1:{port}/dav/"), dav)
 }
 
-/// Give `user_id` a basic-auth CalDAV source on `base` that writes to
-/// `/dav/cal/`.
-async fn seed_write_source(pool: &SqlitePool, user_id: &str, base: &str) -> String {
-    let account_id: String = sqlx::query_scalar("SELECT id FROM accounts WHERE user_id = ?")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-    let source_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc, enabled, write_calendar_href) \
-         VALUES (?, ?, 'Work calendar', ?, 'u', ?, 1, '/dav/cal/')",
-    )
-    .bind(&source_id)
-    .bind(&account_id)
-    .bind(base)
-    .bind(crate::crypto::encrypt_password(&[0u8; 32], "p").unwrap())
-    .execute(pool)
-    .await
-    .unwrap();
-    source_id
-}
-
 /// A host with a write source on a fresh mock server, and a confirmed
 /// booking ten days out. Returns (pool, mock, host id, booking id, uid).
-async fn writeback_fixture(
-    mode: DavMode,
-) -> (SqlitePool, Arc<MockDav>, String, String, String) {
+async fn writeback_fixture(mode: DavMode) -> (SqlitePool, Arc<MockDav>, String, String, String) {
     let pool = setup_test_db().await;
     let host = insert_role_user(&pool, "host@wb.test", "user").await;
     let et_id = insert_personal_et(&pool, &host, "wb").await;
@@ -159,7 +136,10 @@ fn retry_schedule_backs_off_and_stops() {
         writeback::next_attempt_at(writeback::MAX_ATTEMPTS - 1, now),
         Some(now + Duration::minutes(480))
     );
-    assert_eq!(writeback::next_attempt_at(writeback::MAX_ATTEMPTS, now), None);
+    assert_eq!(
+        writeback::next_attempt_at(writeback::MAX_ATTEMPTS, now),
+        None
+    );
     assert_eq!(writeback::next_attempt_at(0, now), None);
 }
 
@@ -298,8 +278,7 @@ async fn retries_stop_after_the_last_attempt() {
     assert_eq!(next, None, "no retry after the last attempt");
     assert_eq!(status, "confirmed");
     assert_eq!(
-        writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::days(2))
-            .await,
+        writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::days(2)).await,
         0
     );
     assert_eq!(dav.puts() as i64, writeback::MAX_ATTEMPTS);
@@ -332,7 +311,10 @@ async fn persistent_writeback_failure_emails_the_host_once() {
     // Inline sends: every message has been delivered by now.
     let body = mail_to(&mails, "host@wb.test").await;
     assert!(body.contains("Une réservation manque"), "in French: {body}");
-    assert!(body.contains("Work calendar"), "names the failing source: {body}");
+    assert!(
+        body.contains("Work calendar"),
+        "names the failing source: {body}"
+    );
     let alerted: Option<String> =
         sqlx::query_scalar("SELECT writeback_alerted_at FROM bookings WHERE id = ?")
             .bind(&id)
@@ -358,11 +340,9 @@ async fn a_writeback_fixed_by_a_retry_sends_no_email() {
     use_capturing_mta(&pool, port).await;
 
     push_fresh(&pool, &host, &uid).await;
-    writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::hours(1))
-        .await;
+    writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::hours(1)).await;
     dav.set_mode(DavMode::Ok);
-    writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::hours(2))
-        .await;
+    writeback::retry_failed_writebacks(&pool, &[0u8; 32], Utc::now() + Duration::hours(2)).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(mails.lock().unwrap().is_empty());
 }
@@ -446,7 +426,10 @@ async fn sync_once(pool: &SqlitePool, source_id: &str) -> anyhow::Result<()> {
     .await
 }
 
-async fn source_health(pool: &SqlitePool, source_id: &str) -> (Option<String>, i64, Option<String>) {
+async fn source_health(
+    pool: &SqlitePool,
+    source_id: &str,
+) -> (Option<String>, i64, Option<String>) {
     sqlx::query_as(
         "SELECT last_sync_error, sync_failure_count, sync_alerted_at FROM caldav_sources WHERE id = ?",
     )
@@ -513,8 +496,7 @@ async fn source_sync_failure_is_recorded_alerted_once_and_cleared() {
     );
 
     // Recovery clears the record and re-arms the alert.
-    crate::commands::sync_health::record_sync_outcome(&pool, &[0u8; 32], &source_id, &Ok(()))
-        .await;
+    crate::commands::sync_health::record_sync_outcome(&pool, &[0u8; 32], &source_id, &Ok(())).await;
     assert_eq!(source_health(&pool, &source_id).await, (None, 0, None));
 
     // Failing again for long enough alerts again.
@@ -580,5 +562,8 @@ async fn sources_dashboard_shows_the_sync_error() {
         body.contains("Sync failing since 2026-10-11 08:00:00 UTC"),
         "{body}"
     );
-    assert!(body.contains("PROPFIND returned 401 Unauthorized"), "{body}");
+    assert!(
+        body.contains("PROPFIND returned 401 Unauthorized"),
+        "{body}"
+    );
 }

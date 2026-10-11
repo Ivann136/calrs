@@ -42,153 +42,12 @@
 
 ## Project structure
 
-```
-calrs/
-├── Cargo.toml
-├── CLAUDE.md                     ← you are here
-├── README.md
-├── .gitignore
-├── assets/
-│   └── intl-tel-input/           ← vendored phone widget (MIT) + libphonenumber utils.js (Apache-2.0)
-├── migrations/
-│   ├── 001_initial.sql           ← full SQLite schema
-│   ├── 002_auth.sql              ← users, sessions, auth_config, groups
-│   ├── 003_username.sql          ← username column on users
-│   ├── 004_oidc.sql              ← OIDC columns on auth_config
-│   ├── 005_requires_confirmation.sql ← requires_confirmation on event_types
-│   ├── 006_group_event_types.sql ← slug on groups, group_id on event_types, assigned_user_id on bookings
-│   ├── 007_caldav_write.sql      ← write_calendar_href on caldav_sources, caldav_calendar_href on bookings
-│   ├── 008_recurrence_id.sql     ← recurrence_id column on events
-│   ├── 009_uid_recurrence_unique.sql ← composite unique index (uid, recurrence_id) on events
-│   ├── 010_confirm_token.sql     ← confirm_token on bookings for email approve/decline
-│   ├── 011_event_type_calendars.sql ← junction table for per-event-type calendar selection
-│   ├── 012_reminders.sql         ← reminder_minutes on event_types, reminder_sent_at on bookings
-│   ├── 013_booking_email.sql     ← booking_email on users
-│   ├── 014_team_links.sql        ← team_links, team_link_members, team_link_bookings tables
-│   ├── 015_user_profile.sql      ← title, bio, avatar_path on users
-│   ├── 016_booking_unique.sql    ← partial unique index for double-booking prevention
-│   ├── 017_events_per_calendar.sql ← per-calendar event uniqueness (uid, calendar_id)
-│   ├── 018_private_invites.sql   ← is_private on event_types, booking_invites table
-│   ├── 019_team_link_reusable.sql ← one_time_use column on team_links
-│   ├── 020_booking_attendees.sql ← max_additional_guests on event_types, booking_attendees table
-│   ├── 021_accent_color.sql      ← accent_color on auth_config
-│   ├── 022_theme.sql             ← theme preset + custom color columns on auth_config
-│   ├── 023_team_link_windows.sql ← availability_windows on team_links
-│   ├── 024_team_link_features.sql ← location, description, reminder on team_links
-│   ├── 025_reschedule_by_host.sql ← reschedule_by_host flag on bookings
-│   ├── 026_visibility.sql        ← visibility column on event_types (public/internal/private)
-│   ├── 027_calendar_sync_token.sql ← sync_token on calendars
-│   ├── 028_company_link.sql      ← company_link URL on auth_config
-│   ├── 029_scheduling_mode.sql   ← scheduling_mode on event_types (round_robin/collective)
-│   ├── 030_member_weight.sql     ← weight on user_groups for round-robin priority
-│   ├── 031_fix_legacy_timezones.sql ← fix bare timezone names to IANA identifiers
-│   ├── 032_event_type_member_weights.sql ← per-event-type member weights table
-│   ├── 033_group_profile.sql     ← description and avatar_path on groups
-│   ├── 034_teams.sql             ← unified teams: teams, team_members, team_groups tables; migrates groups + team_links
-│   ├── 035_drop_legacy_team_links.sql ← drops legacy team_links tables
-│   ├── 036_default_calendar_view.sql ← default_calendar_view on event_types
-│   ├── 037_booking_frequency_limits.sql ← booking_frequency_limits table
-│   ├── 038_first_slot_only.sql   ← first_slot_only on event_types
-│   ├── 039_allow_dynamic_group.sql ← allow_dynamic_group opt-out on users
-│   ├── 040_user_availability.sql ← per-user default working hours (user_availability_rules)
-│   ├── 041_last_full_sync.sql    ← last_full_sync timestamp on caldav_sources
-│   ├── 042_event_transp.sql      ← TRANSP column on events (skip TRANSPARENT)
-│   ├── 043_event_type_watchers.sql ← event_type_watchers junction (team watches event type)
-│   ├── 044_booking_claim.sql     ← claimed_by_user_id/claimed_at on bookings + booking_claim_tokens
-│   ├── 055_provider_type.sql     ← provider_type on caldav_sources (caldav/ews) for the calendar-provider abstraction
-│   ├── 056_meeting_links.sql     ← jitsi + webhook meeting-provider columns on auth_config
-│   ├── 057_runtime_settings.sql  ← base_url + allow_private_hosts on auth_config (env-overridable runtime settings)
-│   ├── 058_resources.sql         ← shared resources: resources, resource_events, event_type_resources; resource_scheduling_mode, assigned_resource_id, lend_resource_write
-│   ├── 059_resource_sync_error.sql ← last_sync_error on resources (feed failure indicator)
-│   ├── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_phone_mode on event_types, sms_config + sms_usage tables, sms_allow_all_users on auth_config
-│   ├── 063_booking_horizon.sql   ← booking_horizon_days on event_types (NULL = unlimited)
-│   ├── 068_writeback_failures.sql ← writeback_error/attempts/next_attempt_at/alerted_at on bookings (#162)
-│   ├── 069_source_sync_errors.sql ← last_sync_error, sync_failing_since, failure count, alert stamp on caldav_sources (#162)
-│   └── 070_booking_organizer.sql ← organizer_user_id/name/email snapshot on bookings: collective and dynamic group organizer (#161)
-│   ├── 064_booking_time_version.sql ← time_version on bookings (0 = legacy wall clock, 1 = UTC)
-│   ├── 065_pending_slot_hold.sql ← pending_blocks_slot + pending_expiry_hours on event_types; pending_expires_at, pending_since, pending_reminder_sent_at on bookings
-│   ├── 066_public_page_language.sql ← public_page_language on users ('visitor' default / 'host') for /u/{username} and legacy /{slug} pages
-│   └── 067_captcha_wasm_url.sql ← captcha_wasm_url on auth_config (self-hosted Cap WASM, #164)
-├── templates/
-│   ├── base.html                 ← base layout + CSS (light/dark mode)
-│   ├── dashboard_base.html       ← sidebar layout (extends base.html, all dashboard pages extend this)
-│   ├── auth/
-│   │   ├── login.html            ← login page (local + SSO button)
-│   │   └── register.html         ← registration page
-│   ├── dashboard_overview.html   ← overview with stats (extends dashboard_base)
-│   ├── dashboard_event_types.html ← event types listing (extends dashboard_base)
-│   ├── dashboard_bookings.html   ← bookings listing (extends dashboard_base)
-│   ├── dashboard_sources.html    ← calendar sources (extends dashboard_base)
-│   ├── dashboard_teams.html      ← teams listing (extends dashboard_base)
-│   ├── dashboard_internal.html   ← internal/organization event types (extends dashboard_base)
-│   ├── settings.html             ← profile & settings with avatar/title/bio (extends dashboard_base)
-│   ├── admin.html                ← admin dashboard (extends dashboard_base)
-│   ├── event_type_form.html      ← create/edit event types (extends dashboard_base)
-│   ├── invite_form.html          ← invite management for internal/private event types (extends dashboard_base)
-│   ├── source_form.html          ← add CalDAV source (extends dashboard_base)
-│   ├── source_test.html          ← connection test / sync results (extends dashboard_base)
-│   ├── source_write_setup.html   ← write-back calendar selection (extends dashboard_base)
-│   ├── team_form.html            ← create/edit team (extends dashboard_base)
-│   ├── team_settings.html        ← team settings: members, linked groups, danger zone (extends dashboard_base)
-│   ├── troubleshoot.html         ← availability troubleshoot timeline (extends dashboard_base)
-│   ├── overrides.html            ← date overrides management per event type (extends dashboard_base)
-│   ├── profile.html              ← public user profile (with avatar, title, bio)
-│   ├── team_profile.html         ← public team page
-│   ├── slots.html                ← available time slots (with timezone picker)
-│   ├── book.html                 ← booking form
-│   ├── confirmed.html            ← confirmation / pending page
-│   ├── booking_approved.html     ← token-based approve success page
-│   ├── booking_decline_form.html ← token-based decline form (optional reason)
-│   ├── booking_declined.html     ← token-based decline success page
-│   ├── booking_cancel_form.html  ← guest self-cancel form (optional reason)
-│   ├── booking_cancelled_guest.html ← guest self-cancel success page
-│   ├── booking_host_reschedule.html ← host-initiated reschedule page
-│   ├── booking_reschedule_confirm.html ← reschedule confirmation page
-│   ├── booking_action_error.html ← error page for invalid/expired tokens
-│   ├── booking_claim_form.html   ← watcher claim form (token-based)
-│   ├── booking_claimed.html      ← claim success page
-│   └── booking_already_claimed.html ← claim collision page (another watcher got there first)
-└── src/
-    ├── main.rs                   ← CLI entry point, Cli/Commands enum, tokio main
-    ├── db.rs                     ← SQLite pool setup (WAL mode) + migration runner
-    ├── models.rs                 ← domain structs: Account, User, Session, AuthConfig,
-    │                               CaldavSource, Calendar, Event, EventType, Booking
-    ├── crypto.rs                 ← AES-256-GCM encryption for stored credentials,
-    │                               secret key management, legacy password migration
-    ├── auth.rs                   ← authentication: password hashing, sessions, OIDC,
-    │                               axum extractors (AuthUser, AdminUser), web handlers
-    ├── email.rs                  ← SMTP email with .ics calendar invites, HTML templates
-    ├── resources.rs              ← shared bookable resources: feed sync, busy intervals,
-    │                               mode merge (all/round_robin), booking-time check
-    ├── rrule.rs                  ← RRULE expansion (DAILY/WEEKLY/MONTHLY, EXDATE, BYDAY)
-    ├── settings.rs               ← runtime settings (base_url, allow_private_hosts): env-overrides-DB, process-global cache
-    ├── sms/                      ← SMS notifications, provider-agnostic
-    │   ├── mod.rs                ← SmsProvider trait, SmsError/SendReceipt, config load (env + DB), notify_guest()
-    │   ├── factory.rs            ← provider kinds, ProviderSpec registry (drives the admin form), validate_config()
-    │   ├── phone.rs              ← E.164 normalisation + country calling codes
-    │   ├── message.rs            ← localised bodies (Fluent) + GSM-7 segment estimation
-    │   ├── twilio.rs             ← Twilio adapter
-    │   ├── gatewayapi.rs         ← GatewayApi adapter (.com / .eu regions)
-    │   ├── sevenio.rs            ← seven.io adapter (HTTP 200 + in-body error codes)
-    │   └── webhook.rs            ← generic webhook adapter (bring your own gateway, HMAC-signed)
-    ├── utils.rs                  ← shared utilities: split_vevents(), extract_vevent_field()
-    ├── caldav/
-    │   └── mod.rs                ← CalDAV client: discovery, calendar list, event fetch, write-back
-    ├── web/
-    │   ├── mod.rs                ← Axum web server: dashboard, booking, admin panel, token actions
-    │   └── writeback.rs          ← write-back failure record, retry sweep, host alert (#162)
-    └── commands/
-        ├── mod.rs                ← re-exports all subcommands
-        ├── source.rs             ← `calrs source add/list/remove/test`
-        ├── sync.rs               ← `calrs sync [--full]` — pull CalDAV → SQLite
-        ├── sync_health.rs        ← source sync failure record + owner alert (#162)
-        ├── calendar.rs           ← `calrs calendar show`
-        ├── event_type.rs         ← `calrs event-type create/list/slots`
-        ├── booking.rs            ← `calrs booking create/list/cancel`
-        ├── config.rs             ← `calrs config smtp/show/smtp-test/auth/oidc`
-        ├── resource.rs           ← `calrs resource probe`, feed/CalDAV probing
-        └── user.rs               ← `calrs user create/list/promote/set-password`
-```
+**Read `ARCHITECTURE.md` first.** It maps every module under `src/` (including each file of `src/web/` and `src/email/` and their test directories) to what it owns, explains the cross-cutting concepts with the file that owns each, and lists where to add a route, an email, a string, a migration or a provider. It replaces the file tree that used to live here.
+
+The two large modules are split by feature area, so open the file for the area you are changing rather than searching one big file:
+
+- `src/web/mod.rs` keeps `AppState`, `create_router` (every route), middleware and shared helpers; handlers live in `public_pages.rs`, `booking.rs`, `booking_actions.rs`, `availability.rs`, `dashboard.rs`, `event_types.rs`, `invites.rs`, `teams.rs`, `sources.rs`, `admin.rs`, and helpers in `hosts.rs`, `calendar_push.rs`, `pending.rs`, `notify.rs`, `branding.rs`, `format.rs`. Submodules `use super::*` and `mod.rs` glob-imports them, so an item moved between files keeps its call sites. Tests are in `src/web/tests/<area>.rs` with shared fixtures in `src/web/tests/mod.rs`.
+- `src/email/mod.rs` re-exports `transport.rs`, `render.rs`, `guest.rs` and `host.rs` with `pub use`, so callers keep writing `crate::email::name`. Tests are in `src/email/tests/`.
 
 ---
 
@@ -279,7 +138,7 @@ File: `src/auth.rs`
 
 ## Web UI
 
-File: `src/web/mod.rs`, templates in `templates/`
+Files: `src/web/` (see `ARCHITECTURE.md` for which file owns which page), templates in `templates/`
 
 **Sidebar layout** (`dashboard_base.html`): All authenticated pages use a two-column layout with a persistent left sidebar (260px). Sidebar shows user avatar (with initials fallback), name, title, and organized nav sections. Mobile responsive with hamburger menu. All dashboard sub-pages pass `sidebar => sidebar_context(&auth_user, "active-page")` to their template context.
 
@@ -335,7 +194,7 @@ File: `src/web/mod.rs`, templates in `templates/`
 
 **Security hardening (1.0):**
 - **CSRF protection** — double-submit cookie pattern on all 31 POST handlers via `csrf_cookie_middleware`. Client-side JS injects `_csrf` hidden field. Multipart forms use query parameter.
-- **Booking rate limiting** — per-IP (10 req / 5 min) on all 4 booking handlers. Client IP is the *rightmost* `X-Forwarded-For` value (the trusted proxy's view of its peer; leftmost is attacker-controlled). See `client_ip_for_rate_limit()` in `web/mod.rs`.
+- **Booking rate limiting** — per-IP (10 req / 5 min) on all 4 booking handlers. Client IP is the *rightmost* `X-Forwarded-For` value (the trusted proxy's view of its peer; leftmost is attacker-controlled). See `client_ip_for_rate_limit()` in `src/web/mod.rs`.
 - **Input validation** — server-side on all booking forms (name 1–255, email format, notes max 5000, date max 365 days), registration, settings, avatar upload (content-type whitelist).
 - **Double-booking prevention** — partial unique index `idx_bookings_no_overlap` on `(event_type_id, start_at)` + `BEGIN IMMEDIATE` transactions.
 - **Crash-proof handlers** — all `.unwrap()` in web handlers replaced with proper error responses.
@@ -394,7 +253,9 @@ The verification is implemented in `src/web/captcha.rs` and applies to **3 handl
 | File | Role |
 |---|---|
 | `src/web/captcha.rs` | Self-contained module: `CaptchaConfig` struct, `load_captcha_config()`, `verify()`, `extract_origin()` helper, unit tests |
-| `src/web/mod.rs` | `AppState.captcha_config: RwLock<Option<CaptchaConfig>>`, `build_csp()`, `csp_middleware()`, `admin_update_captcha()` handler, wiring in the 4 GET form handlers and 3 POST booking handlers |
+| `src/web/mod.rs` | `AppState.captcha_config: RwLock<Option<CaptchaConfig>>`, `build_csp()`, `csp_middleware()` |
+| `src/web/admin.rs` | `admin_update_captcha()` handler |
+| `src/web/public_pages.rs`, `src/web/booking.rs` | wiring in the 4 GET form handlers and 3 POST booking handlers |
 | `migrations/053_captcha.sql` | Adds `captcha_instance_url`, `captcha_site_key`, `captcha_secret`, `captcha_widget_url` columns to `auth_config` |
 | `migrations/067_captcha_wasm_url.sql` | Adds `captcha_wasm_url` to `auth_config` |
 | `templates/admin.html` | Captcha configuration section (status badge, 5 inputs, save button) |
@@ -468,7 +329,7 @@ Because `--surface`, `--border`, etc. are already overridden by `html.dark { ...
 
 **Read path** (`src/resources.rs`): feeds are cached in `resource_events` and re-synced when older than 5 minutes (`sync_if_stale`; the feed is authoritative, orphans are deleted; failed fetches also stamp `last_synced_at` so dead feeds back off, and record `last_sync_error` for the admin panel; success clears it). `fetch_feed` re-validates the URL against the private-host policy on every fetch, follows no redirects, and caps body size and event count. `busy_for_resource()` merges feed events (single + RRULE-expanded, skipping CANCELLED/TRANSPARENT, excluding the booking's own reservation and reservations of cancelled bookings) with calrs' own confirmed bookings, so two event types sharing a resource cannot double-book it even without write-back. `blocking_intervals_for_event_type()` feeds `compute_slots()`; `check_and_pick()` is the booking-time gate, serialized by a process-wide lock (`booking_lock()`) held from the check until the booking row is committed. Both approval paths re-check resources (pending bookings do not block them). The troubleshoot view shows blocked intervals as `resource_busy`.
 
-**Write path** (reservation, `src/web/mod.rs`): confirmed bookings are PUT into the required resources' CalDAV collections under the booking's own uid (`resource_push_booking`; every attached resource in `all` mode, only the assigned resource in `round_robin`), and deleted when a confirmed booking is cancelled or rescheduled (`resource_delete_booking`, targets derived from the stored assignment so detached resources still get released). Declined pending bookings need no cleanup: reservations are only pushed on confirmation. The CalDAV URL is either configured or derived from a BlueMind publish URL (`derive_caldav_url`: `/api/calendars/publish/calendar:UID/...` maps to `/dav/calendars/__uids__/UID/calendar:UID/`). Credential candidates in trust order (`resource_write_candidates`): the resource's service account first, then members who opted in via `users.lend_resource_write` and have a CalDAV source on the same scheme+host+port, preferring the booking's assigned host. Note: lending grants writes to any collection on that origin the member's own server-side ACL allows; the service account is always preferred. Write failure is non-fatal: the DB-side busy check keeps blocking the resource, and failures are logged.
+**Write path** (reservation, `src/web/calendar_push.rs`): confirmed bookings are PUT into the required resources' CalDAV collections under the booking's own uid (`resource_push_booking`; every attached resource in `all` mode, only the assigned resource in `round_robin`), and deleted when a confirmed booking is cancelled or rescheduled (`resource_delete_booking`, targets derived from the stored assignment so detached resources still get released). Declined pending bookings need no cleanup: reservations are only pushed on confirmation. The CalDAV URL is either configured or derived from a BlueMind publish URL (`derive_caldav_url`: `/api/calendars/publish/calendar:UID/...` maps to `/dav/calendars/__uids__/UID/calendar:UID/`). Credential candidates in trust order (`resource_write_candidates`): the resource's service account first, then members who opted in via `users.lend_resource_write` and have a CalDAV source on the same scheme+host+port, preferring the booking's assigned host. Note: lending grants writes to any collection on that origin the member's own server-side ACL allows; the service account is always preferred. Write failure is non-fatal: the DB-side busy check keeps blocking the resource, and failures are logged.
 
 **Visibility:** host-facing emails (new booking, approval request, confirmed, host reminder) show a "Resource" row via `BookingDetails.resource_name` (`booking_resource_label()`: assigned resource in round_robin, attached names in 'all'); guests never see resource names. The event-types listing shows a "resources" badge, and the bookings dashboard shows the assigned resource per booking.
 
@@ -476,7 +337,7 @@ Because `--surface`, `--border`, etc. are already overridden by `html.dark { ...
 
 **CLI:** `calrs resource probe --url <URL> [--username U] [--write-test]` probes a feed or CalDAV collection (full RFC 4791 discovery fallback, write test with a temporary event). Known gap: `calrs event-type slots` and `calrs booking create` do not consult resources yet; the web paths do.
 
-**Files:** `src/resources.rs` (core logic + tests), `src/web/mod.rs` (admin handlers, booking wiring, write-back), `src/commands/resource.rs` (probe CLI), `migrations/058_resources.sql`, `templates/admin.html`, `templates/event_type_form.html`, `templates/settings.html`, `templates/troubleshoot.html`.
+**Files:** `src/resources.rs` (core logic + tests), `src/web/admin.rs` (admin handlers), `src/web/booking.rs` (booking wiring), `src/web/calendar_push.rs` (write-back), `src/commands/resource.rs` (probe CLI), `migrations/058_resources.sql`, `templates/admin.html`, `templates/event_type_form.html`, `templates/settings.html`, `templates/troubleshoot.html`.
 
 ---
 
@@ -527,7 +388,7 @@ The country is **seeded, not guessed**. Only an explicit BCP-47 region subtag co
 **Note:** delta sync is implemented. `commands/sync.rs` stores a per-calendar `sync-token` (migration 027) and `ctag`, issues an RFC 6578 `sync-collection` REPORT when it has one, and falls back to a full fetch when the server rejects it or reports an empty delta against a changed ctag. `--full` clears both. EWS sources keep their own flow.
 
 ### Test coverage roadmap
-- **Web handler integration tests** — use `axum::test` with in-memory SQLite to test the full booking flow (create event type → fetch slots → book → confirm/cancel), dashboard renders, admin panel, token-based actions. Requires building a shared test harness (DB seed, AppState setup). This is the biggest coverage opportunity (~49% of codebase is `web/mod.rs`).
+- **Web handler integration tests** — use `axum::test` with in-memory SQLite to test the full booking flow (create event type → fetch slots → book → confirm/cancel), dashboard renders, admin panel, token-based actions. Requires building a shared test harness (DB seed, AppState setup). This is the biggest coverage opportunity (~49% of the codebase is `src/web/`).
 - **CLI command tests** (`commands/*.rs`) — unit tests for `sync.rs`, `booking.rs`, `event_type.rs`, `source.rs`, `config.rs`, `user.rs`. These are I/O-heavy (DB + CalDAV) so they need mock/in-memory DB fixtures. Can reuse the same test harness from the web handler tests.
 
 ---
@@ -614,7 +475,7 @@ Both the guest side and the host side (dashboard, settings, forms, admin panel, 
 - **Guest token pages** (cancel and reschedule forms and their result pages, including the "pick a new time" slot picker): the stored booking language (`token_page_lang`), else the browser's.
 - **Host token pages** (approve and decline forms and results): the saved language of the booking's single host, the assigned member else the owner (`host_token_page_lang`, one query), else the browser's. A collective booking uses the browser's: every member gets the approval email in their own language, and the shared link cannot tell which one clicked. **Claim pages**: the language of the watcher the claim token was issued to (`claim_page_lang`), else the browser's. When the recipient has a saved language, the page matches the email that linked to it; without one the email is English and the page follows the browser.
 
-Host, team member and watcher emails use the recipient's saved `users.language`, looked up by user id with `email::user_language(pool, user_id)` (never by address: one user's `booking_email` can be another user's login email). `booking_host_identity` returns the host's normalised language alongside the `(name, email)` it resolves, so callers need no second lookup; NULL, empty or unsupported means English, since a background send has no `Accept-Language` to fall back on. A collective booking emails each member in their own language. The invite email follows the inviter's resolved language (`auth_user.lang`), because nothing is known about the invitee and the personal message is the inviter's. The only English email left is the admin SMTP test. New emails go through the `compose_*` pattern in `src/email.rs`: a pure function building an `EmailParts` (subject, heading, message, rows, plain-only lines, footer, buttons) in one language, so tests can read exactly what the recipient gets, and `send_composed` for delivery.
+Host, team member and watcher emails use the recipient's saved `users.language`, looked up by user id with `email::user_language(pool, user_id)` (never by address: one user's `booking_email` can be another user's login email). `booking_host_identity` returns the host's normalised language alongside the `(name, email)` it resolves, so callers need no second lookup; NULL, empty or unsupported means English, since a background send has no `Accept-Language` to fall back on. A collective booking emails each member in their own language. The invite email follows the inviter's resolved language (`auth_user.lang`), because nothing is known about the invitee and the personal message is the inviter's. The only English email left is the admin SMTP test. New emails go through the `compose_*` pattern in `src/email/guest.rs` and `src/email/host.rs`: a pure function building an `EmailParts` (subject, heading, message, rows, plain-only lines, footer, buttons) in one language, so tests can read exactly what the recipient gets, and `send_composed` for delivery.
 
 Three helpers stay English on purpose: the CSRF rejection, the 500 page, and the OIDC failure. They live in helpers called from ~240 sites with no `lang` in scope, and they are diagnostics rather than flow messages.
 
@@ -624,7 +485,7 @@ Every locale except French addresses the reader informally, matching what the ea
 
 **Keys that reach Fluent through a variable.** Most call sites name their key inline, as `translate(lang, "key", None)`. Two places on the booking path do not: `render_booking_action_error_keys_in(state, lang, title_key, body_key)` takes a `bae-*` pair, and the booking-form validators return their key as `Err("validate-*")` for the handler to resolve. The email module's short helpers (`t(lang, "key")`, `ta(lang, "key", ..)`, `push_row(rows, lang, "key", ..)`, `status_subject(..)`) are scanned too. Both forms are covered by the Rust key guard, so a typo still fails the build rather than rendering the raw id to a guest. Add any further indirection to `find_rust_keys` in `src/i18n.rs` at the same time you add the indirection itself.
 
-**Guard tests** in `src/i18n.rs`: every `t()` key referenced from a template exists in the English bundle; the same for keys used from Rust (including the two indirect forms above); every template still loads; every locale covers every English key; and plural messages carry the categories the locale's grammar needs. That last one matters because Polish selects one/few/many for integers, so a translation that copies English's one/other reads wrong at 2 and at 5. Two further guards in `src/web/mod.rs`: one fails if a host-facing template is rendered without a `lang` in its context, the other fails if any call site hands the booking error page a bare English sentence instead of a key or an already-translated value.
+**Guard tests** in `src/i18n.rs`: every `t()` key referenced from a template exists in the English bundle; the same for keys used from Rust (including the two indirect forms above); every template still loads; every locale covers every English key; and plural messages carry the categories the locale's grammar needs. That last one matters because Polish selects one/few/many for integers, so a translation that copies English's one/other reads wrong at 2 and at 5. Two further guards in `src/web/tests/guards.rs` (they scan every shipping `.rs` file under `src/web/`): one fails if a host-facing template is rendered without a `lang` in its context, the other fails if any call site hands the booking error page a bare English sentence instead of a key or an already-translated value.
 
 **Numbers passed to `t()`** reach Fluent as numbers, not strings, so `{ $count -> [one] ... }` plural selectors work. Grouping is switched off, so an integer renders as it always did ("1440", not "1,440").
 

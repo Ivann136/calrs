@@ -1374,7 +1374,7 @@ mod tests {
 
         // Booking in the exact state produced by guest_reschedule_booking's pending
         // branch: status='pending', caldav_calendar_href still set from the prior
-        // confirmed push (fix A in web/mod.rs clears this — but the sweep must also
+        // confirmed push (fix A in web/booking_actions.rs clears this — but the sweep must also
         // be safe even if a legacy booking row still has the href set).
         let booking_id = Uuid::new_v4().to_string();
         sqlx::query(
