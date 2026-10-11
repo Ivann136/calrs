@@ -470,6 +470,28 @@ mod tests {
         );
     }
 
+    /// The email module's short helpers are scanned like `translate`, so a
+    /// typo in an email key fails the build too; names that merely end in
+    /// `t(` are not.
+    #[test]
+    fn rust_key_scan_reads_the_email_helpers() {
+        let src = r#"
+            let a = t(lang, "email-one");
+            let b = ta(
+                lang,
+                "email-two",
+                [("x", y)],
+            );
+            push_row(&mut rows, lang, "email-three", value);
+            let c = format(lang, "not-a-call");
+        "#;
+        let keys = find_rust_keys(src);
+        for key in ["email-one", "email-two", "email-three"] {
+            assert!(keys.iter().any(|k| k == key), "{key} not found: {keys:?}");
+        }
+        assert!(!keys.iter().any(|k| k == "not-a-call"), "{keys:?}");
+    }
+
     /// Handlers translate too (form validation errors, the troubleshoot
     /// timeline). A typo there renders the raw message id into the page just
     /// as silently as it would from a template.
@@ -568,16 +590,43 @@ mod tests {
                 keys.push(key.to_string());
             }
         }
-        for call in ["translate(", "tr1("] {
+        // `t(lang, "key")` and `ta(lang, "key", ..)` are the email module's
+        // short forms of `translate`; `push_row(rows, lang, "key", ..)` hands
+        // a label key to one of them. Each is listed with how many arguments
+        // come before the key.
+        for (call, skip) in [
+            ("translate(", 1),
+            ("tr1(", 1),
+            ("t(", 1),
+            ("ta(", 1),
+            ("push_row(", 2),
+        ] {
             let mut i = 0;
             while let Some(pos) = src[i..].find(call) {
-                let start = i + pos + call.len();
+                let at = i + pos;
+                let start = at + call.len();
                 i = start;
-                // Skip the lang argument, then read the quoted key.
-                let Some(comma) = src[start..].find(',') else {
+                // `t(` and `ta(` also end longer names (`format(`, `meta(`).
+                if src[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
                     continue;
-                };
-                let rest = src[start + comma + 1..].trim_start();
+                }
+                // Skip the arguments before the key, then read the quoted key.
+                let mut from = start;
+                let mut found = true;
+                for _ in 0..skip {
+                    match src[from..].find(',') {
+                        Some(comma) => from += comma + 1,
+                        None => found = false,
+                    }
+                }
+                if !found {
+                    continue;
+                }
+                let rest = src[from..].trim_start();
                 let Some(inner) = rest.strip_prefix('"') else {
                     continue;
                 };
