@@ -103,7 +103,8 @@ calrs/
 │   ├── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_phone_mode on event_types, sms_config + sms_usage tables, sms_allow_all_users on auth_config
 │   ├── 063_booking_horizon.sql   ← booking_horizon_days on event_types (NULL = unlimited)
 │   ├── 068_writeback_failures.sql ← writeback_error/attempts/next_attempt_at/alerted_at on bookings (#162)
-│   └── 069_source_sync_errors.sql ← last_sync_error, sync_failing_since, failure count, alert stamp on caldav_sources (#162)
+│   ├── 069_source_sync_errors.sql ← last_sync_error, sync_failing_since, failure count, alert stamp on caldav_sources (#162)
+│   └── 070_booking_organizer.sql ← organizer_user_id/name/email snapshot on bookings: collective and dynamic group organizer (#161)
 │   ├── 064_booking_time_version.sql ← time_version on bookings (0 = legacy wall clock, 1 = UTC)
 │   ├── 065_pending_slot_hold.sql ← pending_blocks_slot + pending_expiry_hours on event_types; pending_expires_at, pending_since, pending_reminder_sent_at on bookings
 │   ├── 066_public_page_language.sql ← public_page_language on users ('visitor' default / 'host') for /u/{username} and legacy /{slug} pages

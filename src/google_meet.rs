@@ -397,11 +397,12 @@ pub async fn elect_meet_owner(pool: &SqlitePool, booking_id: &str) -> Option<Str
     let row: Option<(
         Option<String>,
         Option<String>,
+        Option<String>,
         String,
         String,
         Option<String>,
     )> = sqlx::query_as(
-        "SELECT b.assigned_user_id, et.team_id, et.scheduling_mode, et.id, a.user_id
+        "SELECT b.organizer_user_id, b.assigned_user_id, et.team_id, et.scheduling_mode, et.id, a.user_id
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -412,7 +413,15 @@ pub async fn elect_meet_owner(pool: &SqlitePool, booking_id: &str) -> Option<Str
     .await
     .ok()
     .flatten();
-    let (assigned, team_id, mode, et_id, owner_id) = row?;
+    let (organizer, assigned, team_id, mode, et_id, owner_id) = row?;
+
+    // A multi-host booking stored its organizer at creation (#161): that
+    // user, whatever the roster has become since.
+    if let Some(organizer) = organizer {
+        return user_has_google_writeback(pool, &organizer)
+            .await
+            .then_some(organizer);
+    }
 
     if let Some(assigned) = assigned {
         return user_has_google_writeback(pool, &assigned)
@@ -1003,9 +1012,11 @@ async fn booking_details_for_meet(
         String,
         Option<String>,
         Option<i32>,
+        Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT b.uid, b.guest_name, b.guest_email, CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at,
-                b.notes, et.title, et.timezone, et.reminder_minutes
+                b.notes, et.title, et.timezone, et.reminder_minutes, b.organizer_name, b.organizer_email
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          WHERE b.id = ?",
@@ -1025,15 +1036,21 @@ async fn booking_details_for_meet(
         title,
         et_timezone,
         reminder_minutes,
+        organizer_name,
+        organizer_email,
     ) = booking?;
 
-    let host: Option<(String, String)> =
-        sqlx::query_as("SELECT name, COALESCE(booking_email, email) FROM users WHERE id = ?")
+    // A multi-host booking keeps the organizer it was created with (#161);
+    // `owner_id` was elected from that same snapshot.
+    let host: Option<(String, String)> = match (organizer_name, organizer_email) {
+        (Some(name), Some(email)) => Some((name, email)),
+        _ => sqlx::query_as("SELECT name, COALESCE(booking_email, email) FROM users WHERE id = ?")
             .bind(owner_id)
             .fetch_optional(pool)
             .await
             .ok()
-            .flatten();
+            .flatten(),
+    };
     let (host_name, host_email) = host?;
 
     // bookings.start_at is naive in the event type timezone. Convert to UTC
@@ -1800,6 +1817,45 @@ mod tests {
             elect_meet_owner(&pool, &bid).await.is_none(),
             "must not mint Meet on Carol when Alice is ORGANIZER"
         );
+    }
+
+    /// #161: a collective booking keeps the organizer it was created with.
+    /// Aaron joining sorts first by name, but the Meet must stay on Carol,
+    /// whose address the event already carries as ORGANIZER.
+    #[tokio::test]
+    async fn elect_owner_collective_prefers_the_stored_organizer() {
+        let pool = memory_pool().await;
+        let aaron = insert_user(&pool, "aaron@colstore.example.com", "Aaron").await;
+        let carol = insert_user(&pool, "carol@colstore.example.com", "Carol").await;
+        insert_google_source(&pool, &aaron, true).await;
+        insert_google_source(&pool, &carol, true).await;
+        let team = insert_team(&pool, &[(&carol, "admin"), (&aaron, "member")]).await;
+        let et = insert_event_type(&pool, &carol, Some(&team), "collective", "google_meet").await;
+        let (bid, _) = insert_booking(&pool, &et, None, None).await;
+        sqlx::query(
+            "UPDATE bookings SET organizer_user_id = ?, organizer_name = 'Carol', \
+             organizer_email = 'carol@colstore.example.com' WHERE id = ?",
+        )
+        .bind(&carol)
+        .bind(&bid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            elect_meet_owner(&pool, &bid).await.as_deref(),
+            Some(carol.as_str())
+        );
+        // A later rename or booking address change does not reach the event.
+        sqlx::query(
+            "UPDATE users SET name = 'Caroline', booking_email = 'c@new.example.com' WHERE id = ?",
+        )
+        .bind(&carol)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let details = booking_details_for_meet(&pool, &bid, &carol).await.unwrap();
+        assert_eq!(details.host_email, "carol@colstore.example.com");
+        assert_eq!(details.host_name, "Carol");
     }
 
     #[tokio::test]

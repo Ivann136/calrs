@@ -95,6 +95,44 @@ fn extract_origin(url: &str) -> String {
     }
 }
 
+/// What the admin captcha form shows: the stored values as they are, whether
+/// or not they add up to a working configuration. Reading these from the
+/// active [`CaptchaConfig`] instead would show empty fields while the
+/// configuration is incomplete (say, before the secret is entered), and the
+/// next save would then wipe the values already stored.
+pub struct CaptchaFormValues {
+    pub instance_url: String,
+    pub site_key: String,
+    /// The stored widget URL, or [`DEFAULT_WIDGET_URL`] when none is stored.
+    pub widget_url: String,
+    pub wasm_url: String,
+}
+
+pub async fn load_captcha_form_values(pool: &SqlitePool) -> CaptchaFormValues {
+    let row: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT captcha_instance_url, captcha_site_key, captcha_widget_url, captcha_wasm_url \
+             FROM auth_config WHERE id = 'singleton'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (instance_url, site_key, widget_url, wasm_url) = row.unwrap_or_default();
+    CaptchaFormValues {
+        instance_url: instance_url.unwrap_or_default(),
+        site_key: site_key.unwrap_or_default(),
+        widget_url: widget_url
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_WIDGET_URL.to_string()),
+        wasm_url: wasm_url.unwrap_or_default(),
+    }
+}
+
 pub async fn load_captcha_config(pool: &SqlitePool, key: &[u8; 32]) -> Option<CaptchaConfig> {
     let row: Option<(
         Option<String>,

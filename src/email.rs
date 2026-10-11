@@ -295,6 +295,26 @@ fn guest_sender_name(lang: &str, host_name: &str, from_name: Option<&str>) -> Op
 /// Reply-To for guest-facing mail: the host's address when it is exactly one
 /// bare address, nothing otherwise. A malformed value or an address list
 /// yields no Reply-To rather than a broken or surprising header.
+/// `name <email>` as a [`Mailbox`]. Formatting the two into one string and
+/// parsing it, as every send path used to, fails on a display name with
+/// `@`, `,`, `<`, `>`, `;` or quotes in it ("Dr. A, PhD", "Alice @ Acme"),
+/// and the email was then never sent. Passing the name to `Mailbox::new`
+/// lets lettre quote or encode it instead. Control characters are replaced
+/// by spaces so a CRLF in a guest-supplied name still cannot start a header
+/// line, and an empty name leaves the bare address.
+pub(crate) fn named_mailbox(name: &str, email: &str) -> Result<Mailbox> {
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let name = name.trim();
+    let address = email.trim().parse()?;
+    Ok(Mailbox::new(
+        (!name.is_empty()).then(|| name.to_string()),
+        address,
+    ))
+}
+
 fn host_reply_to(email: &str) -> Option<Mailbox> {
     email
         .trim()
@@ -903,7 +923,7 @@ pub async fn send_guest_confirmation_ex(
     let ics = generate_ics(details, "REQUEST");
     let lang = guest_lang(details);
 
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
 
     let time_display = format!(
         "{} \u{2013} {} ({})",
@@ -1299,7 +1319,7 @@ fn compose_attendee_confirmation(details: &BookingDetails) -> ComposedEmail {
 
 /// Send booking notification to the host
 pub async fn send_host_notification(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     let ics = generate_ics(details, "REQUEST");
     send_composed(
         config,
@@ -1381,7 +1401,7 @@ pub async fn send_host_booking_confirmed(
     config: &SmtpConfig,
     details: &BookingDetails,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     send_composed(
         config,
         Sender::Instance,
@@ -1463,7 +1483,7 @@ pub async fn send_host_calendar_sync_failure(
     details: &BookingDetails,
     reason: &str,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     send_composed(
         config,
         Sender::Instance,
@@ -1524,7 +1544,7 @@ pub async fn send_host_writeback_failure(
     details: &BookingDetails,
     error: &str,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     send_composed(
         config,
         Sender::Instance,
@@ -1591,7 +1611,7 @@ pub async fn send_source_sync_failure(
     config: &SmtpConfig,
     alert: &SourceSyncFailure,
 ) -> Result<()> {
-    let to = format!("{} <{}>", alert.owner_name, alert.owner_email).parse()?;
+    let to = named_mailbox(&alert.owner_name, &alert.owner_email)?;
     send_composed(
         config,
         Sender::Instance,
@@ -1635,7 +1655,7 @@ pub async fn send_guest_reminder(
     cancel_url: Option<&str>,
 ) -> Result<()> {
     let lang = guest_lang(details);
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
 
     let time_display = format!(
         "{} \u{2013} {} ({})",
@@ -1754,7 +1774,7 @@ pub async fn send_guest_reminder(
 
 /// Send booking reminder to the host
 pub async fn send_host_reminder(config: &SmtpConfig, details: &BookingDetails) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     send_composed(
         config,
         Sender::Instance,
@@ -1830,7 +1850,7 @@ pub async fn send_guest_cancellation(
     let ics = generate_cancel_ics(details);
     let lang = lang_or_en(details.guest_language.as_deref());
 
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
 
     let time_display = if details.guest_timezone.is_empty() {
         format!("{} \u{2013} {}", details.start_time, details.end_time)
@@ -1960,7 +1980,7 @@ pub async fn send_host_cancellation(
     config: &SmtpConfig,
     details: &CancellationDetails,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     let ics = generate_cancel_ics(details);
     send_composed(
         config,
@@ -2043,7 +2063,7 @@ pub async fn send_guest_pending_notice_ex(
     cancel_url: Option<&str>,
     reschedule_url: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
     let composed = compose_guest_pending_notice(details, cancel_url, reschedule_url);
     let body = build_multipart_body(&composed.plain, &composed.html);
 
@@ -2245,7 +2265,7 @@ async fn send_host_approval_email(
     base_url: Option<&str>,
     expires: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     let mail = compose_host_approval_email(details, confirm_token, base_url, expires);
     send_composed(config, Sender::Instance, to, mail, None).await
 }
@@ -2359,7 +2379,7 @@ pub async fn send_guest_decline_notice(
     config: &SmtpConfig,
     details: &CancellationDetails,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
     let composed = compose_guest_decline_notice(details);
     let body = build_multipart_body(&composed.plain, &composed.html);
 
@@ -2474,7 +2494,7 @@ pub async fn send_guest_pending_expired(
     details: &CancellationDetails,
     rebook_url: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
     let composed = compose_guest_pending_expired(details, rebook_url);
     let body = build_multipart_body(&composed.plain, &composed.html);
 
@@ -2588,7 +2608,7 @@ pub async fn send_host_pending_expired(
     config: &SmtpConfig,
     details: &CancellationDetails,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     send_composed(
         config,
         Sender::Instance,
@@ -2925,7 +2945,7 @@ pub async fn send_invite_email(
     invite_url: &str,
     expires_at: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", guest_name, guest_email).parse()?;
+    let to = named_mailbox(guest_name, guest_email)?;
     let mail = compose_invite_email(
         lang,
         guest_name,
@@ -3114,7 +3134,7 @@ pub async fn send_guest_pick_new_time(
     reschedule_url: &str,
     cancel_url: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
     let mail = compose_guest_pick_new_time(details, reschedule_url, cancel_url);
     send_composed(config, Sender::host_of(details), to, mail, None).await
 }
@@ -3211,7 +3231,7 @@ pub async fn send_guest_reschedule_notification(
     };
     let ics = generate_ics(&booking_details, "REQUEST");
 
-    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let to = named_mailbox(&details.guest_name, &details.guest_email)?;
     let mail = compose_guest_reschedule_notification(details, cancel_url, reschedule_url);
     let sender = Sender::Host {
         name: &details.host_name,
@@ -3315,7 +3335,7 @@ pub async fn send_host_reschedule_request(
     confirm_token: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+    let to = named_mailbox(&details.host_name, &details.host_email)?;
     let mail = compose_host_reschedule_request(details, confirm_token, base_url);
     send_composed(config, Sender::Instance, to, mail, None).await
 }
@@ -3411,7 +3431,7 @@ pub async fn send_watcher_claim_notification(
     assigned_to_name: &str,
     claim_url: &str,
 ) -> Result<()> {
-    let to = format!("{} <{}>", watcher_name, watcher_email).parse()?;
+    let to = named_mailbox(watcher_name, watcher_email)?;
     let mail = compose_watcher_claim_notification(
         details,
         watcher_name,
@@ -3484,7 +3504,7 @@ pub async fn send_claim_confirmation(
     claimant_email: &str,
     lang: Option<&str>,
 ) -> Result<()> {
-    let to = format!("{} <{}>", claimant_name, claimant_email).parse()?;
+    let to = named_mailbox(claimant_name, claimant_email)?;
     let mail = compose_claim_confirmation(details, claimant_name, lang);
     send_composed(config, Sender::Instance, to, mail, None).await
 }
@@ -7220,13 +7240,15 @@ mod tests {
 
     // ===== Email-header injection defenses =====
     //
-    // All email-sending paths build To/From/Reply-To via
-    // `format!("{name} <{email}>").parse::<Mailbox>()?` and subjects via
+    // Email-sending paths used to build To via
+    // `format!("{name} <{email}>").parse::<Mailbox>()?`; they now go through
+    // `named_mailbox()`, which replaces control characters in the name before
+    // `Mailbox::new` (see the tests below it). Subjects go through
     // `.subject(format!(…))`. The audit that produced #43 flagged the first
     // pattern as potentially injectable (Claude's reasoning: an unvalidated
     // guest name could contain CRLF and smuggle a Bcc: into the headers).
     //
-    // Empirically the defense is lettre's typed builder: `Mailbox::from_str`
+    // Empirically lettre's typed builder defends both: `Mailbox::from_str`
     // rejects CRLF in display names, and `.subject(…)` RFC 2047-encodes any
     // control chars (so `\r\n` ends up inside a base64-encoded section and
     // never reaches the SMTP wire). These tests pin that behavior so we
@@ -7237,7 +7259,7 @@ mod tests {
     #[test]
     fn lettre_mailbox_rejects_crlf_in_display_name() {
         use lettre::message::Mailbox;
-        // Exact shape used throughout email.rs:
+        // The shape email.rs used before `named_mailbox()`:
         //   format!("{} <{}>", details.guest_name, details.guest_email).parse()
         let payloads = [
             "Alice\r\nBcc: evil@attacker.com",
@@ -7255,6 +7277,85 @@ mod tests {
                 result
             );
         }
+    }
+
+    /// A display name with `@`, a comma, quotes and angle brackets did not
+    /// parse once formatted as `name <email>`, so the email was never sent.
+    #[test]
+    fn named_mailbox_accepts_special_characters_in_the_name() {
+        let name = r#"Dr. "Ace" O'Neil, PhD @ Acme <ops>; team"#;
+        let mailbox = named_mailbox(name, "ace@example.com").expect("a valid mailbox");
+        assert_eq!(mailbox.name.as_deref(), Some(name));
+        assert_eq!(mailbox.email.to_string(), "ace@example.com");
+        // What lettre writes on the wire parses back to the same mailbox.
+        let reparsed: Mailbox = mailbox.to_string().parse().expect("round-trips");
+        assert_eq!(reparsed, mailbox);
+        // The old shape refused the same input.
+        assert!(format!("{name} <ace@example.com>")
+            .parse::<Mailbox>()
+            .is_err());
+    }
+
+    #[test]
+    fn named_mailbox_keeps_crlf_out_of_the_headers() {
+        let mailbox = named_mailbox("Alice\r\nBcc: evil@attacker.com", "guest@example.com")
+            .expect("control characters are replaced, not refused");
+        let msg = Message::builder()
+            .from("sender@example.com".parse::<Mailbox>().unwrap())
+            .to(mailbox)
+            .subject("s")
+            .body("body".to_string())
+            .unwrap();
+        let wire = String::from_utf8_lossy(&msg.formatted()).into_owned();
+        assert!(
+            !wire.lines().any(|l| l.starts_with("Bcc:")),
+            "header injected: {wire}"
+        );
+        // An empty (or all-control) name leaves the bare address.
+        let bare = named_mailbox(" \r\n ", "guest@example.com").unwrap();
+        assert_eq!(bare.name, None);
+        assert!(named_mailbox("Alice", "not an address").is_err());
+    }
+
+    /// End to end: a host whose name has `@`, a comma and quotes in it gets
+    /// their cancellation notice.
+    #[tokio::test]
+    async fn host_with_special_characters_in_the_name_is_emailed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_no_auth_mta(listener));
+
+        let details = CancellationDetails {
+            event_title: "Intro".to_string(),
+            date: "2030-07-02".to_string(),
+            start_time: "10:00".to_string(),
+            end_time: "10:30".to_string(),
+            guest_name: "Guest".to_string(),
+            guest_email: "guest@example.com".to_string(),
+            guest_timezone: "UTC".to_string(),
+            host_name: r#"Alice "Ops" @ Acme, Inc."#.to_string(),
+            host_email: "alice@example.com".to_string(),
+            uid: "uid-special-name".to_string(),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_host_cancellation(&plaintext_config(port, ""), &details),
+        )
+        .await
+        .expect("send timed out")
+        .expect("the notice is sent");
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("server timed out")
+            .unwrap();
+        assert!(
+            seen.iter()
+                .any(|c| c.starts_with("RCPT TO") && c.contains("alice@example.com")),
+            "{seen:?}"
+        );
+        assert!(seen.iter().any(|c| c == "DATA"), "{seen:?}");
     }
 
     #[test]
