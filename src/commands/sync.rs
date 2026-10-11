@@ -98,8 +98,30 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
     // A failing source may have queued an email to its owner.
     crate::web::drain_emails(std::time::Duration::from_secs(30)).await;
 
-    println!("{} Sync complete.", "✓".green());
-    Ok(())
+    if failed.is_empty() {
+        println!("{} Sync complete.", "✓".green());
+        return Ok(());
+    }
+    // #162: this used to print "Sync complete." after a failure and exit 0,
+    // so a cron job or a monitoring check could not tell anything was wrong.
+    println!(
+        "{} Sync failed for {} of {} source(s):",
+        "✗".red(),
+        failed.len(),
+        sources.len()
+    );
+    for (name, error) in &failed {
+        println!("  {} {}: {}", "✗".red(), name, error);
+    }
+    println!(
+        "  {}",
+        "Availability keeps being served from the last successful sync of these sources.".dimmed()
+    );
+    anyhow::bail!(
+        "{} of {} source(s) failed to sync",
+        failed.len(),
+        sources.len()
+    )
 }
 
 /// Build the right client for a source row and sync it, recording the

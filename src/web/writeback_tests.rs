@@ -541,6 +541,17 @@ async fn on_demand_sync_backs_off_after_a_failure() {
     );
 }
 
+/// `calrs sync` used to print "Sync complete." after a failure and exit 0.
+#[tokio::test]
+async fn cli_sync_fails_when_a_source_fails() {
+    let (pool, _host, source_id) = failing_source_fixture().await;
+    let err = crate::commands::sync::run(&pool, &[0u8; 32], false)
+        .await
+        .expect_err("a failed source must fail the command");
+    assert!(err.to_string().contains("1 of 1 source(s) failed"), "{err}");
+    assert!(source_health(&pool, &source_id).await.0.is_some());
+}
+
 /// The calendar sources page shows a failing source's error.
 #[tokio::test]
 async fn sources_dashboard_shows_the_sync_error() {
