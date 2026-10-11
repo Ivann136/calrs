@@ -177,6 +177,8 @@ Additionally, a database-level unique index prevents two bookings from occupying
 
 When a booking is confirmed (either directly or via approval), calrs can push the event to the host's CalDAV calendar. For team event types the host is the assigned member (round-robin), or every eligible member (collective: enabled members with a non-zero per-event-type weight, the same set the slot grid checks). See [CalDAV Integration > Write-back](./caldav.md#caldav-write-back) for setup.
 
+The event's `ORGANIZER` is the host: the assigned member, or for a collective booking the first eligible member by name, with every member's name joined. A collective or dynamic group booking stores that organizer when it is created and keeps it for every later update (approval, reschedule, claim, retry), even if the team changes in the meantime: Google CalDAV refuses an update that changes an existing event's organizer. Bookings made before calrs stored it (migration 070) still resolve it from the current roster.
+
 ## Email notifications
 
 If SMTP is configured, calrs sends emails at these moments:
@@ -210,7 +212,7 @@ The admin SMTP test email is English.
 Every email leaves from the configured sender address, so SPF, DKIM and DMARC keep aligning with the instance's domain. What changes is the name the guest sees and where their reply goes:
 
 - **Guest emails** (confirmation, the copies to additional attendees, pending, reminder, cancellation, decline, expired request, pick a new time, reschedule, invite) show the host's name followed by the configured sender name, joined in the email's language: `Bob Smith via Acme Scheduling`, or just `Bob Smith` when no sender name is set. They carry a `Reply-To` with the host's booking email (their account email when no booking email is set), so a guest who answers the email reaches the host directly.
-- On a round-robin booking the host is the assigned member. On a collective booking the name is the joined roster (`Alice & Bob via ...`), as is the confirmation of a dynamic group booking, and replies go to the member the calendar invite names as organizer.
+- On a round-robin booking the host is the assigned member. On a collective or dynamic group booking the name is the joined roster (`Alice & Bob via ...`), and replies go to the member the calendar invite names as organizer, the same on every email of that booking even when the team changes after it was made.
 - **Invites** take the `Reply-To` from the inviting user's account email, never their booking email: the inviter picks the recipients, and the booking email is not verified.
 - **Host, team member, watcher and admin emails** keep the configured sender name and have no `Reply-To`.
 
