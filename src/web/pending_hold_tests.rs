@@ -592,6 +592,125 @@ async fn token_approval_is_refused_when_a_calendar_event_now_overlaps() {
     assert_eq!(booking_status(&pool, &pending).await, "pending");
 }
 
+async fn pending_columns(
+    pool: &SqlitePool,
+    id: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    sqlx::query_as(
+        "SELECT pending_expires_at, pending_since, pending_reminder_sent_at FROM bookings WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Review finding on #234: an approved booking kept its old, now past,
+/// deadline, and a guest reschedule back to pending only re-stamped it
+/// afterwards on another connection. A sweep landing in between declined the
+/// fresh request at once. The deadline is now cleared on approval and written
+/// by the same UPDATE that puts the booking back to pending.
+#[tokio::test]
+async fn approved_then_rescheduled_request_is_not_expired_by_the_old_deadline() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    sqlx::query(
+        "UPDATE event_types SET requires_confirmation = 1, pending_expiry_hours = 24 WHERE id = ?",
+    )
+    .bind(&et_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let past = Some(utc_stamp(Utc::now() - Duration::hours(1)));
+    let id = insert_v1_booking(
+        &pool,
+        &et_id,
+        "approved@test.com",
+        Utc::now() + Duration::days(2),
+        30,
+        "pending",
+        &[
+            ("pending_expires_at", past.clone()),
+            ("pending_since", past),
+        ],
+    )
+    .await;
+
+    // The host approves just before the sweep would have expired it.
+    let csrf = "csrf-approve-then-resched";
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            &format!("/dashboard/bookings/{}/confirm", id),
+            &session,
+            csrf,
+            &format!("_csrf={}", csrf),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    assert_eq!(booking_status(&pool, &id).await, "confirmed");
+    assert_eq!(pending_columns(&pool, &id).await, (None, None, None));
+
+    // The guest moves it: back to pending, with a fresh deadline.
+    let token: String = sqlx::query_scalar("SELECT reschedule_token FROM bookings WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let csrf = "csrf-resched-after-approve";
+    let response = app
+        .oneshot(post_form_unauthed(
+            &format!("/booking/reschedule/{}", token),
+            csrf,
+            &format!(
+                "_csrf={}&date={}&time=10%3A00&tz=UTC",
+                csrf,
+                far_future_monday()
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(booking_status(&pool, &id).await, "pending");
+
+    let sweep = sweep_pending_requests(&pool, &[0u8; 32], Utc::now()).await;
+    assert_eq!(sweep.expired, 0);
+    assert_eq!(booking_status(&pool, &id).await, "pending");
+}
+
+/// Declining or cancelling a request clears its pending window too.
+#[tokio::test]
+async fn leaving_pending_clears_the_window() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    let future = Some(utc_stamp(Utc::now() + Duration::hours(5)));
+    let id = insert_v1_booking(
+        &pool,
+        &et_id,
+        "declined@test.com",
+        Utc::now() + Duration::days(2),
+        30,
+        "pending",
+        &[
+            ("pending_expires_at", future.clone()),
+            ("pending_since", future),
+        ],
+    )
+    .await;
+    let csrf = "csrf-decline-clears";
+    let response = app
+        .oneshot(post_form(
+            &format!("/dashboard/bookings/{}/cancel", id),
+            &session,
+            csrf,
+            &format!("_csrf={}", csrf),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    assert_eq!(booking_status(&pool, &id).await, "declined");
+    assert_eq!(pending_columns(&pool, &id).await, (None, None, None));
+}
+
 #[tokio::test]
 async fn guest_reschedule_back_to_pending_restarts_the_expiry_clock() {
     let (app, pool, _, et_id) = setup_test_app().await;

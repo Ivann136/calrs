@@ -527,12 +527,37 @@ fn pending_expiry_deadline(
     Some(by_expiry.min(cap).max(now))
 }
 
-/// Store the expiry deadline of a booking, computed from its event type, and
-/// clear the one-shot host nudge so a booking put back to pending gets a fresh
-/// one. A booking that is not pending (or a legacy row without a UTC start)
+/// Store the expiry deadline of a just-inserted booking, inside the insert's
+/// transaction, computed from its event type. A booking that is not pending (or a legacy row without a UTC start)
 /// gets NULL, which never expires. Best-effort: a failure only means the
 /// request does not expire, which is the pre-#234 behaviour, so it is logged
 /// rather than failing the booking.
+/// `(pending_expires_at, pending_since)` for a booking entering pending at
+/// `now` with UTC start `start_at`, from its event type's `expiry_hours` and
+/// `min_notice_min`. Both `None` when requests never expire (or the start is
+/// not a UTC instant). `pending_since` anchors the halfway host nudge, so a
+/// request put back to pending by a reschedule is nudged halfway through its
+/// new window.
+fn pending_window(
+    now: chrono::DateTime<Utc>,
+    start_at: &str,
+    expiry_hours: Option<i32>,
+    min_notice_min: i32,
+) -> (Option<String>, Option<String>) {
+    let deadline = chrono::DateTime::parse_from_rfc3339(start_at)
+        .ok()
+        .and_then(|start| {
+            pending_expiry_deadline(now, start.with_timezone(&Utc), expiry_hours, min_notice_min)
+        });
+    match deadline {
+        Some(d) => (
+            Some(d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        ),
+        None => (None, None),
+    }
+}
+
 async fn stamp_pending_deadline(conn: &mut sqlx::SqliteConnection, booking_id: &str) {
     let row: Option<(String, Option<i32>, i32)> = match sqlx::query_as(
         "SELECT b.start_at, et.pending_expiry_hours, et.min_notice_min
@@ -549,18 +574,9 @@ async fn stamp_pending_deadline(conn: &mut sqlx::SqliteConnection, booking_id: &
             return;
         }
     };
-    let deadline = row.and_then(|(start, hours, min_notice)| {
-        let start = chrono::DateTime::parse_from_rfc3339(&start)
-            .ok()?
-            .with_timezone(&Utc);
-        pending_expiry_deadline(Utc::now(), start, hours, min_notice)
-    });
-    let deadline = deadline.map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-    // `pending_since` anchors the halfway host nudge, so a request put back to
-    // pending by a reschedule is nudged halfway through its new window.
-    let since = deadline
-        .as_ref()
-        .map(|_| Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    let (deadline, since) = row
+        .map(|(start, hours, min_notice)| pending_window(Utc::now(), &start, hours, min_notice))
+        .unwrap_or_default();
     if let Err(e) = sqlx::query(
         "UPDATE bookings SET pending_expires_at = ?, pending_since = ?, pending_reminder_sent_at = NULL WHERE id = ?",
     )
@@ -5200,7 +5216,7 @@ async fn cancel_booking(
     // Guarded on the status read above: a double click, or an approval or
     // cancellation landing in between, must not notify the guest twice or
     // cancel a booking that changed state meanwhile.
-    let changed = sqlx::query("UPDATE bookings SET status = ? WHERE id = ? AND status = ?")
+    let changed = sqlx::query("UPDATE bookings SET status = ?, pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = ?")
         .bind(new_status)
         .bind(&bid)
         .bind(&prev_status)
@@ -5418,7 +5434,7 @@ async fn confirm_booking(
     // approvals (double click, or dashboard and email link together) only
     // one goes on to send the emails and the paid SMS.
     let flipped =
-        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+        sqlx::query("UPDATE bookings SET status = 'confirmed', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = 'pending'")
             .bind(&bid)
             .execute(&state.pool)
             .await
@@ -20138,7 +20154,7 @@ async fn approve_booking_by_token(
     // Confirm the booking, guarded like the dashboard path: a concurrent
     // approval that already flipped it lands on the "already handled" page.
     let flipped =
-        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+        sqlx::query("UPDATE bookings SET status = 'confirmed', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = 'pending'")
             .bind(&bid)
             .execute(&state.pool)
             .await
@@ -20444,7 +20460,7 @@ async fn decline_booking_by_token(
     // Decline the booking, guarded like approval: if a concurrent approve or
     // decline got there first, say so instead of emailing the guest again.
     let changed =
-        sqlx::query("UPDATE bookings SET status = 'declined' WHERE id = ? AND status = 'pending'")
+        sqlx::query("UPDATE bookings SET status = 'declined', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status = 'pending'")
             .bind(&bid)
             .execute(&state.pool)
             .await
@@ -20890,7 +20906,7 @@ async fn guest_cancel_booking(
     // Cancel the booking. Guarded so a double submit, or a host decline or
     // cancel in between, does not notify everyone twice.
     let changed = sqlx::query(
-        "UPDATE bookings SET status = 'cancelled' WHERE id = ? AND status IN ('confirmed', 'pending')",
+        "UPDATE bookings SET status = 'cancelled', pending_expires_at = NULL, pending_since = NULL, pending_reminder_sent_at = NULL WHERE id = ? AND status IN ('confirmed', 'pending')",
     )
     .bind(&bid)
     .execute(&state.pool)
@@ -21657,11 +21673,30 @@ async fn guest_reschedule_booking(
         }
         Err(e) => return internal_error_response("booking conflict check", &e),
     }
+    // The pending window is written by the same UPDATE as the status: a
+    // request put back to pending gets a fresh deadline (and a fresh host
+    // nudge) atomically, so the expiry sweep can never see it pending with
+    // the previous, possibly past, deadline. A confirmed result clears it.
+    let (pending_expires_at, pending_since) = if needs_approval {
+        let (hours, min_notice): (Option<i32>, i32) = sqlx::query_as(
+            "SELECT pending_expiry_hours, min_notice_min FROM event_types WHERE id = ?",
+        )
+        .bind(&et_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or((None, 0));
+        pending_window(Utc::now(), &new_start_at, hours, min_notice)
+    } else {
+        (None, None)
+    };
     let update_result = sqlx::query(
         "UPDATE bookings SET time_version = 1, start_at = ?, end_at = ?, status = ?,
                 reschedule_token = ?, cancel_token = ?, confirm_token = ?,
                 reminder_sent_at = NULL, guest_timezone = ?, reschedule_by_host = 0,
-                assigned_resource_id = ?
+                assigned_resource_id = ?,
+                pending_expires_at = ?, pending_since = ?, pending_reminder_sent_at = NULL
          WHERE id = ?",
     )
     .bind(&new_start_at)
@@ -21672,6 +21707,8 @@ async fn guest_reschedule_booking(
     .bind(&new_confirm)
     .bind(&new_guest_timezone)
     .bind(&new_resource_assignment)
+    .bind(&pending_expires_at)
+    .bind(&pending_since)
     .bind(&booking_id)
     .execute(&state.pool)
     .await;
@@ -21684,14 +21721,6 @@ async fn guest_reschedule_booking(
                 .into_response();
         }
         return internal_error_response("database query", &e);
-    }
-    // A reschedule that lands back in pending starts a fresh expiry clock
-    // (and a fresh host nudge); one that confirms clears the deadline.
-    match state.pool.acquire().await {
-        Ok(mut conn) => stamp_pending_deadline(&mut conn, &booking_id).await,
-        Err(e) => {
-            tracing::warn!(booking_id = %booking_id, error = %e, "cannot reset pending request deadline")
-        }
     }
     if let Some(old_rid) = release_old {
         resource_release_one(&state.pool, &state.secret_key, &uid, &old_rid).await;
