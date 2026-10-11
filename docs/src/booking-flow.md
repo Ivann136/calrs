@@ -205,6 +205,17 @@ Every email is written in its reader's language, in any of the languages calrs s
 
 The admin SMTP test email is English.
 
+### Sender and replies
+
+Every email leaves from the configured sender address, so SPF, DKIM and DMARC keep aligning with the instance's domain. What changes is the name the guest sees and where their reply goes:
+
+- **Guest emails** (confirmation, the copies to additional attendees, pending, reminder, cancellation, decline, expired request, pick a new time, reschedule, invite) show the host's name followed by the configured sender name, joined in the email's language: `Bob Smith via Acme Scheduling`, or just `Bob Smith` when no sender name is set. They carry a `Reply-To` with the host's booking email (their account email when no booking email is set), so a guest who answers the email reaches the host directly.
+- On a round-robin booking the host is the assigned member. On a collective booking the name is the joined roster (`Alice & Bob via ...`), as is the confirmation of a dynamic group booking, and replies go to the member the calendar invite names as organizer.
+- **Invites** take the `Reply-To` from the inviting user's account email, never their booking email: the inviter picks the recipients, and the booking email is not verified.
+- **Host, team member, watcher and admin emails** keep the configured sender name and have no `Reply-To`.
+
+A host whose booking email is on a free-mail domain while the instance sends from its own domain may see some guest emails scored higher by spam filters (SpamAssassin's `FREEMAIL_FORGED_REPLYTO`). A booking email on the organization's domain avoids it.
+
 ## Timezone handling
 
 - Guest's timezone is auto-detected via `Intl.DateTimeFormat` in the browser

@@ -857,10 +857,16 @@ async fn notify_pending_expired(
     let (date, start_time, end_time) =
         booking_strings_in_guest_tz(&start_at, &end_at, stored_tz, guest_tz);
     let hosts = pending_host_recipients(pool, &uid, &owner_user_id).await;
-    let (host_name, host_email) = hosts
-        .first()
-        .map(|(n, e, _)| (n.clone(), e.clone()))
-        .unwrap_or_default();
+    // The guest's email names the host the way every other guest email does
+    // (joined roster and ICS organizer for collective bookings), so its
+    // sender and Reply-To match the confirmation they would have got (#221).
+    let (host_name, host_email) = match booking_host_identity(pool, &uid).await {
+        Some((name, email, _)) => (name, email),
+        None => hosts
+            .first()
+            .map(|(n, e, _)| (n.clone(), e.clone()))
+            .unwrap_or_default(),
+    };
     let details = crate::email::CancellationDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
         event_title,
@@ -1330,12 +1336,24 @@ async fn send_due_reminders(pool: SqlitePool, secret_key: [u8; 32]) {
         let mut notified = false;
 
         if let Some(smtp_config) = &smtp_config {
+            // The guest's reminder names the host as their confirmation
+            // did: for a collective booking the joined roster, with the ICS
+            // organizer as sender and Reply-To (#221), not the owner `due`
+            // joined on.
+            let guest_details = match booking_host_identity(&pool, uid).await {
+                Some((host_name, host_email, _)) => crate::email::BookingDetails {
+                    host_name,
+                    host_email,
+                    ..details.clone()
+                },
+                None => details.clone(),
+            };
             // Inline on purpose: this loop is already off the request
             // path, and `send_email` bounds each attempt.
             log_email_result(
                 crate::email::send_guest_reminder(
                     smtp_config,
-                    &details,
+                    &guest_details,
                     guest_cancel_url.as_deref(),
                 )
                 .await,
@@ -20866,6 +20884,23 @@ async fn decline_booking_by_token(
     if let Ok(Some(smtp_config)) =
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
+        // The query above joins the event type's owner; the guest's email
+        // names the host they booked with, which is also its sender and
+        // Reply-To (#221).
+        let booking_uid: Option<String> =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE id = ?")
+                .bind(&bid)
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap_or(None);
+        let identity = match &booking_uid {
+            Some(uid) => booking_host_identity(&state.pool, uid).await,
+            None => None,
+        };
+        let (guest_host_name, guest_host_email) = match identity {
+            Some((name, email, _)) => (name, email),
+            None => (host_name.clone(), host_email),
+        };
         let details = crate::email::CancellationDetails {
             utc_times: crate::booking_time::ics_times(&start_at, &end_at),
             event_title: event_title.clone(),
@@ -20875,8 +20910,8 @@ async fn decline_booking_by_token(
             guest_name: guest_name.clone(),
             guest_email: guest_email.clone(),
             guest_timezone: guest_timezone.clone(),
-            host_name: host_name.clone(),
-            host_email,
+            host_name: guest_host_name,
+            host_email: guest_host_email,
             uid: String::new(),
             reason: reason.clone(),
             cancelled_by_host: true,
@@ -21382,9 +21417,21 @@ async fn guest_cancel_booking(
         crate::email::load_smtp_config(&state.pool, &state.secret_key).await
     {
         let details = details.clone();
+        // The query above joins the event type's owner. The guest's copy
+        // names the host they booked with (assigned member, or the joined
+        // roster and ICS organizer for a collective booking), which is also
+        // its sender and Reply-To (#221).
+        let guest_details = match booking_host_identity(&state.pool, &details.uid).await {
+            Some((host_name, host_email, _)) => crate::email::CancellationDetails {
+                host_name,
+                host_email,
+                ..details.clone()
+            },
+            None => details.clone(),
+        };
         spawn_emails(async move {
             log_email_result(
-                crate::email::send_guest_cancellation(&smtp_config, &details).await,
+                crate::email::send_guest_cancellation(&smtp_config, &guest_details).await,
                 "guest_cancellation",
                 &details.uid,
             );
@@ -22220,7 +22267,7 @@ async fn guest_reschedule_booking(
                 guest_email: guest_email.clone(),
                 guest_timezone: new_guest_timezone.clone(),
                 host_name: host_name.clone(),
-                host_email,
+                host_email: host_email.clone(),
                 uid: uid.clone(),
                 location: loc_value.clone(),
                 host_timezone: host_tz.name().to_string(),
@@ -22253,7 +22300,7 @@ async fn guest_reschedule_booking(
                 guest_email: guest_email.clone(),
                 guest_timezone: new_guest_timezone,
                 host_name: host_name.clone(),
-                host_email: String::new(),
+                host_email,
                 uid: uid.clone(),
                 notes: None,
                 location: loc_value,
@@ -37422,6 +37469,117 @@ mod tests {
         );
         assert!(mail.contains("<html lang=\"fr\">"), "{mail}");
         assert!(!mail.contains("has been declined"), "{mail}");
+    }
+
+    // --- #221: guest emails come from the host, with Reply-To ---
+
+    /// The value of the first `name:` header of a captured message.
+    fn mail_header<'a>(mail: &'a str, name: &str) -> Option<&'a str> {
+        let headers = mail.split("\r\n\r\n").next().unwrap_or(mail);
+        let prefix = format!("{name}: ");
+        headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+    }
+
+    /// The guest's confirmation goes out under the host's name in the
+    /// guest's language, on the instance address, with Reply-To pointing at
+    /// the host's booking address.
+    #[tokio::test]
+    async fn guest_confirmation_comes_from_the_host() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, session, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+        sqlx::query("UPDATE smtp_config SET from_name = 'Acme Scheduling'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET booking_email = 'bookings@example.com' WHERE email = 'test@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-221-approve").await;
+
+        let csrf = "test-csrf-221-approve";
+        let response = app
+            .oneshot(post_form(
+                &format!("/dashboard/bookings/{}/confirm", booking_id),
+                &session,
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert_eq!(
+            mail_header(&mail, "From"),
+            Some("\"Test User via Acme Scheduling\" <noreply@test.com>"),
+            "{mail}"
+        );
+        assert_eq!(
+            mail_header(&mail, "Reply-To"),
+            Some("bookings@example.com"),
+            "{mail}"
+        );
+    }
+
+    /// A guest cancelling a booking assigned to a member other than the
+    /// event type's owner hears back from that member, not the owner, while
+    /// the host-side notice keeps the instance sender and no Reply-To.
+    #[tokio::test]
+    async fn guest_cancellation_comes_from_the_assigned_host() {
+        let _env = crate::test_support::ENV_LOCK.lock().await;
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let (port, mails) = spawn_capturing_mta().await;
+        use_capturing_mta(&pool, port).await;
+
+        let bob_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled, booking_email) VALUES (?, 'bob@test.com', 'Bob Member', 'user', 'local', 'bob', 1, 'bob.bookings@test.com')")
+            .bind(&bob_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let booking_id = insert_pending_french_booking(&pool, &et_id, "uid-221-cancel").await;
+        sqlx::query("UPDATE bookings SET status = 'confirmed', assigned_user_id = ?, cancel_token = 'cancel-221', start_at = '2099-06-15T10:00:00', end_at = '2099-06-15T10:30:00' WHERE id = ?")
+            .bind(&bob_id)
+            .bind(&booking_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let csrf = "test-csrf-221-cancel";
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/booking/cancel/cancel-221",
+                csrf,
+                &format!("_csrf={}", csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let mail = mail_to(&mails, "guest@test.com").await;
+        assert_eq!(
+            mail_header(&mail, "From"),
+            Some("\"Bob Member\" <noreply@test.com>"),
+            "{mail}"
+        );
+        assert_eq!(
+            mail_header(&mail, "Reply-To"),
+            Some("bob.bookings@test.com"),
+            "{mail}"
+        );
+
+        let host_mail = mail_to(&mails, "test@example.com").await;
+        assert_eq!(
+            mail_header(&host_mail, "From"),
+            Some("noreply@test.com"),
+            "{host_mail}"
+        );
+        assert_eq!(mail_header(&host_mail, "Reply-To"), None, "{host_mail}");
     }
 
     /// Pages declare the language they are rendered in, so browsers pick the
