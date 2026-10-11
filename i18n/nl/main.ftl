@@ -999,6 +999,7 @@ etf-webhook-hint = De afspraak-URL per boeking wordt opgehaald via de webhook di
 admin-page-title = Beheer
 admin-heading = Beheerdashboard
 admin-action-refused = Actie geweigerd:
+admin-error-last-admin = Dit is de laatste actieve beheerder. Maak eerst iemand anders beheerder of schakel een andere beheerder in.
 admin-logo = Bedrijfslogo
 admin-logo-help = Wordt getoond op openbare boekingspagina's. Aanbevolen: PNG of SVG, max. 2 MB.
 admin-company-link = Bedrijfslink

@@ -998,6 +998,7 @@ etf-webhook-hint = La URL de reunión de cada reserva se obtiene del webhook que
 admin-page-title = Administración
 admin-heading = Panel de administración
 admin-action-refused = Acción rechazada:
+admin-error-last-admin = Es el último administrador activo. Asciende o activa primero a otro administrador.
 admin-logo = Logotipo de la empresa
 admin-logo-help = Se muestra en las páginas de reserva públicas. Recomendado: PNG o SVG, máx. 2 MB.
 admin-company-link = Enlace de la empresa

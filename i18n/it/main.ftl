@@ -998,6 +998,7 @@ etf-webhook-hint = L'URL dell'incontro per ogni prenotazione viene recuperato da
 admin-page-title = Amministrazione
 admin-heading = Pannello di amministrazione
 admin-action-refused = Azione rifiutata:
+admin-error-last-admin = È l'ultimo amministratore attivo. Promuovi o riattiva prima un altro amministratore.
 admin-logo = Logo aziendale
 admin-logo-help = Compare sulle pagine di prenotazione pubbliche. Consigliato: PNG o SVG, max 2 MB.
 admin-company-link = Link aziendale

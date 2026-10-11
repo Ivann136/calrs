@@ -1016,6 +1016,7 @@ etf-webhook-hint = Adres spotkania dla każdej rezerwacji pobierany jest z webho
 admin-page-title = Administracja
 admin-heading = Panel administracyjny
 admin-action-refused = Odmowa wykonania:
+admin-error-last-admin = To ostatni aktywny administrator. Najpierw nadaj uprawnienia administratora innemu użytkownikowi lub włącz innego administratora.
 admin-logo = Logo firmy
 admin-logo-help = Wyświetlane na publicznych stronach rezerwacji. Zalecane: PNG lub SVG, maks. 2 MB.
 admin-company-link = Link firmowy

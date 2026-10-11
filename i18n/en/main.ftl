@@ -999,6 +999,7 @@ etf-webhook-hint = Per-booking meeting URL is fetched from the webhook configure
 admin-page-title = Admin
 admin-heading = Admin dashboard
 admin-action-refused = Action refused:
+admin-error-last-admin = This is the last enabled admin. Promote or enable another admin first.
 admin-logo = Company logo
 admin-logo-help = Displayed on public booking pages. Recommended: PNG or SVG, max 2 MB.
 admin-company-link = Company link

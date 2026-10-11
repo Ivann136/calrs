@@ -177,6 +177,68 @@ async fn admin_toggle_user_enabled() {
     assert_eq!(enabled, 0, "User should be disabled");
 }
 
+/// The red-team run: the only admin demoted themselves from the admin panel
+/// and the instance was left with none. Same for disabling.
+#[tokio::test]
+async fn admin_panel_refuses_to_remove_the_last_enabled_admin() {
+    let (app, pool, session, _) = setup_test_app().await;
+    sqlx::query("UPDATE users SET language = 'fr' WHERE username = 'testuser'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let me: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'testuser'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    for action in ["toggle-role", "toggle-enabled"] {
+        let csrf = "test-csrf-last-admin";
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/dashboard/admin/users/{me}/{action}"),
+                &session,
+                csrf,
+                &format!("_csrf={csrf}"),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        let location = response.headers()["location"].to_str().unwrap().to_string();
+        let expected = crate::i18n::translate("fr", "admin-error-last-admin", None);
+        assert_eq!(
+            location,
+            format!("/dashboard/admin?error={}", urlencoding::encode(&expected)),
+            "{action}: the refusal is shown in the admin's language"
+        );
+        let (role, enabled): (String, i32) =
+            sqlx::query_as("SELECT role, enabled FROM users WHERE id = ?")
+                .bind(&me)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((role.as_str(), enabled), ("admin", 1), "{action}");
+    }
+
+    // With a second enabled admin, demoting yourself is allowed.
+    insert_role_user(&pool, "other-admin@test.com", "admin").await;
+    let csrf = "test-csrf-last-admin-ok";
+    app.oneshot(post_form(
+        &format!("/dashboard/admin/users/{me}/toggle-role"),
+        &session,
+        csrf,
+        &format!("_csrf={csrf}"),
+    ))
+    .await
+    .unwrap();
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind(&me)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "user");
+}
+
 #[tokio::test]
 async fn admin_update_auth_settings() {
     let (app, pool, session, _) = setup_test_app().await;

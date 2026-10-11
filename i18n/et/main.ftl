@@ -998,6 +998,7 @@ etf-webhook-hint = Iga broneeringu kohtumisaadress võetakse webhookist, mille h
 admin-page-title = Haldus
 admin-heading = Halduse töölaud
 admin-action-refused = Toiming keelati:
+admin-error-last-admin = See on viimane aktiivne administraator. Anna esmalt administraatori õigused kellelegi teisele või lülita mõni teine administraator sisse.
 admin-logo = Ettevõtte logo
 admin-logo-help = Kuvatakse avalikel broneerimislehtedel. Soovitatav: PNG või SVG, kuni 2 MB.
 admin-company-link = Ettevõtte link

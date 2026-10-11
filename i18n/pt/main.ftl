@@ -998,6 +998,7 @@ etf-webhook-hint = A URL de reunião de cada agendamento vem do webhook que a ad
 admin-page-title = Administração
 admin-heading = Painel de administração
 admin-action-refused = Ação recusada:
+admin-error-last-admin = Este é o último administrador ativo. Promova ou reative outro administrador primeiro.
 admin-logo = Logotipo da empresa
 admin-logo-help = Aparece nas páginas de agendamento públicas. Recomendado: PNG ou SVG, no máximo 2 MB.
 admin-company-link = Link da empresa

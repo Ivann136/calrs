@@ -998,6 +998,7 @@ etf-webhook-hint = L'URL de réunion propre à chaque réservation est récupér
 admin-page-title = Administration
 admin-heading = Tableau de bord d'administration
 admin-action-refused = Action refusée :
+admin-error-last-admin = C'est le dernier administrateur actif. Promouvez ou réactivez d'abord un autre administrateur.
 admin-logo = Logo de l'entreprise
 admin-logo-help = Affiché sur les pages de réservation publiques. Recommandé : PNG ou SVG, 2 Mo maximum.
 admin-company-link = Lien de l'entreprise

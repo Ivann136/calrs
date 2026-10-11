@@ -998,6 +998,7 @@ etf-webhook-hint = Die Termin-URL je Buchung wird von dem Webhook geholt, den di
 admin-page-title = Administration
 admin-heading = Administrations-Dashboard
 admin-action-refused = Aktion abgelehnt:
+admin-error-last-admin = Das ist der letzte aktive Admin. Stufe zuerst einen anderen Benutzer hoch oder aktiviere einen anderen Admin.
 admin-logo = Firmenlogo
 admin-logo-help = Wird auf öffentlichen Buchungsseiten angezeigt. Empfohlen: PNG oder SVG, max. 2 MB.
 admin-company-link = Firmenlink
