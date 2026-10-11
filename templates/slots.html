@@ -1089,7 +1089,10 @@
 
     // Auto-select first available date
     var firstAvail = null;
+    // availableDates can hold days outside this month (the week grid's
+    // spill-over, or months merged by the week view): only pick one shown here.
     for (var key in availableDates) {
+      if (key.indexOf(monthYear + '-') !== 0) continue;
       if (!firstAvail || key < firstAvail) firstAvail = key;
     }
     if (firstAvail) selectDay(firstAvail);

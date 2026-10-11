@@ -13980,6 +13980,32 @@ fn parse_month_param(param: Option<&str>, guest_tz: Tz) -> (i32, u32) {
     (now.date().year(), now.date().month())
 }
 
+/// Day window (start_offset, days_ahead), relative to the host's today, for
+/// which slots are computed when a month is rendered.
+///
+/// The window spans the whole Monday-to-Sunday grid around the month, not
+/// just the month itself: the week view opens on the week containing today
+/// (or the 1st), and that week can run into the next or previous month. It
+/// reads its slots from the same payload, so a month-only window left the
+/// trailing days of the last week empty until the guest navigated away and
+/// back, which loaded the neighbouring month (#228). One extra day on each
+/// side absorbs the host/guest timezone offset.
+fn month_slot_window(
+    month_start: NaiveDate,
+    month_end: NaiveDate,
+    host_today: NaiveDate,
+) -> (i32, i32) {
+    let grid_start =
+        month_start - Duration::days(month_start.weekday().num_days_from_monday() as i64);
+    let grid_end =
+        month_end + Duration::days(6 - month_end.weekday().num_days_from_monday() as i64);
+    let start_offset = ((grid_start - host_today).num_days() - 1).max(0) as i32;
+    // Exclusive upper bound, so +2 keeps the last grid day plus one buffer day.
+    let end_offset = (grid_end - host_today).num_days() as i32 + 2;
+    let days_ahead = (end_offset - start_offset).max(1);
+    (start_offset, days_ahead)
+}
+
 /// Build month-based slot computation parameters and context variables.
 /// Returns (start_offset, days_ahead, month_label, prev_month, next_month, first_weekday, days_in_month, today_date, month_year)
 fn build_month_params(
@@ -14013,11 +14039,7 @@ fn build_month_params(
 
     let days_in_month = (month_end - month_start).num_days() as u32 + 1;
 
-    // Compute start_offset and days_ahead relative to host's today
-    let host_today = now_host.date();
-    let start_offset = (month_start - host_today).num_days().max(0) as i32;
-    let end_offset = (month_end - host_today).num_days() as i32 + 2; // +2 buffer for TZ edge cases
-    let days_ahead = (end_offset - start_offset).max(1);
+    let (start_offset, days_ahead) = month_slot_window(month_start, month_end, now_host.date());
 
     let month_label = crate::i18n::format_month_year(month_start, lang);
     let month_year = format!("{}-{:02}", year, month);
@@ -34494,6 +34516,36 @@ mod tests {
         assert!(
             days.is_empty(),
             "crossed limits must yield zero slots, not an error"
+        );
+    }
+
+    #[test]
+    fn month_slot_window_covers_the_trailing_week() {
+        // #228: on Monday 2026-09-28 the week view shows Sep 28 to Oct 4.
+        // The September payload must carry Friday Oct 2 and Sunday Oct 4,
+        // not stop one day past the month end.
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        let today = d(9, 28);
+        let (start, ahead) = month_slot_window(d(9, 1), d(9, 30), today);
+        assert_eq!(start, 0, "a month already under way starts today");
+        let last = today + Duration::days((start + ahead - 1) as i64);
+        assert!(
+            last >= d(10, 4),
+            "window must reach the grid's Sunday, got {last}"
+        );
+
+        // A future month whose 1st falls mid-week also covers the leading
+        // Monday, so the week view opened on that month is complete.
+        let (start, ahead) = month_slot_window(d(10, 1), d(10, 31), today);
+        let first = today + Duration::days(start as i64);
+        let last = today + Duration::days((start + ahead - 1) as i64);
+        assert!(
+            first <= d(9, 28),
+            "window must start on the grid's Monday, got {first}"
+        );
+        assert!(
+            last >= d(11, 1),
+            "window must reach the grid's Sunday, got {last}"
         );
     }
 
