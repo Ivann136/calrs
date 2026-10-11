@@ -194,6 +194,17 @@ If SMTP is configured, calrs sends emails at these moments:
 
 All emails are sent as **HTML with plain text fallback**. They include event title, date, time, timezone, location, and notes. The HTML templates are responsive and support dark mode in email clients that honor `prefers-color-scheme`.
 
+### Email language
+
+Every email is written in its reader's language, in any of the languages calrs ships:
+
+- **Guests** (and the additional attendees they add) get the language the booking page was shown in when they booked, whoever triggers the email. That is the guest's browser language, unless the host chose **Always my language** under **Public booking page language** in Profile & Settings: their own booking pages (`/u/{username}`, and the legacy `/{slug}` routes), and so their guests' emails, then use the host's own saved language. Being logged in to calrs does not change the language of a booking page: it follows the browser the booking is made from, so a staff member booking on a client's behalf books in their own browser's language, not their saved calrs preference. To reach a client in another language, book from a browser set to it, or send the client the booking link. The email goes out whoever triggers it: the guest themselves, the host approving, declining, cancelling or asking for a new time, the reminder task, or a calendar sync noticing the host deleted the event.
+- **Hosts, team members and watchers** get the language they chose in **Profile & Settings**. With none set, they get English. On a collective team booking each member receives the host email in their own language.
+- The guest's cancel and reschedule pages use that same language, so they match the emails. The host's approve and decline pages use the host's saved language (for a collective booking, which several members can approve, the browser's), and claim pages the watcher's.
+- **Invites** follow the language of the person sending them, who also writes the optional personal message.
+
+The admin SMTP test email is English.
+
 ## Timezone handling
 
 - Guest's timezone is auto-detected via `Intl.DateTimeFormat` in the browser

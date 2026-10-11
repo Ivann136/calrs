@@ -471,10 +471,14 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
 /// Extractor that does NOT require authentication. Returns Some(user) for
 /// authenticated requests (mirroring AuthUser's impersonation resolution) and
 /// None for anonymous/invalid sessions — never redirects.
+///
+/// It deliberately carries no language: it is only used on public pages,
+/// which follow the visitor's browser, never a logged-in user's saved
+/// preference (staff booking for a client must not stamp their own language
+/// on the client's booking).
 pub struct OptionalAuthUser {
     pub user: Option<User>,
     pub impersonation: Option<ImpersonationInfo>,
-    pub lang: &'static str,
 }
 
 impl FromRequestParts<Arc<AppState>> for OptionalAuthUser {
@@ -489,14 +493,9 @@ impl FromRequestParts<Arc<AppState>> for OptionalAuthUser {
             Some((u, info)) => (Some(u), info),
             None => (None, None),
         };
-        let lang = crate::i18n::resolve(
-            user.as_ref().and_then(|u| u.language.as_deref()),
-            &parts.headers,
-        );
         Ok(OptionalAuthUser {
             user,
             impersonation,
-            lang,
         })
     }
 }

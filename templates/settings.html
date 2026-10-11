@@ -129,6 +129,15 @@
       <span class="hint" style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-top: 0.25rem;">{{ t("settings-language-help") }}</span>
     </div>
 
+    <div class="form-group">
+      <label for="public_page_language">{{ t("settings-public-page-language") }}</label>
+      <select id="public_page_language" name="public_page_language" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font-size: 0.9rem;">
+        <option value="visitor" {% if form_public_page_language != "host" %}selected{% endif %}>{{ t("settings-public-page-language-visitor") }}</option>
+        <option value="host" {% if form_public_page_language == "host" %}selected{% endif %}>{{ t("settings-public-page-language-host") }}</option>
+      </select>
+      <span class="hint" style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-top: 0.25rem;">{{ t("settings-public-page-language-help") }}</span>
+    </div>
+
     <div class="form-group" style="margin-top: 1rem;">
       <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
         <input type="checkbox" name="allow_dynamic_group" {% if allow_dynamic_group %}checked{% endif %} style="width: auto;">
