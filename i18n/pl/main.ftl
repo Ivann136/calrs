@@ -1359,7 +1359,7 @@ troubleshoot-detail-pending-request = { $title } (oczekująca prośba)
 etf-pending-blocks-slot = Oczekujące prośby blokują termin
 etf-pending-blocks-slot-help = Dopóki prośba czeka na twoją odpowiedź, nikt inny nie może zarezerwować tego czasu, ani w tym, ani w innych twoich typach wydarzeń.
 etf-pending-expiry = Wygasanie próśb
-etf-pending-expiry-help = Prośba, na którą do tego czasu nie odpowiesz, zostaje automatycznie odrzucona, a gość zostaje poproszony o wybranie innego terminu. Termin nigdy nie przekracza minimalnego wyprzedzenia spotkania. W połowie czasu dostajesz jedno przypomnienie.
+etf-pending-expiry-help = Prośba, na którą do tego czasu nie odpowiesz, zostaje automatycznie odrzucona, a gość zostaje poproszony o wybranie innego terminu. Termin kończy się wcześniej, gdy spotkanie jest zbyt blisko, by ktoś inny mógł jeszcze zarezerwować ten czas. W połowie czasu dostajesz jedno przypomnienie.
 etf-pending-expiry-never = Nigdy
 
 etf-pending-expiry-hours =

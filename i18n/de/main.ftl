@@ -1337,7 +1337,7 @@ troubleshoot-detail-pending-request = { $title } (offene Anfrage)
 etf-pending-blocks-slot = Offene Anfragen blockieren den Termin
 etf-pending-blocks-slot-help = Solange eine Anfrage auf deine Antwort wartet, kann niemand sonst diese Zeit buchen, weder bei dieser noch bei deinen anderen Terminarten.
 etf-pending-expiry = Ablauf von Anfragen
-etf-pending-expiry-help = Eine Anfrage, die du bis dahin nicht beantwortet hast, wird automatisch abgelehnt und der Gast wird gebeten, einen anderen Termin zu wählen. Die Frist reicht nie über die Mindestvorlaufzeit des Termins hinaus. Zur Halbzeit bekommst du eine Erinnerung.
+etf-pending-expiry-help = Eine Anfrage, die du bis dahin nicht beantwortet hast, wird automatisch abgelehnt und der Gast wird gebeten, einen anderen Termin zu wählen. Sie endet früher, wenn der Termin zu nah ist, als dass jemand anderes ihn noch buchen könnte. Zur Halbzeit bekommst du eine Erinnerung.
 etf-pending-expiry-never = Nie
 
 etf-pending-expiry-hours =

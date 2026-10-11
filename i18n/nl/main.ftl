@@ -1338,7 +1338,7 @@ troubleshoot-detail-pending-request = { $title } (openstaande aanvraag)
 etf-pending-blocks-slot = Openstaande aanvragen blokkeren het tijdslot
 etf-pending-blocks-slot-help = Zolang een aanvraag op je antwoord wacht, kan niemand anders dat tijdstip boeken, bij dit en bij je andere afspraaktypes.
 etf-pending-expiry = Verloop van aanvragen
-etf-pending-expiry-help = Een aanvraag die je dan nog niet hebt beantwoord, wordt automatisch afgewezen en de gast wordt gevraagd een ander tijdstip te kiezen. De termijn loopt nooit voorbij de minimale aankondigingstijd van de afspraak. Halverwege krijg je één herinnering.
+etf-pending-expiry-help = Een aanvraag die je dan nog niet hebt beantwoord, wordt automatisch afgewezen en de gast wordt gevraagd een ander tijdstip te kiezen. De termijn eindigt eerder als de afspraak te dichtbij komt om het tijdslot nog door iemand anders te laten boeken. Halverwege krijg je één herinnering.
 etf-pending-expiry-never = Nooit
 
 etf-pending-expiry-hours =

@@ -1337,7 +1337,7 @@ troubleshoot-detail-pending-request = { $title } (pedido pendente)
 etf-pending-blocks-slot = Pedidos pendentes bloqueiam o horário
 etf-pending-blocks-slot-help = Enquanto um pedido aguarda sua resposta, ninguém mais pode agendar esse horário, nem neste nem nos seus outros tipos de evento.
 etf-pending-expiry = Expiração dos pedidos
-etf-pending-expiry-help = Um pedido que você não responder até lá é recusado automaticamente e pedimos ao convidado que escolha outro horário. O prazo nunca ultrapassa a antecedência mínima da reunião. Você recebe um lembrete na metade do prazo.
+etf-pending-expiry-help = Um pedido que você não responder até lá é recusado automaticamente e pedimos ao convidado que escolha outro horário. Ele termina antes se a reunião estiver próxima demais para outra pessoa ainda agendar o horário. Você recebe um lembrete na metade do prazo.
 etf-pending-expiry-never = Nunca
 
 etf-pending-expiry-hours =

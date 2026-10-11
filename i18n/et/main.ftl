@@ -1337,7 +1337,7 @@ troubleshoot-detail-pending-request = { $title } (ootel taotlus)
 etf-pending-blocks-slot = Ootel taotlused blokeerivad aja
 etf-pending-blocks-slot-help = Kuni taotlus ootab sinu vastust, ei saa keegi teine seda aega broneerida, ei selles ega sinu teistes sündmuse tüüpides.
 etf-pending-expiry = Taotluste aegumine
-etf-pending-expiry-help = Taotlus, millele sa selleks ajaks vastanud pole, lükatakse automaatselt tagasi ja külalisel palutakse valida muu aeg. Tähtaeg ei ulatu kunagi üle kohtumise minimaalse etteteatamisaja. Poole aja peal saad ühe meeldetuletuse.
+etf-pending-expiry-help = Taotlus, millele sa selleks ajaks vastanud pole, lükatakse automaatselt tagasi ja külalisel palutakse valida muu aeg. Tähtaeg saabub varem, kui kohtumine on liiga lähedal, et keegi teine saaks seda aega veel broneerida. Poole aja peal saad ühe meeldetuletuse.
 etf-pending-expiry-never = Mitte kunagi
 
 etf-pending-expiry-hours =

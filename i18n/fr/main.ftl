@@ -1337,7 +1337,7 @@ troubleshoot-detail-pending-request = { $title } (demande en attente)
 etf-pending-blocks-slot = Les demandes en attente bloquent le créneau
 etf-pending-blocks-slot-help = Tant qu'une demande attend votre réponse, personne d'autre ne peut réserver ce créneau, sur ce type d'événement comme sur les autres.
 etf-pending-expiry = Expiration des demandes
-etf-pending-expiry-help = Une demande restée sans réponse à cette échéance est refusée automatiquement et l'invité est prié de choisir un autre créneau. L'échéance ne dépasse jamais le préavis minimum de la réunion. Vous recevez un rappel à mi-parcours.
+etf-pending-expiry-help = Une demande restée sans réponse à cette échéance est refusée automatiquement et l'invité est prié de choisir un autre créneau. Elle arrive plus tôt si la réunion devient trop proche pour qu'un autre invité puisse réserver le créneau. Vous recevez un rappel à mi-parcours.
 etf-pending-expiry-never = Jamais
 
 etf-pending-expiry-hours =

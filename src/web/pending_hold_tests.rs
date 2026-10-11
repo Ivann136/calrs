@@ -96,6 +96,37 @@ fn pending_expiry_deadline_is_capped_by_the_minimum_notice() {
 }
 
 #[test]
+fn pending_expiry_deadline_inside_the_notice_window_waits_for_the_start() {
+    // Booked at the edge of a 2h minimum notice: start - notice is already
+    // behind us, so expiring early would free a slot nobody can book.
+    let now = utc(2030, 1, 1, 8, 0);
+    let start = utc(2030, 1, 1, 9, 50);
+    assert_eq!(
+        pending_expiry_deadline(now, start, Some(24), 120),
+        Some(start),
+        "capped by the start, not by a moment in the past"
+    );
+    // A short expiry still applies when it comes first.
+    assert_eq!(
+        pending_expiry_deadline(now, start, Some(1), 120),
+        Some(utc(2030, 1, 1, 9, 0))
+    );
+    // Exactly at the release point counts as inside the window.
+    let start = utc(2030, 1, 1, 10, 0);
+    assert_eq!(
+        pending_expiry_deadline(now, start, Some(24), 120),
+        Some(start)
+    );
+}
+
+#[test]
+fn pending_expiry_deadline_is_never_in_the_past() {
+    let now = utc(2030, 1, 1, 12, 0);
+    let start = utc(2030, 1, 1, 11, 0);
+    assert_eq!(pending_expiry_deadline(now, start, Some(24), 60), Some(now));
+}
+
+#[test]
 fn pending_expiry_deadline_is_none_when_requests_never_expire() {
     let now = utc(2030, 1, 1, 0, 0);
     let start = utc(2030, 1, 10, 10, 0);

@@ -82,7 +82,7 @@ By default a pending request blocks its host's time exactly like a confirmed boo
 
 ### Request expiry
 
-**Request expiry** (never, 4, 24, 48 or 72 hours; 24 for new event types, never for event types that existed before the setting) bounds how long a request may wait. The deadline is set when the request is made, and never later than the latest moment the slot could have been booked (start minus the minimum notice). A guest reschedule that puts the booking back to pending restarts it.
+**Request expiry** (never, 4, 24, 48 or 72 hours; 24 for new event types, never for event types that existed before the setting) bounds how long a request may wait. The deadline is set when the request is made. It never runs later than the latest moment another guest could still book the slot (start minus the minimum notice), since expiring after that point frees nothing. A request made inside that window (the guest booked right at the minimum notice) keeps the expiry, capped by the meeting start, rather than lapsing minutes later. A guest reschedule that puts the booking back to pending restarts it.
 
 - Halfway to the deadline, the host gets one reminder with the Approve and Decline buttons.
 - At the deadline the request is **declined, never accepted**. The guest receives an email in the language they booked in (and an SMS when the event type collects phone numbers) asking them to pick another time, with a link to the booking page when the event type is public and `CALRS_BASE_URL` is set. The host gets a short notice.

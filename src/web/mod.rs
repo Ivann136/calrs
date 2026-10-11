@@ -501,10 +501,19 @@ const PENDING_EXPIRY_CHOICES: [i32; 4] = [4, 24, 48, 72];
 const DEFAULT_PENDING_EXPIRY_HOURS: i32 = 24;
 
 /// Deadline for a pending request created (or put back to pending) at `now`
-/// for a meeting starting at `start`: `expiry_hours` from now, but never later
-/// than the latest moment a guest could still have booked that slot
-/// (`start - min_notice`), so an approval cannot land inside the notice
-/// window. `None` when the event type's requests never expire.
+/// for a meeting starting at `start`. `None` when the event type's requests
+/// never expire.
+///
+/// Expiring a request is only useful while releasing its slot helps another
+/// guest, i.e. until `release = start - min_notice`, the last moment the slot
+/// can still be booked. So:
+/// - `release` still ahead: `min(now + expiry, release)`.
+/// - `release` already passed (the request was made, or rescheduled, inside
+///   the notice window, where nobody else could book the slot anyway):
+///   `min(now + expiry, start)`, which leaves the host until the meeting
+///   instead of expiring the request minutes after it was made.
+///
+/// Never earlier than `now`.
 fn pending_expiry_deadline(
     now: chrono::DateTime<Utc>,
     start: chrono::DateTime<Utc>,
@@ -513,8 +522,9 @@ fn pending_expiry_deadline(
 ) -> Option<chrono::DateTime<Utc>> {
     let hours = expiry_hours.filter(|h| *h > 0)?;
     let by_expiry = now + Duration::hours(hours.into());
-    let by_notice = start - Duration::minutes(min_notice_min.max(0).into());
-    Some(by_expiry.min(by_notice))
+    let release = start - Duration::minutes(min_notice_min.max(0).into());
+    let cap = if release > now { release } else { start };
+    Some(by_expiry.min(cap).max(now))
 }
 
 /// Store the expiry deadline of a booking, computed from its event type, and

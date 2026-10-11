@@ -1337,7 +1337,7 @@ troubleshoot-detail-pending-request = { $title } (solicitud pendiente)
 etf-pending-blocks-slot = Las solicitudes pendientes bloquean el hueco
 etf-pending-blocks-slot-help = Mientras una solicitud espera tu respuesta, nadie más puede reservar esa hora, ni en este tipo de evento ni en los demás.
 etf-pending-expiry = Caducidad de las solicitudes
-etf-pending-expiry-help = Una solicitud que no hayas respondido para entonces se rechaza automáticamente y se pide al invitado que elija otra hora. El plazo nunca va más allá del aviso mínimo de la reunión. Recibes un recordatorio a mitad de plazo.
+etf-pending-expiry-help = Una solicitud que no hayas respondido para entonces se rechaza automáticamente y se pide al invitado que elija otra hora. Termina antes si la reunión está demasiado cerca para que otra persona reserve ese hueco. Recibes un recordatorio a mitad de plazo.
 etf-pending-expiry-never = Nunca
 
 etf-pending-expiry-hours =

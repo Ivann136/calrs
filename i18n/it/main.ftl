@@ -1337,7 +1337,7 @@ troubleshoot-detail-pending-request = { $title } (richiesta in attesa)
 etf-pending-blocks-slot = Le richieste in attesa bloccano lo slot
 etf-pending-blocks-slot-help = Finché una richiesta attende la tua risposta, nessun altro può prenotare quell'orario, né in questo né negli altri tuoi tipi di evento.
 etf-pending-expiry = Scadenza delle richieste
-etf-pending-expiry-help = Una richiesta a cui non hai risposto entro quel momento viene rifiutata automaticamente e all'ospite viene chiesto di scegliere un altro orario. La scadenza non supera mai il preavviso minimo della riunione. A metà tempo ricevi un promemoria.
+etf-pending-expiry-help = Una richiesta a cui non hai risposto entro quel momento viene rifiutata automaticamente e all'ospite viene chiesto di scegliere un altro orario. Scade prima se la riunione è troppo vicina perché qualcun altro possa ancora prenotare lo slot. A metà tempo ricevi un promemoria.
 etf-pending-expiry-never = Mai
 
 etf-pending-expiry-hours =
