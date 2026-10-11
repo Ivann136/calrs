@@ -1657,7 +1657,11 @@
       // Update loading spinner with appropriate message
       var loader = document.getElementById('deferred-loader');
       if (loader) {
-        var hasSlots = Object.keys(availableDates).length > 0;
+        // The payload also covers the edge weeks of neighbouring months
+        // (#228); only dates in the displayed month are highlighted.
+        var hasSlots = Object.keys(availableDates).some(function(k) {
+          return k.indexOf(monthYear + '-') === 0;
+        });
         if (hasSlots) {
           loader.innerHTML = '<div class="slot-empty-icon">&#128197;</div><div>' + (i18n.clickHighlighted || 'Click a highlighted date to see available times') + '</div>';
         } else {

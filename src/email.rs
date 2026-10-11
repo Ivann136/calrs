@@ -266,7 +266,7 @@ fn render_html_email_in(
     footer_note: Option<&str>,
     actions: &[EmailAction],
 ) -> String {
-    let lang = h(lang);
+    let lang = h(crate::i18n::html_lang(lang));
     let mut detail_rows = String::new();
     for (i, row) in rows.iter().enumerate() {
         let bg = if i % 2 == 0 { "#f8f9fa" } else { "#ffffff" };

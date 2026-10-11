@@ -514,7 +514,85 @@ fn spawn_emails<F>(task: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(task);
+    EMAIL_TASKS.spawn(task);
+}
+
+/// Background email sends still in flight, so a graceful shutdown can wait
+/// for them instead of dropping them with the runtime (see `drain_emails`).
+static EMAIL_TASKS: TaskTracker = TaskTracker::new();
+
+/// Counts spawned tasks and wakes waiters when the count drops to zero.
+struct TaskTracker {
+    pending: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl TaskTracker {
+    const fn new() -> Self {
+        Self {
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::const_new(),
+        }
+    }
+
+    fn spawn<F>(&'static self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        // Decrement on drop, so a task that panics still counts as done.
+        struct Done(&'static TaskTracker);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if self.0.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.0.drained.notify_waiters();
+                }
+            }
+        }
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let done = Done(self);
+        tokio::spawn(async move {
+            let _done = done;
+            task.await;
+        });
+    }
+
+    /// Wait until every spawned task has finished, or `timeout` passes.
+    /// Returns how many were still running.
+    async fn drain(&self, timeout: std::time::Duration) -> usize {
+        use std::sync::atomic::Ordering;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let left = self.pending.load(Ordering::Acquire);
+            if left == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.pending.load(Ordering::Acquire);
+            }
+        }
+    }
+}
+
+/// Called once the HTTP server has stopped: give queued booking emails time
+/// to go out. Each send is bounded by the SMTP deadline, so this cannot hang
+/// past `timeout`.
+pub async fn drain_emails(timeout: std::time::Duration) {
+    if EMAIL_TASKS
+        .pending
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        return;
+    }
+    tracing::info!("waiting for queued emails before exiting");
+    let left = EMAIL_TASKS.drain(timeout).await;
+    if left > 0 {
+        tracing::warn!(left, "shutdown: queued emails still sending were dropped");
+    }
 }
 
 /// Everything the new-booking emails need, owned so it can outlive the
@@ -4831,12 +4909,20 @@ async fn confirm_booking(
         }
     }
 
-    // Confirm the booking
-    let _ = sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ?")
-        .bind(&bid)
-        .execute(&state.pool)
-        .await;
+    // Confirm the booking. Guarded on 'pending' so that of two concurrent
+    // approvals (double click, or dashboard and email link together) only
+    // one goes on to send the emails and the paid SMS.
+    let flipped =
+        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+            .bind(&bid)
+            .execute(&state.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
     drop(resource_guard);
+    if flipped == 0 {
+        return Redirect::to("/dashboard/bookings").into_response();
+    }
 
     tracing::info!(booking_id = %bid, "booking confirmed by host");
 
@@ -4911,6 +4997,18 @@ async fn confirm_booking(
     // Push to CalDAV calendar
     caldav_push_booking(&state.pool, &state.secret_key, &user.id, &uid, &details).await;
     resource_push_booking(&state.pool, &state.secret_key, &uid, &details).await;
+
+    // Notify watcher teams, as the token approve path does: a booking that
+    // needed approval only becomes claimable once it is confirmed.
+    notify_watchers(
+        &state.pool,
+        &state.secret_key,
+        &bid,
+        &et_id,
+        &details.host_name,
+        &details,
+    )
+    .await;
 
     // Confirmation SMS to the guest, the same deferred send as the token
     // approve path: a pending booking stays silent until the host approves.
@@ -19349,12 +19447,24 @@ async fn approve_booking_by_token(
         }
     }
 
-    // Confirm the booking
-    let _ = sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ?")
-        .bind(&bid)
-        .execute(&state.pool)
-        .await;
+    // Confirm the booking, guarded like the dashboard path: a concurrent
+    // approval that already flipped it lands on the "already handled" page.
+    let flipped =
+        sqlx::query("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'")
+            .bind(&bid)
+            .execute(&state.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
     drop(resource_guard);
+    if flipped == 0 {
+        let already: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
+            .bind(&bid)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+        return render_token_error(&state, &headers, &token, already);
+    }
 
     tracing::info!(booking_id = %bid, "booking approved via token");
 
@@ -30083,6 +30193,9 @@ mod tests {
     /// page must come back without waiting on SMTP at all.
     #[tokio::test]
     async fn booking_does_not_wait_on_a_stalled_smtp_relay() {
+        // The SMTP config comes from the DB row; a CALRS_SMTP_* block set by a
+        // concurrent env test would override it.
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         let (app, pool, _, _) = setup_test_app().await;
         let csrf = "test-csrf-stalled-smtp";
 
@@ -34017,6 +34130,29 @@ mod tests {
             body.contains("Phone Guest") && body.contains("+15550000001"),
             "Upcoming booking should display the guest phone number when SMS is enabled"
         );
+    }
+
+    #[tokio::test]
+    async fn task_tracker_drains_spawned_tasks() {
+        static TRACKER: TaskTracker = TaskTracker::new();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        TRACKER.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let left = TRACKER.drain(std::time::Duration::from_secs(5)).await;
+        assert_eq!(left, 0);
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A panicking task still counts as finished.
+        TRACKER.spawn(async { panic!("send blew up") });
+        assert_eq!(TRACKER.drain(std::time::Duration::from_secs(5)).await, 0);
+
+        // A task that outlives the timeout is reported, not waited on.
+        TRACKER.spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        let left = TRACKER.drain(std::time::Duration::from_millis(50)).await;
+        assert_eq!(left, 1);
     }
 
     /// The phone shows on pending requests too: the host may need to call
