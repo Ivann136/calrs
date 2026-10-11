@@ -261,11 +261,14 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
                 })
                 .collect();
 
-            // Bookings (already in host-local time, no conversion needed)
+            // Bookings (already in host-local time, no conversion needed).
+            // Pending requests block too when their event type holds the
+            // slot (`pending_blocks_slot`), as on the web slot pages.
             let booking_busy: Vec<(String, String)> = sqlx::query_as(
-                "SELECT CASE time_version WHEN 1 THEN start_at ELSE rtrim(start_at, 'Z') END AS start_at, CASE time_version WHEN 1 THEN end_at ELSE rtrim(end_at, 'Z') END AS end_at FROM bookings
-                 WHERE status = 'confirmed'
-                   AND start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')",
+                "SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b
+                 JOIN event_types et ON et.id = b.event_type_id
+                 WHERE (b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1))
+                   AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')",
             )
             .bind(&end_iso)
             .bind(&now_iso)

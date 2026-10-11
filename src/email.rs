@@ -1936,6 +1936,38 @@ pub async fn send_host_approval_request(
     confirm_token: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<()> {
+    send_host_approval_email(config, details, confirm_token, base_url, None).await
+}
+
+/// The one reminder a host gets for a request still unanswered halfway to its
+/// expiry (#234): the approval request again, with the same Approve/Decline
+/// buttons, saying when the request will be declined on its own.
+/// `expires_display` is the deadline already formatted in the host's timezone.
+pub async fn send_host_approval_reminder(
+    config: &SmtpConfig,
+    details: &BookingDetails,
+    confirm_token: Option<&str>,
+    base_url: Option<&str>,
+    expires_display: &str,
+) -> Result<()> {
+    send_host_approval_email(
+        config,
+        details,
+        confirm_token,
+        base_url,
+        Some(expires_display),
+    )
+    .await
+}
+
+/// Approval request (`expires` = `None`) or its reminder (`Some(deadline)`).
+async fn send_host_approval_email(
+    config: &SmtpConfig,
+    details: &BookingDetails,
+    confirm_token: Option<&str>,
+    base_url: Option<&str>,
+    expires: Option<&str>,
+) -> Result<()> {
     let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
 
     let (date_display, time_display) = host_time_display_exact(
@@ -1968,8 +2000,16 @@ pub async fn send_host_approval_request(
         _ => "Log in to your dashboard to confirm or decline this booking.".to_string(),
     };
 
+    let headline_plain = match expires {
+        None => "New booking request requiring your approval!".to_string(),
+        Some(deadline) => format!(
+            "Reminder: this booking request is still waiting for your answer. \
+             If you do not respond, it will be declined automatically on {}.",
+            deadline
+        ),
+    };
     let plain = format!(
-        "New booking request requiring your approval!\n\n\
+        "{}\n\n\
          Event: {}\n\
          Date: {}\n\
          Time: {}\n\
@@ -1977,6 +2017,7 @@ pub async fn send_host_approval_request(
          {}{}{}\n\
          {}\n\n\
          \u{2014} calrs",
+        headline_plain,
         details.event_title,
         date_display,
         time_display,
@@ -2059,9 +2100,40 @@ pub async fn send_host_approval_request(
         _ => vec![],
     };
 
+    if let Some(deadline) = expires {
+        rows.push(EmailRow {
+            label: "Expires".to_string(),
+            value: deadline.to_string(),
+        });
+    }
+
+    let (heading, message, subject) = match expires {
+        None => (
+            "Action required",
+            format!("{} wants to book a slot with you.", h(&details.guest_name)),
+            format!(
+                "Action required: {} \u{2014} {} ({})",
+                details.event_title, details.guest_name, date_display
+            ),
+        ),
+        Some(deadline) => (
+            "Reminder: action required",
+            format!(
+                "{} is still waiting for your answer. If you do not respond, \
+                 the request will be declined automatically on {}.",
+                h(&details.guest_name),
+                h(deadline)
+            ),
+            format!(
+                "Reminder: {} is waiting for your answer ({}, {})",
+                details.guest_name, details.event_title, date_display
+            ),
+        ),
+    };
+
     let html = render_html_email_with_actions(
-        "Action required",
-        &format!("{} wants to book a slot with you.", h(&details.guest_name)),
+        heading,
+        &message,
         "#f59e0b",
         &rows,
         Some("You can also manage this from your dashboard."),
@@ -2073,10 +2145,7 @@ pub async fn send_host_approval_request(
     let email = Message::builder()
         .from(config.mailbox_from()?)
         .to(to)
-        .subject(format!(
-            "Action required: {} \u{2014} {} ({})",
-            details.event_title, details.guest_name, date_display
-        ))
+        .subject(subject)
         .multipart(body)?;
 
     send_email(config, email).await
@@ -2191,6 +2260,197 @@ fn compose_guest_decline_notice(details: &CancellationDetails) -> ComposedEmail 
         plain,
         html,
     }
+}
+
+/// Tell the guest their request expired because the host did not answer in
+/// time (#234), in the language stored with the booking. `rebook_url` points
+/// back to the event type's booking page when it is public and a base URL is
+/// configured.
+pub async fn send_guest_pending_expired(
+    config: &SmtpConfig,
+    details: &CancellationDetails,
+    rebook_url: Option<&str>,
+) -> Result<()> {
+    let to = format!("{} <{}>", details.guest_name, details.guest_email).parse()?;
+    let composed = compose_guest_pending_expired(details, rebook_url);
+    let body = build_multipart_body(&composed.plain, &composed.html);
+
+    let email = Message::builder()
+        .from(config.mailbox_from()?)
+        .to(to)
+        .subject(composed.subject)
+        .multipart(body)?;
+
+    send_email(config, email).await
+}
+
+fn compose_guest_pending_expired(
+    details: &CancellationDetails,
+    rebook_url: Option<&str>,
+) -> ComposedEmail {
+    let lang = details.guest_language.as_deref().unwrap_or("en");
+
+    let time_display = if details.guest_timezone.is_empty() {
+        format!("{} \u{2013} {}", details.start_time, details.end_time)
+    } else {
+        format!(
+            "{} \u{2013} {} ({})",
+            details.start_time, details.end_time, details.guest_timezone
+        )
+    };
+
+    let greeting = ta(
+        lang,
+        "email-confirm-greeting",
+        [("name", &details.guest_name)],
+    );
+    let headline = t(lang, "email-pending-expired-headline");
+    let label_event = t(lang, "confirmed-detail-event");
+    let label_date = t(lang, "confirmed-detail-date");
+    let label_time = t(lang, "confirmed-detail-time");
+    let label_with = t(lang, "confirmed-detail-with");
+    let action_label = t(lang, "email-pending-expired-action");
+    let signature = t(lang, "email-signature");
+
+    let mut plain = format!(
+        "{}\n\n{}\n\n{} {}\n{} {}\n{} {}\n{} {}\n\n",
+        greeting,
+        headline,
+        label_event,
+        details.event_title,
+        label_date,
+        details.date,
+        label_time,
+        time_display,
+        label_with,
+        details.host_name,
+    );
+    if let Some(url) = rebook_url {
+        plain.push_str(&format!("{}: {}\n\n", action_label, url));
+    }
+    plain.push_str(&signature);
+
+    let rows = vec![
+        EmailRow {
+            label: label_event,
+            value: details.event_title.clone(),
+        },
+        EmailRow {
+            label: label_date,
+            value: details.date.clone(),
+        },
+        EmailRow {
+            label: label_time,
+            value: time_display,
+        },
+        EmailRow {
+            label: label_with,
+            value: details.host_name.clone(),
+        },
+    ];
+    let actions: Vec<EmailAction> = rebook_url
+        .map(|url| EmailAction {
+            label: action_label,
+            url: url.to_string(),
+            color: "#6366f1".to_string(),
+        })
+        .into_iter()
+        .collect();
+
+    let html = render_html_email_in(
+        lang,
+        &h(&greeting),
+        &h(&headline),
+        "#dc2626",
+        &rows,
+        None,
+        &actions,
+    );
+
+    ComposedEmail {
+        subject: status_subject(
+            lang,
+            "email-pending-expired-status",
+            &details.event_title,
+            &details.date,
+        ),
+        plain,
+        html,
+    }
+}
+
+/// Tell the host a request they did not answer has expired and was declined
+/// automatically (#234). English, like the other host emails.
+pub async fn send_host_pending_expired(
+    config: &SmtpConfig,
+    details: &CancellationDetails,
+) -> Result<()> {
+    let to = format!("{} <{}>", details.host_name, details.host_email).parse()?;
+
+    let (date_display, time_display) = host_time_display_exact(
+        &details.date,
+        &details.start_time,
+        &details.end_time,
+        &details.guest_timezone,
+        &details.host_timezone,
+        details.utc_times.as_ref(),
+    );
+
+    let plain = format!(
+        "Booking request expired.\n\n\
+         Nobody answered this request before its deadline, so it was declined \
+         automatically and the guest was told to pick another time.\n\n\
+         Event: {}\n\
+         Date: {}\n\
+         Time: {}\n\
+         Guest: {} <{}>\n\n\
+         calrs",
+        details.event_title, date_display, time_display, details.guest_name, details.guest_email,
+    );
+
+    let rows = vec![
+        EmailRow {
+            label: "Event".to_string(),
+            value: details.event_title.clone(),
+        },
+        EmailRow {
+            label: "Date".to_string(),
+            value: date_display.clone(),
+        },
+        EmailRow {
+            label: "Time".to_string(),
+            value: time_display,
+        },
+        EmailRow {
+            label: "Guest".to_string(),
+            value: format!("{} <{}>", details.guest_name, details.guest_email),
+        },
+    ];
+
+    let html = render_html_email(
+        "Booking request expired.",
+        &format!(
+            "Nobody answered the request from {} before its deadline, so it was \
+             declined automatically and the guest was told to pick another time.",
+            h(&details.guest_name)
+        ),
+        "#dc2626",
+        &rows,
+        Some("You can change how long requests wait in the event type settings."),
+    );
+
+    let body = build_multipart_body(&plain, &html);
+
+    let email = Message::builder()
+        .from(config.mailbox_from()?)
+        .to(to)
+        .subject(format!(
+            "Expired: {} with {} ({})",
+            details.event_title, details.guest_name, date_display
+        ))
+        .multipart(body)?;
+
+    send_email(config, email).await
 }
 
 // --- Utility ---

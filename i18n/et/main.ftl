@@ -1324,3 +1324,24 @@ dynamic-group-user-not-found = Kasutajat „{ $username }“ ei leitud.
 dynamic-group-user-opted-out = Kasutaja „{ $username }“ ei ole dünaamilise grupi linke lubanud.
 
 error-slot-unavailable-member = See aeg ei ole enam saadaval ({ $username } on hõivatud).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Taotlus aegus: { $event }, { $date } kell { $time } ({ $tz }). Vastust ei tulnud, vali palun muu aeg.
+email-pending-expired-status = Taotlus aegus
+email-pending-expired-headline = Sinu broneerimistaotlus aegus: korraldaja ei vastanud õigel ajal. Vali palun muu aeg.
+email-pending-expired-action = Vali muu aeg
+bae-body-host-busy = Korraldaja (või vajalik meeskonnaliige) ei ole sel ajal enam vaba. Palu külalisel valida mõni muu aeg.
+bookings-error-generic = Midagi läks valesti.
+troubleshoot-detail-pending-request = { $title } (ootel taotlus)
+etf-pending-blocks-slot = Ootel taotlused blokeerivad aja
+etf-pending-blocks-slot-help = Kuni taotlus ootab sinu vastust, ei saa keegi teine seda aega broneerida, ei selles ega sinu teistes sündmuse tüüpides.
+etf-pending-expiry = Taotluste aegumine
+etf-pending-expiry-help = Taotlus, millele sa selleks ajaks vastanud pole, lükatakse automaatselt tagasi ja külalisel palutakse valida muu aeg. Tähtaeg ei ulatu kunagi üle kohtumise minimaalse etteteatamisaja. Poole aja peal saad ühe meeldetuletuse.
+etf-pending-expiry-never = Mitte kunagi
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] { $hours } tunni pärast
+       *[other] { $hours } tunni pärast
+    }

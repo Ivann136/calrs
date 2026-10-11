@@ -1324,3 +1324,24 @@ dynamic-group-user-not-found = Benutzer „{ $username }“ nicht gefunden.
 dynamic-group-user-opted-out = Benutzer „{ $username }“ hat dynamische Gruppenlinks nicht aktiviert.
 
 error-slot-unavailable-member = Dieses Zeitfenster ist nicht mehr verfügbar ({ $username } hat einen Konflikt).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Anfrage abgelaufen: { $event }, { $date } um { $time } ({ $tz }). Keine Antwort erhalten, bitte wähle einen anderen Termin.
+email-pending-expired-status = Anfrage abgelaufen
+email-pending-expired-headline = Deine Buchungsanfrage ist abgelaufen: Der Gastgeber hat nicht rechtzeitig geantwortet. Bitte wähle einen anderen Termin.
+email-pending-expired-action = Anderen Termin wählen
+bae-body-host-busy = Der Gastgeber (oder ein benötigtes Teammitglied) ist zu dieser Zeit nicht mehr frei. Bitte den Gast, einen anderen Termin zu wählen.
+bookings-error-generic = Etwas ist schiefgelaufen.
+troubleshoot-detail-pending-request = { $title } (offene Anfrage)
+etf-pending-blocks-slot = Offene Anfragen blockieren den Termin
+etf-pending-blocks-slot-help = Solange eine Anfrage auf deine Antwort wartet, kann niemand sonst diese Zeit buchen, weder bei dieser noch bei deinen anderen Terminarten.
+etf-pending-expiry = Ablauf von Anfragen
+etf-pending-expiry-help = Eine Anfrage, die du bis dahin nicht beantwortet hast, wird automatisch abgelehnt und der Gast wird gebeten, einen anderen Termin zu wählen. Die Frist reicht nie über die Mindestvorlaufzeit des Termins hinaus. Zur Halbzeit bekommst du eine Erinnerung.
+etf-pending-expiry-never = Nie
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Nach { $hours } Stunde
+       *[other] Nach { $hours } Stunden
+    }

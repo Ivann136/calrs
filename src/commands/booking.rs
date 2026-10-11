@@ -186,7 +186,7 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
 
             // Validate: no conflicts with existing bookings
             let booking_conflicts: Vec<(String, String)> =
-                sqlx::query_as("SELECT CASE time_version WHEN 1 THEN start_at ELSE rtrim(start_at, 'Z') END AS start_at, CASE time_version WHEN 1 THEN end_at ELSE rtrim(end_at, 'Z') END AS end_at FROM bookings WHERE status = 'confirmed'")
+                sqlx::query_as("SELECT CASE b.time_version WHEN 1 THEN b.start_at ELSE rtrim(b.start_at, 'Z') END AS start_at, CASE b.time_version WHEN 1 THEN b.end_at ELSE rtrim(b.end_at, 'Z') END AS end_at FROM bookings b JOIN event_types et ON et.id = b.event_type_id WHERE b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1)")
                     .fetch_all(pool)
                     .await?;
 

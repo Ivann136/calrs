@@ -39,6 +39,7 @@ pub fn compose(event: SmsEvent, ctx: &SmsContext<'_>) -> String {
         SmsEvent::Cancelled => "sms-cancelled",
         SmsEvent::Rescheduled => "sms-rescheduled",
         SmsEvent::Reminder => "sms-reminder",
+        SmsEvent::Expired => "sms-expired",
     };
 
     let title = shorten(ctx.event_title, MAX_TITLE_CHARS);
@@ -113,6 +114,7 @@ mod tests {
             SmsEvent::Cancelled,
             SmsEvent::Rescheduled,
             SmsEvent::Reminder,
+            SmsEvent::Expired,
         ] {
             let body = compose(event, &ctx("Product demo", None));
             assert!(
@@ -135,6 +137,7 @@ mod tests {
                 SmsEvent::Cancelled,
                 SmsEvent::Rescheduled,
                 SmsEvent::Reminder,
+                SmsEvent::Expired,
             ] {
                 let body = compose(event, &ctx("Product demo", Some(lang)));
                 let segments = estimate_segments(&body);

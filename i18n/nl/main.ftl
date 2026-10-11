@@ -1325,3 +1325,24 @@ dynamic-group-user-not-found = Gebruiker "{ $username }" niet gevonden.
 dynamic-group-user-opted-out = Gebruiker "{ $username }" heeft dynamische groepslinks niet ingeschakeld.
 
 error-slot-unavailable-member = Dit tijdslot is niet meer beschikbaar ({ $username } heeft een conflict).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Aanvraag verlopen: { $event }, { $date } om { $time } ({ $tz }). Geen reactie, kies een ander tijdstip.
+email-pending-expired-status = Aanvraag verlopen
+email-pending-expired-headline = Je boekingsaanvraag is verlopen: de organisator heeft niet op tijd gereageerd. Kies een ander tijdstip.
+email-pending-expired-action = Kies een ander tijdstip
+bae-body-host-busy = De organisator (of een vereist teamlid) is op dit tijdstip niet meer beschikbaar. Vraag de gast een ander tijdslot te kiezen.
+bookings-error-generic = Er is iets misgegaan.
+troubleshoot-detail-pending-request = { $title } (openstaande aanvraag)
+etf-pending-blocks-slot = Openstaande aanvragen blokkeren het tijdslot
+etf-pending-blocks-slot-help = Zolang een aanvraag op je antwoord wacht, kan niemand anders dat tijdstip boeken, bij dit en bij je andere afspraaktypes.
+etf-pending-expiry = Verloop van aanvragen
+etf-pending-expiry-help = Een aanvraag die je dan nog niet hebt beantwoord, wordt automatisch afgewezen en de gast wordt gevraagd een ander tijdstip te kiezen. De termijn loopt nooit voorbij de minimale aankondigingstijd van de afspraak. Halverwege krijg je één herinnering.
+etf-pending-expiry-never = Nooit
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Na { $hours } uur
+       *[other] Na { $hours } uur
+    }

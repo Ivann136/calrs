@@ -421,6 +421,8 @@ pub enum SmsEvent {
     Cancelled,
     Rescheduled,
     Reminder,
+    /// A pending request the host did not answer before its deadline (#234).
+    Expired,
 }
 
 impl SmsEvent {
@@ -430,6 +432,7 @@ impl SmsEvent {
             SmsEvent::Cancelled => "cancelled",
             SmsEvent::Rescheduled => "rescheduled",
             SmsEvent::Reminder => "reminder",
+            SmsEvent::Expired => "expired",
         }
     }
 }

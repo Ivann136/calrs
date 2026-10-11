@@ -1324,3 +1324,24 @@ dynamic-group-user-not-found = Utilisateur « { $username } » introuvable.
 dynamic-group-user-opted-out = L'utilisateur « { $username } » n'a pas activé les liens de groupe dynamique.
 
 error-slot-unavailable-member = Ce créneau n'est plus disponible ({ $username } a un conflit).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Demande expirée : { $event }, le { $date } à { $time } ({ $tz }). Pas de réponse à temps, merci de choisir un autre créneau.
+email-pending-expired-status = Demande expirée
+email-pending-expired-headline = Votre demande de réservation a expiré : l'hôte n'a pas répondu à temps. Merci de choisir un autre créneau.
+email-pending-expired-action = Choisir un autre créneau
+bae-body-host-busy = L'hôte (ou un membre requis de l'équipe) n'est plus disponible sur ce créneau. Demandez à l'invité d'en choisir un autre.
+bookings-error-generic = Une erreur est survenue.
+troubleshoot-detail-pending-request = { $title } (demande en attente)
+etf-pending-blocks-slot = Les demandes en attente bloquent le créneau
+etf-pending-blocks-slot-help = Tant qu'une demande attend votre réponse, personne d'autre ne peut réserver ce créneau, sur ce type d'événement comme sur les autres.
+etf-pending-expiry = Expiration des demandes
+etf-pending-expiry-help = Une demande restée sans réponse à cette échéance est refusée automatiquement et l'invité est prié de choisir un autre créneau. L'échéance ne dépasse jamais le préavis minimum de la réunion. Vous recevez un rappel à mi-parcours.
+etf-pending-expiry-never = Jamais
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Après { $hours } heure
+       *[other] Après { $hours } heures
+    }

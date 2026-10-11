@@ -1324,3 +1324,24 @@ dynamic-group-user-not-found = Utente «{ $username }» non trovato.
 dynamic-group-user-opted-out = L'utente «{ $username }» non ha attivato i link di gruppo dinamico.
 
 error-slot-unavailable-member = Questo slot non è più disponibile ({ $username } ha un conflitto).
+
+# Pending requests: slot hold, expiry and approval re-check (#234)
+
+sms-expired = Richiesta scaduta: { $event }, { $date } alle { $time } ({ $tz }). Nessuna risposta, scegli un altro orario.
+email-pending-expired-status = Richiesta scaduta
+email-pending-expired-headline = La tua richiesta di prenotazione è scaduta: l'organizzatore non ha risposto in tempo. Scegli un altro orario.
+email-pending-expired-action = Scegli un altro orario
+bae-body-host-busy = L'organizzatore (o un membro necessario del team) non è più libero a quest'ora. Chiedi all'ospite di scegliere un altro slot.
+bookings-error-generic = Qualcosa è andato storto.
+troubleshoot-detail-pending-request = { $title } (richiesta in attesa)
+etf-pending-blocks-slot = Le richieste in attesa bloccano lo slot
+etf-pending-blocks-slot-help = Finché una richiesta attende la tua risposta, nessun altro può prenotare quell'orario, né in questo né negli altri tuoi tipi di evento.
+etf-pending-expiry = Scadenza delle richieste
+etf-pending-expiry-help = Una richiesta a cui non hai risposto entro quel momento viene rifiutata automaticamente e all'ospite viene chiesto di scegliere un altro orario. La scadenza non supera mai il preavviso minimo della riunione. A metà tempo ricevi un promemoria.
+etf-pending-expiry-never = Mai
+
+etf-pending-expiry-hours =
+    { $hours ->
+        [one] Dopo { $hours } ora
+       *[other] Dopo { $hours } ore
+    }
