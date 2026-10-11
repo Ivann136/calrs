@@ -193,6 +193,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Migration 067 adds the optional captcha WASM URL. Nothing changes until it is set.
 - Migrations 068 and 069 add write-back failure tracking to bookings and sync failure tracking to calendar sources (#162). No configuration change.
 - Migration 070 adds the stored organizer to bookings (#161). Only new collective team and dynamic group bookings fill it; existing bookings are not backfilled and keep resolving their organizer from the current roster, as before. No configuration change.
+- **Log targets are more specific.** With `src/web/mod.rs` and `src/email.rs` split into modules, log lines now carry the module that wrote them, e.g. `calrs::web::booking`, `calrs::web::booking_actions`, `calrs::web::admin`, `calrs::email::transport` instead of `calrs::web` / `calrs::email`. `RUST_LOG` filters such as `calrs::web=debug` still match (they match by prefix), but tooling that matches the exact target text (a fail2ban filter on `calrs::web: rate limited`, a log alert) needs updating.
 
 ### Fixed
 
