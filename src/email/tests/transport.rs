@@ -626,12 +626,12 @@ fn smtp_env_invalid_tls_mode_errors() {
 // never reaches the SMTP wire). These tests pin that behavior so we
 // notice immediately if a future lettre upgrade relaxes either defense
 // — at which point we'd need to add an explicit sanitizer at the
-// boundary in email.rs.
+// boundary in email/transport.rs.
 
 #[test]
 fn lettre_mailbox_rejects_crlf_in_display_name() {
     use lettre::message::Mailbox;
-    // The shape email.rs used before `named_mailbox()`:
+    // The shape the email module used before `named_mailbox()`:
     //   format!("{} <{}>", details.guest_name, details.guest_email).parse()
     let payloads = [
         "Alice\r\nBcc: evil@attacker.com",
