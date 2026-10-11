@@ -165,6 +165,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 | Google Meet auto-links | 1.18.0 | Host-owned Google Meet conference per confirmed booking, using existing Google Calendar OAuth2 tokens (#45 phase 3) |
 | UTC booking storage | 1.18.0 | New bookings are stored in UTC, so reminders, cancellations and the dashboard no longer depend on the server's OS timezone |
 
+## [Unreleased]
+
+### Added
+
+- **Pending requests hold their slot and expire** (#234) - On event types that require confirmation, a pending request used to leave its time free: a second guest was offered the same slot, filled in the form and was only turned away at submit, and an overlapping slot on another of the host's event types could be requested too. A pending request now blocks its host's (or assigned member's) time across all event types, exactly like a confirmed booking. Requests that wait too long are declined on their own, never accepted: the guest gets an email (and an SMS when the event type collects phones) asking them to pick another time, with a link back to the booking page, and the host gets a short notice. Halfway to the deadline the host gets one reminder with the Approve/Decline buttons. Both settings sit under "Requires confirmation" in the event type form: "Pending requests block the time slot" (on by default) and "Request expiry" (never, 4, 24, 48 or 72 hours, 24 for new event types). The deadline never runs past the meeting's minimum notice, and a guest reschedule that puts a booking back to pending restarts it. Reported by @Piergeek.
+- **Approval re-checks the host's calendar** (#234) - Approving a request, from the dashboard or from the email link, now refuses when the host (or the assigned member, or any member of a collective booking) has since become busy at that time, through a calendar event or another booking, instead of double-booking them.
+
+### Upgrade notes
+
+- Migration 065 adds the new settings. Existing event types get the slot hold on and **no expiry**, so requests that are already waiting are never declined by the upgrade; pick an expiry in the event type form to opt in.
+
 ## [1.18.0] - 2026-09-23
 
 Minor release. The headline is a **timezone fix for bookings**: on a server whose OS timezone differed from the event type's, reminders could arrive at the start time or after the meeting had ended, and cancellation notices showed the wrong time. New bookings are now stored in UTC. It also adds **Google Meet auto-generated links**, contributed by @gsmachado, and fixes three smaller issues on the settings and profile pages. One migration (064), no configuration change. **Back up your database before upgrading**: see the upgrade notes below.
