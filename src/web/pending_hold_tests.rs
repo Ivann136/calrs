@@ -136,11 +136,44 @@ fn pending_expiry_deadline_is_none_when_requests_never_expire() {
 
 #[test]
 fn pending_expiry_select_values_round_trip() {
-    assert_eq!(parse_pending_expiry("24"), Some(24));
-    assert_eq!(parse_pending_expiry("never"), None);
-    assert_eq!(parse_pending_expiry("5"), None, "only the offered choices");
-    assert_eq!(pending_expiry_form_value("72"), "72");
-    assert_eq!(pending_expiry_form_value("bogus"), "never");
+    for stored in [None, Some(4), Some(24), Some(12)] {
+        assert_eq!(
+            PendingSettings::parse_expiry(&PendingSettings::expiry_value(stored)),
+            stored
+        );
+    }
+    assert_eq!(PendingSettings::parse_expiry("bogus"), None);
+    assert_eq!(PendingSettings::parse_expiry("0"), None);
+    assert_eq!(PendingSettings::parse_expiry("-3"), None);
+    assert_eq!(PendingSettings::parse_expiry("99999"), None);
+}
+
+/// The options come from `PENDING_EXPIRY_CHOICES`, and a stored value that
+/// is not one of them is offered too so it stays selected on save (#234
+/// review): before, the template hard-coded the list and such a value fell
+/// back to "never".
+#[test]
+fn pending_settings_context_keeps_an_unlisted_stored_expiry() {
+    let ctx = PendingSettings {
+        blocks_slot: false,
+        expiry_hours: Some(12),
+    }
+    .context();
+    let values: Vec<String> = ctx
+        .get_attr("options")
+        .unwrap()
+        .try_iter()
+        .unwrap()
+        .map(|o| o.get_attr("value").unwrap().to_string())
+        .collect();
+    let mut expected = vec!["never".to_string()];
+    let mut hours = PENDING_EXPIRY_CHOICES.to_vec();
+    hours.push(12);
+    hours.sort_unstable();
+    expected.extend(hours.iter().map(|h| h.to_string()));
+    assert_eq!(values, expected);
+    assert_eq!(ctx.get_attr("selected").unwrap().to_string(), "12");
+    assert!(!ctx.get_attr("blocks_slot").unwrap().is_true());
 }
 
 #[tokio::test]
@@ -706,6 +739,51 @@ async fn event_type_form_persists_the_pending_settings() {
     let body = body_string(page).await;
     assert!(body.contains("id=\"pending-options\""), "{body}");
     assert!(body.contains("<option value=\"never\" selected>"), "{body}");
+}
+
+#[tokio::test]
+async fn event_type_form_keeps_an_unlisted_stored_expiry_on_save() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    sqlx::query(
+        "UPDATE event_types SET requires_confirmation = 1, pending_expiry_hours = 12 WHERE id = ?",
+    )
+    .bind(&et_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let page = app
+        .clone()
+        .oneshot(get_authed(
+            "/dashboard/event-types/test-meeting/edit",
+            &session,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(page).await;
+    assert!(body.contains("<option value=\"12\" selected>"), "{body}");
+
+    // What the browser posts back for that select.
+    let csrf = "csrf-pending-unlisted";
+    let response = app
+        .oneshot(post_form(
+            "/dashboard/event-types/test-meeting/edit",
+            &session,
+            csrf,
+            &format!(
+                "_csrf={}&title=Test+Meeting&slug=test-meeting&duration_min=30&requires_confirmation=on&pending_blocks_slot=on&pending_expiry_hours=12&location_type=link&location_value=https%3A%2F%2Fmeet.example.com%2Froom&avail_days=1,2,3,4,5&avail_start=09:00&avail_end=17:00",
+                csrf
+            ),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_redirection());
+    let stored: Option<i32> =
+        sqlx::query_scalar("SELECT pending_expiry_hours FROM event_types WHERE id = ?")
+            .bind(&et_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, Some(12));
 }
 
 #[tokio::test]

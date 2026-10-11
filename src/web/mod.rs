@@ -5969,6 +5969,7 @@ async fn new_event_type_form(
             form_reschedule_notice_value => 0,
             form_reschedule_notice_unit => "minutes",
             form_booking_horizon_days => "",
+            form_pending => PendingSettings::DEFAULT.context(),
             tz_options => common_timezones_with(&user.timezone)
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -6390,8 +6391,7 @@ async fn edit_event_type_form(
         .await
         .map(|v| v.to_string())
         .unwrap_or_default();
-    let (form_pending_blocks_slot, form_pending_expiry_hours) =
-        pending_form_values(&state.pool, &et_id).await;
+    let form_pending = PendingSettings::load(&state.pool, &et_id).await.context();
 
     let meeting_pattern_override: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT meeting_pattern_override FROM event_types WHERE id = ?",
@@ -6634,8 +6634,7 @@ async fn edit_event_type_form(
             form_reschedule_notice_value => form_reschedule_notice_value,
             form_reschedule_notice_unit => form_reschedule_notice_unit,
             form_booking_horizon_days => form_booking_horizon_days,
-            form_pending_blocks_slot => form_pending_blocks_slot,
-            form_pending_expiry_hours => form_pending_expiry_hours,
+            form_pending => form_pending,
             tz_options => common_timezones_with(&form_timezone)
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -8334,13 +8333,9 @@ async fn render_event_type_form_error(
             // Preserve what the user typed, so a validation error doesn't
             // silently blank the horizon back to "no limit".
             form_booking_horizon_days => form.booking_horizon_days.trim(),
-            form_pending_blocks_slot => form.pending_expiry_hours.is_none()
-                || form.pending_blocks_slot.as_deref() == Some("on"),
-            form_pending_expiry_hours => form
-                .pending_expiry_hours
-                .as_deref()
-                .map(pending_expiry_form_value)
-                .unwrap_or_else(|| DEFAULT_PENDING_EXPIRY_HOURS.to_string()),
+            form_pending => PendingSettings::from_form(form)
+                .unwrap_or(PendingSettings::DEFAULT)
+                .context(),
             tz_options => common_timezones_with(form.timezone.as_deref().unwrap_or(&auth_user.user.timezone))
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -9345,6 +9340,7 @@ async fn new_group_event_type_form(
             form_first_slot_only => false,
             form_frequency_limits => "",
             form_booking_horizon_days => "",
+            form_pending => PendingSettings::DEFAULT.context(),
             form_timezone => &user.timezone,
             tz_options => common_timezones_with(&user.timezone)
                 .iter()
@@ -9733,8 +9729,7 @@ async fn edit_group_event_type_form(
         .await
         .map(|v| v.to_string())
         .unwrap_or_default();
-    let (form_pending_blocks_slot, form_pending_expiry_hours) =
-        pending_form_values(&state.pool, &et_id).await;
+    let form_pending = PendingSettings::load(&state.pool, &et_id).await.context();
 
     let meeting_pattern_override: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT meeting_pattern_override FROM event_types WHERE id = ?",
@@ -9938,8 +9933,7 @@ async fn edit_group_event_type_form(
             form_reschedule_notice_value => form_reschedule_notice_value,
             form_reschedule_notice_unit => form_reschedule_notice_unit,
             form_booking_horizon_days => form_booking_horizon_days,
-            form_pending_blocks_slot => form_pending_blocks_slot,
-            form_pending_expiry_hours => form_pending_expiry_hours,
+            form_pending => form_pending,
             tz_options => common_timezones_with(&form_timezone)
                 .iter()
                 .map(|(iana, label)| context! { value => iana, label => label })
@@ -14915,71 +14909,121 @@ async fn get_booking_horizon(pool: &SqlitePool, et_id: &str) -> Option<i32> {
     .flatten()
 }
 
-/// Parse the request expiry select: one of [`PENDING_EXPIRY_CHOICES`], or
-/// `None` for "never" (and for anything else, which a crafted POST could send).
-fn parse_pending_expiry(raw: &str) -> Option<i32> {
-    raw.trim()
-        .parse::<i32>()
-        .ok()
-        .filter(|h| PENDING_EXPIRY_CHOICES.contains(h))
+/// The pending-request section of the event type form (#234): whether a
+/// pending request blocks the slot, and how long it may wait (`None` = never).
+/// The one place that maps between stored values, form values and the
+/// template, so the defaults and the "never" spelling live nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSettings {
+    blocks_slot: bool,
+    expiry_hours: Option<i32>,
 }
 
-/// The select value for a submitted expiry, normalised the way it is stored.
-fn pending_expiry_form_value(raw: &str) -> String {
-    parse_pending_expiry(raw)
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| "never".to_string())
+impl PendingSettings {
+    /// What a new event type gets from the web form.
+    const DEFAULT: Self = Self {
+        blocks_slot: true,
+        expiry_hours: Some(DEFAULT_PENDING_EXPIRY_HOURS),
+    };
+
+    /// Longest expiry accepted from the form, one year. Anything positive up
+    /// to that is kept, so a stored value outside [`PENDING_EXPIRY_CHOICES`]
+    /// survives a save instead of being reset to "never".
+    const MAX_EXPIRY_HOURS: i32 = 24 * 365;
+
+    /// The select value for an expiry: hours as a number, or "never".
+    fn expiry_value(expiry_hours: Option<i32>) -> String {
+        expiry_hours
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "never".to_string())
+    }
+
+    /// Parse a select value back. "never", and anything that is not a
+    /// positive hour count within [`Self::MAX_EXPIRY_HOURS`], is `None`.
+    fn parse_expiry(raw: &str) -> Option<i32> {
+        raw.trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|h| (1..=Self::MAX_EXPIRY_HOURS).contains(h))
+    }
+
+    /// The settings a submitted form carries, or `None` when the form did not
+    /// include the section at all (no `pending_expiry_hours` field, e.g. a
+    /// script posting the old field set).
+    fn from_form(form: &EventTypeForm) -> Option<Self> {
+        let raw = form.pending_expiry_hours.as_deref()?;
+        Some(Self {
+            blocks_slot: form.pending_blocks_slot.as_deref() == Some("on"),
+            expiry_hours: Self::parse_expiry(raw),
+        })
+    }
+
+    async fn load(pool: &SqlitePool, et_id: &str) -> Self {
+        let row: Option<(i32, Option<i32>)> = sqlx::query_as(
+            "SELECT pending_blocks_slot, pending_expiry_hours FROM event_types WHERE id = ?",
+        )
+        .bind(et_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        match row {
+            Some((blocks, hours)) => Self {
+                blocks_slot: blocks != 0,
+                expiry_hours: hours,
+            },
+            None => Self::DEFAULT,
+        }
+    }
+
+    /// Template context: the checkbox state, the selected value, and the
+    /// options to render. A stored expiry that is not one of the offered
+    /// choices is listed too, so it stays selected.
+    fn context(&self) -> minijinja::Value {
+        let mut hours: Vec<i32> = PENDING_EXPIRY_CHOICES.to_vec();
+        if let Some(h) = self.expiry_hours {
+            if !hours.contains(&h) {
+                hours.push(h);
+                hours.sort_unstable();
+            }
+        }
+        let mut options = vec![context! { value => "never", hours => () }];
+        options.extend(
+            hours
+                .into_iter()
+                .map(|h| context! { value => h.to_string(), hours => h }),
+        );
+        context! {
+            blocks_slot => self.blocks_slot,
+            selected => Self::expiry_value(self.expiry_hours),
+            options => options,
+        }
+    }
 }
 
-/// Persist the pending-request settings from the event type form (#234). A
-/// submission without the section at all (no `pending_expiry_hours` field,
-/// e.g. a script posting the old field set) keeps the stored values on edit
-/// and gets the defaults on create.
+/// Persist the pending-request settings from the event type form. A
+/// submission without the section keeps the stored values on edit and gets
+/// [`PendingSettings::DEFAULT`] on create.
 async fn save_pending_settings(
     pool: &SqlitePool,
     et_id: &str,
     form: &EventTypeForm,
     creating: bool,
 ) {
-    let (blocks, expiry) = match form.pending_expiry_hours.as_deref() {
-        Some(raw) => (
-            form.pending_blocks_slot.as_deref() == Some("on"),
-            parse_pending_expiry(raw),
-        ),
-        None if creating => (true, Some(DEFAULT_PENDING_EXPIRY_HOURS)),
+    let settings = match PendingSettings::from_form(form) {
+        Some(settings) => settings,
+        None if creating => PendingSettings::DEFAULT,
         None => return,
     };
     if let Err(e) = sqlx::query(
         "UPDATE event_types SET pending_blocks_slot = ?, pending_expiry_hours = ? WHERE id = ?",
     )
-    .bind(blocks as i32)
-    .bind(expiry)
+    .bind(settings.blocks_slot as i32)
+    .bind(settings.expiry_hours)
     .bind(et_id)
     .execute(pool)
     .await
     {
         tracing::warn!(event_type_id = %et_id, error = %e, "cannot save pending request settings");
-    }
-}
-
-/// Form values for the pending-request section of an existing event type:
-/// (blocks the slot, expiry select value).
-async fn pending_form_values(pool: &SqlitePool, et_id: &str) -> (bool, String) {
-    let row: Option<(i32, Option<i32>)> = sqlx::query_as(
-        "SELECT pending_blocks_slot, pending_expiry_hours FROM event_types WHERE id = ?",
-    )
-    .bind(et_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
-    match row {
-        Some((blocks, hours)) => (
-            blocks != 0,
-            hours
-                .map(|h| h.to_string())
-                .unwrap_or_else(|| "never".to_string()),
-        ),
-        None => (true, DEFAULT_PENDING_EXPIRY_HOURS.to_string()),
     }
 }
 
