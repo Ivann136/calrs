@@ -1181,6 +1181,8 @@
       daysInMonth = newData.daysInMonth;
       monthYear = newData.monthYear;
       hasPrevMonth = newData.hasPrevMonth;
+      // A month change from the month or column view re-anchors the week view.
+      weekStart = null;
 
       // Keep calData in sync so all views see fresh state
       calData.monthLabel = newData.monthLabel;
@@ -1304,30 +1306,38 @@
     return href;
   }
 
+  // Monday of the week shown in the week view. It is anchored once (on the
+  // week containing today, or the 1st of a future month) and then moved by
+  // whole weeks. Deriving it from monthYear plus an offset broke as soon as
+  // a week navigation loaded another month, since monthYear moved the base.
+  var weekStart = null;
+
   function getWeekDates() {
-    // Get the week containing today (or first available date if today is before this month)
-    var parts = monthYear.split('-');
-    var year = parseInt(parts[0], 10);
-    var month = parseInt(parts[1], 10);
+    if (!weekStart) {
+      var parts = monthYear.split('-');
+      var year = parseInt(parts[0], 10);
+      var month = parseInt(parts[1], 10);
 
-    // Find a good starting date: today if in this month, else first of month
-    var todayParts = todayDate.split('-');
-    var startDate;
-    if (parseInt(todayParts[0]) === year && parseInt(todayParts[1]) === month) {
-      startDate = new Date(year, month - 1, parseInt(todayParts[2]));
-    } else {
-      startDate = new Date(year, month - 1, 1);
+      // Find a good starting date: today if in this month, else first of month
+      var todayParts = todayDate.split('-');
+      var anchor;
+      if (parseInt(todayParts[0]) === year && parseInt(todayParts[1]) === month) {
+        anchor = new Date(year, month - 1, parseInt(todayParts[2]));
+      } else {
+        anchor = new Date(year, month - 1, 1);
+      }
+
+      // Go back to Monday
+      var dow = anchor.getDay();
+      var mondayOffset = dow === 0 ? -6 : 1 - dow;
+      anchor.setDate(anchor.getDate() + mondayOffset);
+      weekStart = anchor;
     }
-
-    // Go back to Monday
-    var dow = startDate.getDay();
-    var mondayOffset = dow === 0 ? -6 : 1 - dow;
-    startDate.setDate(startDate.getDate() + mondayOffset);
 
     var dates = [];
     for (var i = 0; i < 7; i++) {
-      var d = new Date(startDate);
-      d.setDate(startDate.getDate() + i);
+      var d = new Date(weekStart);
+      d.setDate(weekStart.getDate() + i);
       var ds = d.getFullYear() + '-' + (d.getMonth() < 9 ? '0' : '') + (d.getMonth() + 1) + '-' + (d.getDate() < 10 ? '0' : '') + d.getDate();
       dates.push({ date: d, dateStr: ds, day: d.getDate(), weekday: shortDays[d.getDay()] });
     }
@@ -1414,9 +1424,9 @@
       prevBtn.innerHTML = '&larr;';
       prevBtn.addEventListener('click', function(e) {
         e.preventDefault();
-        weekOffset -= 7;
         var targetDate = new Date(dates[0].date);
         targetDate.setDate(targetDate.getDate() - 7);
+        weekStart = targetDate;
         ensureMonthLoaded(targetDate, function() { buildWeekView(); });
       });
       nav.appendChild(prevBtn);
@@ -1433,44 +1443,13 @@
     nextBtn.innerHTML = '&rarr;';
     nextBtn.addEventListener('click', function(e) {
       e.preventDefault();
-      weekOffset += 7;
       var targetDate = new Date(dates[6].date);
       targetDate.setDate(targetDate.getDate() + 1);
+      weekStart = targetDate;
       ensureMonthLoaded(targetDate, function() { buildWeekView(); });
     });
     nav.appendChild(nextBtn);
   }
-
-  var weekOffset = 0;
-
-  // Override getWeekDates to use offset
-  getWeekDates = function() {
-    var parts = monthYear.split('-');
-    var year = parseInt(parts[0], 10);
-    var month = parseInt(parts[1], 10);
-
-    var todayParts = todayDate.split('-');
-    var startDate;
-    if (parseInt(todayParts[0]) === year && parseInt(todayParts[1]) === month) {
-      startDate = new Date(year, month - 1, parseInt(todayParts[2]));
-    } else {
-      startDate = new Date(year, month - 1, 1);
-    }
-
-    // Go to Monday of that week
-    var dow = startDate.getDay();
-    var mondayOffset = dow === 0 ? -6 : 1 - dow;
-    startDate.setDate(startDate.getDate() + mondayOffset + weekOffset);
-
-    var dates = [];
-    for (var i = 0; i < 7; i++) {
-      var d = new Date(startDate);
-      d.setDate(startDate.getDate() + i);
-      var ds = d.getFullYear() + '-' + (d.getMonth() < 9 ? '0' : '') + (d.getMonth() + 1) + '-' + (d.getDate() < 10 ? '0' : '') + d.getDate();
-      dates.push({ date: d, dateStr: ds, day: d.getDate(), weekday: shortDays[d.getDay()] });
-    }
-    return dates;
-  };
 
   // Ensure data is loaded for the month containing targetDate
   function ensureMonthLoaded(targetDate, cb) {
