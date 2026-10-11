@@ -554,6 +554,154 @@ async fn dashboard_approval_is_refused_when_the_host_became_busy() {
     assert_eq!(booking_status(&pool, &pending).await, "confirmed");
 }
 
+async fn approve_from_dashboard(
+    app: &Router,
+    session: &str,
+    id: &str,
+) -> axum::http::Response<Body> {
+    let csrf = format!("csrf-approve-{id}");
+    app.clone()
+        .oneshot(post_form(
+            &format!("/dashboard/bookings/{}/confirm", id),
+            session,
+            &csrf,
+            &format!("_csrf={}", csrf),
+        ))
+        .await
+        .unwrap()
+}
+
+fn location(response: &axum::http::Response<Body>) -> String {
+    response.headers()["location"].to_str().unwrap().to_string()
+}
+
+/// Review finding on #234: the approval re-check counted other pending
+/// requests as busy, so two overlapping requests (e.g. made before the
+/// upgrade) blocked each other's approval forever. Between two waiting
+/// requests the host decides; the loser is refused once the winner is
+/// confirmed.
+#[tokio::test]
+async fn overlapping_pending_requests_do_not_block_each_others_approval() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    let first = insert_v1_booking(
+        &pool,
+        &et_id,
+        "first@test.com",
+        utc(2030, 3, 18, 10, 0),
+        30,
+        "pending",
+        &[],
+    )
+    .await;
+    let second = insert_v1_booking(
+        &pool,
+        &et_id,
+        "second@test.com",
+        utc(2030, 3, 18, 10, 15),
+        30,
+        "pending",
+        &[],
+    )
+    .await;
+
+    // The later request can be approved although the earlier one holds
+    // an overlapping slot...
+    let response = approve_from_dashboard(&app, &session, &second).await;
+    assert_eq!(location(&response), "/dashboard/bookings");
+    assert_eq!(booking_status(&pool, &second).await, "confirmed");
+
+    // ...and then the earlier one is refused: the host is now busy.
+    let response = approve_from_dashboard(&app, &session, &first).await;
+    assert_eq!(location(&response), "/dashboard/bookings?error=host-busy");
+    assert_eq!(booking_status(&pool, &first).await, "pending");
+}
+
+/// Review finding on #234: an empty collective roster counted as free, the
+/// opposite of the reschedule path where it means nobody can host.
+#[tokio::test]
+async fn approval_is_refused_when_the_collective_roster_is_empty() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let (team_id, team_et) = seed_team_event_type(&pool).await;
+    sqlx::query("UPDATE event_types SET scheduling_mode = 'collective' WHERE id = ?")
+        .bind(&team_et)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM team_members WHERE team_id = ?")
+        .bind(&team_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id = insert_v1_booking(
+        &pool,
+        &team_et,
+        "collective@test.com",
+        utc(2030, 3, 18, 10, 0),
+        30,
+        "pending",
+        &[],
+    )
+    .await;
+
+    let response = approve_from_dashboard(&app, &session, &id).await;
+    assert_eq!(location(&response), "/dashboard/bookings?error=host-busy");
+    assert_eq!(booking_status(&pool, &id).await, "pending");
+}
+
+/// Review finding on #234: the host check ran outside any lock, so two
+/// overlapping requests (on an event type that does not hold pending slots)
+/// approved at the same moment could both pass it and both be confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_approvals_of_overlapping_requests_confirm_only_one() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    sqlx::query("UPDATE event_types SET pending_blocks_slot = 0 WHERE id = ?")
+        .bind(&et_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first = insert_v1_booking(
+        &pool,
+        &et_id,
+        "first@test.com",
+        utc(2030, 3, 18, 10, 0),
+        30,
+        "pending",
+        &[],
+    )
+    .await;
+    let second = insert_v1_booking(
+        &pool,
+        &et_id,
+        "second@test.com",
+        utc(2030, 3, 18, 10, 15),
+        30,
+        "pending",
+        &[],
+    )
+    .await;
+
+    let by_dashboard = approve_from_dashboard(&app, &session, &first);
+    let csrf = "csrf-concurrent-token";
+    let by_token = app.clone().oneshot(post_form_unauthed(
+        &format!("/booking/approve/confirm-{second}"),
+        csrf,
+        &format!("_csrf={}", csrf),
+    ));
+    let (a, b) = tokio::join!(by_dashboard, by_token);
+    b.unwrap();
+    drop(a);
+
+    let confirmed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM bookings WHERE id IN (?, ?) AND status = 'confirmed'",
+    )
+    .bind(&first)
+    .bind(&second)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(confirmed, 1, "exactly one overlapping request is approved");
+}
+
 #[tokio::test]
 async fn token_approval_is_refused_when_a_calendar_event_now_overlaps() {
     let (app, pool, _, et_id) = setup_test_app().await;

@@ -17,13 +17,24 @@ use sqlx::SqlitePool;
 /// the slot (`pending_blocks_slot`, #234).
 ///
 /// Shared by the web slot engine, the troubleshoot view and the CLI so the
-/// three can never disagree about who is busy.
-pub const USER_BUSY_BOOKINGS: &str = "(b.assigned_user_id = ?
+/// three can never disagree about who is busy. `include_pending_holds` is
+/// false only for the approval re-check, where other pending requests must
+/// not block the one being approved.
+pub fn user_busy_bookings(include_pending_holds: bool) -> String {
+    let status = if include_pending_holds {
+        "(b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1))"
+    } else {
+        "b.status = 'confirmed'"
+    };
+    format!(
+        "(b.assigned_user_id = ?
         OR (b.assigned_user_id IS NULL AND a.user_id = ?)
         OR (b.assigned_user_id IS NULL AND et.team_id IS NOT NULL AND EXISTS (
               SELECT 1 FROM team_members tm
               WHERE tm.team_id = et.team_id AND tm.user_id = ?)))
-   AND (b.status = 'confirmed' OR (b.status = 'pending' AND et.pending_blocks_slot = 1))";
+   AND {status}"
+    )
+}
 
 pub fn naive(value: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(value.trim_end_matches('Z'), "%Y-%m-%dT%H:%M:%S")

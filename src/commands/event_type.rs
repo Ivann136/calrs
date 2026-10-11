@@ -68,7 +68,7 @@ struct EventTypeRow {
 /// Bookings that make the host of `et_id` busy around a window, as raw
 /// (start_at, end_at) strings for `booking_time::busy_range`. The host is the
 /// event type owner, and the rule is the web slot engine's
-/// (`booking_time::USER_BUSY_BOOKINGS`): their own bookings, bookings assigned
+/// (`booking_time::user_busy_bookings`): their own bookings, bookings assigned
 /// to them on other people's team event types, unassigned collective team
 /// bookings, and pending requests whose event type holds the slot. Bookings
 /// of other users on the same instance do not count. The window bounds are
@@ -96,7 +96,7 @@ pub(crate) async fn host_busy_bookings(
          JOIN accounts a ON a.id = et.account_id
          WHERE {}
            AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')",
-        crate::booking_time::USER_BUSY_BOOKINGS
+        crate::booking_time::user_busy_bookings(true)
     ))
     .bind(&host)
     .bind(&host)

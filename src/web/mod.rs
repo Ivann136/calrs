@@ -5381,31 +5381,53 @@ async fn confirm_booking(
         None => return Redirect::to("/dashboard/bookings").into_response(),
     };
 
-    // The host may have filled the time since the request came in (another
-    // meeting in their calendar, or another booking): approving would then
-    // double-book them (#234).
-    if !approval_hosts_free(&state, &bid, &uid, &et_id, &user.id, &start_at, &end_at).await {
-        tracing::warn!(booking_id = %bid, "approval refused: host no longer free");
-        return Redirect::to("/dashboard/bookings?error=host-busy").into_response();
-    }
+    // Refresh the hosts' calendars before taking the lock below (bounded,
+    // see `prepare_approval_hosts`).
+    let approval_hosts = prepare_approval_hosts(&state, &uid, &user.id).await;
 
     // Pending bookings do not block shared resources, so re-verify them at
-    // approval time under the process-wide resource lock; in round-robin
+    // approval time under the process-wide lock taken below; in round-robin
     // mode the resource is re-picked (the original pick may be long stale).
-    let resource_guard = {
+    // The feeds are refreshed first, outside the lock.
+    let has_resources = {
         let ids: Vec<String> = crate::resources::resources_for_event_type(&state.pool, &et_id)
             .await
             .into_iter()
             .map(|r| r.id)
             .collect();
         if ids.is_empty() {
-            None
+            false
         } else {
             crate::resources::sync_if_stale(&state.pool, &ids).await;
-            Some(crate::resources::booking_lock().await)
+            true
         }
     };
-    if resource_guard.is_some() {
+
+    // One process-wide lock from the availability re-checks through the
+    // status flip: without it two overlapping requests approved at the same
+    // time could both pass the host check (#234). The resource re-check runs
+    // under the same guard, which is why it no longer takes its own.
+    let booking_guard = crate::resources::booking_lock().await;
+
+    // The host may have filled the time since the request came in (another
+    // meeting in their calendar, or another booking): approving would then
+    // double-book them (#234).
+    if !approval_hosts_free(
+        &state.pool,
+        &approval_hosts,
+        &bid,
+        &uid,
+        &et_id,
+        &start_at,
+        &end_at,
+    )
+    .await
+    {
+        tracing::warn!(booking_id = %bid, "approval refused: host no longer free");
+        return Redirect::to("/dashboard/bookings?error=host-busy").into_response();
+    }
+
+    if has_resources {
         if let (Some(s), Some(e)) = (parse_ical_datetime(&start_at), parse_ical_datetime(&end_at)) {
             let tz_check = get_host_tz(&state.pool, &et_id).await;
             let (s, e) =
@@ -5440,7 +5462,7 @@ async fn confirm_booking(
             .await
             .map(|r| r.rows_affected())
             .unwrap_or(0);
-    drop(resource_guard);
+    drop(booking_guard);
     if flipped == 0 {
         return Redirect::to("/dashboard/bookings").into_response();
     }
@@ -13995,6 +14017,35 @@ async fn fetch_busy_times_for_user_ex(
     exclude_booking_id: Option<&str>,
     exclude_booking_uid: Option<&str>,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    fetch_busy_times_for_user_opts(
+        pool,
+        user_id,
+        window_start,
+        window_end,
+        host_tz,
+        event_type_id,
+        exclude_booking_id,
+        exclude_booking_uid,
+        true,
+    )
+    .await
+}
+
+/// [`fetch_busy_times_for_user_ex`], choosing whether pending requests that
+/// hold their slot count as busy. Slot pages and booking checks count them;
+/// the approval re-check does not (see [`approval_hosts_free`]).
+#[allow(clippy::too_many_arguments)]
+async fn fetch_busy_times_for_user_opts(
+    pool: &SqlitePool,
+    user_id: &str,
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    host_tz: Tz,
+    event_type_id: Option<&str>,
+    exclude_booking_id: Option<&str>,
+    exclude_booking_uid: Option<&str>,
+    include_pending_holds: bool,
+) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     // Events are stored in compact iCal form ("YYYYMMDDTHHMMSS" for timed,
     // "YYYYMMDD" for all-day), so both overlap bounds must also be compact
     // with a time component. Using a date-only upper bound here ("YYYYMMDD")
@@ -14100,7 +14151,7 @@ async fn fetch_busy_times_for_user_ex(
          WHERE {}
            AND b.start_at <= strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at >= strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
            AND (? = '' OR b.id != ?)",
-        crate::booking_time::USER_BUSY_BOOKINGS
+        crate::booking_time::user_busy_bookings(include_pending_holds)
     ))
     .bind(user_id)
     .bind(user_id)
@@ -16790,7 +16841,7 @@ async fn troubleshoot(
          WHERE {}
            AND b.start_at < strftime('%Y-%m-%dT%H:%M:%S', ?, '+2 days') AND b.end_at > strftime('%Y-%m-%dT%H:%M:%S', ?, '-2 days')
          ORDER BY b.start_at",
-        crate::booking_time::USER_BUSY_BOOKINGS
+        crate::booking_time::user_busy_bookings(true)
     ))
     .bind(&user.id)
     .bind(&user.id)
@@ -20076,13 +20127,37 @@ async fn approve_booking_by_token(
             .flatten()
             .flatten();
 
-    // Same host re-check as the dashboard approval (#234).
+    // Refresh the hosts' calendars before taking the lock below (bounded,
+    // see `prepare_approval_hosts`).
+    let approval_hosts = prepare_approval_hosts(&state, &uid, &user_id).await;
+
+    // Pending bookings do not block shared resources, so re-verify them at
+    // approval time under the process-wide lock taken below; in round-robin
+    // mode the resource is re-picked (the original pick may be long stale).
+    // The feeds are refreshed first, outside the lock.
+    let has_resources = {
+        let ids: Vec<String> =
+            crate::resources::resources_for_event_type(&state.pool, &event_type_id)
+                .await
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+        if ids.is_empty() {
+            false
+        } else {
+            crate::resources::sync_if_stale(&state.pool, &ids).await;
+            true
+        }
+    };
+
+    // Same lock and host re-check as the dashboard approval (#234).
+    let booking_guard = crate::resources::booking_lock().await;
     if !approval_hosts_free(
-        &state,
+        &state.pool,
+        &approval_hosts,
         &bid,
         &uid,
         &event_type_id,
-        &user_id,
         &start_at,
         &end_at,
     )
@@ -20097,24 +20172,7 @@ async fn approve_booking_by_token(
         );
     }
 
-    // Pending bookings do not block shared resources, so re-verify them at
-    // approval time under the process-wide resource lock; in round-robin
-    // mode the resource is re-picked (the original pick may be long stale).
-    let resource_guard = {
-        let ids: Vec<String> =
-            crate::resources::resources_for_event_type(&state.pool, &event_type_id)
-                .await
-                .into_iter()
-                .map(|r| r.id)
-                .collect();
-        if ids.is_empty() {
-            None
-        } else {
-            crate::resources::sync_if_stale(&state.pool, &ids).await;
-            Some(crate::resources::booking_lock().await)
-        }
-    };
-    if resource_guard.is_some() {
+    if has_resources {
         if let (Some(s), Some(e)) = (parse_ical_datetime(&start_at), parse_ical_datetime(&end_at)) {
             let tz_check = get_host_tz(&state.pool, &event_type_id).await;
             let (s, e) =
@@ -20160,7 +20218,7 @@ async fn approve_booking_by_token(
             .await
             .map(|r| r.rows_affected())
             .unwrap_or(0);
-    drop(resource_guard);
+    drop(booking_guard);
     if flipped == 0 {
         let already: Option<(String,)> = sqlx::query_as("SELECT status FROM bookings WHERE id = ?")
             .bind(&bid)
@@ -22507,31 +22565,64 @@ async fn reschedule_busy_source(
     BusySource::Team(member_busy)
 }
 
-/// Whether everyone a pending booking needs is still free for it, checked
-/// before an approval flips it to confirmed. Same hosts as a reschedule (the
-/// assigned member, every eligible member of a collective booking, the owner
-/// otherwise) and the same busy sources (calendar events, confirmed bookings,
-/// and pending requests that hold their slot), excluding the booking itself
-/// and its own calendar copy. Working hours are deliberately not re-applied:
-/// the host is explicitly accepting this time.
-async fn approval_hosts_free(
+/// Upper bound on the calendar refresh an approval does before re-checking
+/// the hosts. The token path is unauthenticated, so a slow or dead CalDAV
+/// server must not hold the request (or the approval) open indefinitely.
+const APPROVAL_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The hosts an approval has to re-check (same resolution as a reschedule:
+/// the assigned member, every eligible member of a collective booking, the
+/// owner otherwise), with their calendars refreshed when stale. The refresh
+/// is bounded by [`APPROVAL_SYNC_TIMEOUT`] overall; past it the check uses
+/// the cached events, which is what it would have done before the refresh.
+async fn prepare_approval_hosts(
     state: &Arc<AppState>,
+    booking_uid: &str,
+    owner_user_id: &str,
+) -> RescheduleHosts {
+    let hosts = reschedule_hosts(&state.pool, booking_uid, owner_user_id).await;
+    if tokio::time::timeout(APPROVAL_SYNC_TIMEOUT, sync_reschedule_hosts(state, &hosts))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            uid = %booking_uid,
+            "calendar refresh before approval timed out; checking cached events"
+        );
+    }
+    hosts
+}
+
+/// Whether everyone a pending booking needs is still free for it, checked
+/// under the booking lock right before an approval flips it to confirmed.
+///
+/// Busy means a calendar event or a confirmed booking, excluding the booking
+/// itself and its own calendar copy. Other pending requests are not counted:
+/// they hold slots against new guests, but between two waiting requests the
+/// host decides, and counting them would let two overlapping requests block
+/// each other's approval forever. Once one is approved it is confirmed, and
+/// the other is then refused. Working hours are not re-applied: the host is
+/// explicitly accepting this time. An empty collective roster is never free,
+/// as in [`reschedule_hosts`].
+async fn approval_hosts_free(
+    pool: &SqlitePool,
+    hosts: &RescheduleHosts,
     booking_id: &str,
     booking_uid: &str,
     et_id: &str,
-    owner_user_id: &str,
     start_at: &str,
     end_at: &str,
 ) -> bool {
-    let host_tz = get_host_tz(&state.pool, et_id).await;
+    if hosts.user_ids.is_empty() {
+        return false;
+    }
+    let host_tz = get_host_tz(pool, et_id).await;
     let Some((start, end)) = crate::booking_time::busy_range(start_at, end_at, host_tz) else {
         return true;
     };
-    let hosts = reschedule_hosts(&state.pool, booking_uid, owner_user_id).await;
-    sync_reschedule_hosts(state, &hosts).await;
     for user_id in &hosts.user_ids {
-        let busy = fetch_busy_times_for_user_ex(
-            &state.pool,
+        let busy = fetch_busy_times_for_user_opts(
+            pool,
             user_id,
             start,
             end,
@@ -22539,6 +22630,7 @@ async fn approval_hosts_free(
             Some(et_id),
             Some(booking_id),
             Some(booking_uid),
+            false,
         )
         .await;
         if has_conflict(&busy, start, end) {
