@@ -105,7 +105,7 @@ No extra OAuth scope or admin field is required beyond the setup above, as long 
 |---|---|
 | Personal event type | The event type owner |
 | Team round-robin | The assigned member |
-| Team collective | The first eligible member by name (same person as the calendar ORGANIZER) |
+| Team collective | The first eligible member by name when the booking was made (same person as the calendar ORGANIZER, kept even if the team changes later) |
 | Dynamic group (`/u/alice+bob/...`) | The event type owner (first username). Checked on the slots page so the guest is not asked to fill the form first. Other participants do not need Google connected. |
 
 The conference is created with that person's token on their write-back calendar, so they see the native "Join with Google Meet" button in Google Calendar.

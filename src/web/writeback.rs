@@ -292,6 +292,20 @@ pub(super) async fn writeback_details(
             .await
             .unwrap_or_default();
 
+    // The organizer the event was created with: the stored snapshot for a
+    // multi-host booking (#161), the assigned member or owner otherwise. The
+    // row's own join only knows the latter, which put the owner (or nobody,
+    // for a team's placeholder account) on a collective retry.
+    let (host_name, host_email, host_language) =
+        match super::booking_host_identity(pool, booking_uid).await {
+            Some((name, email, language)) => (name, email, language),
+            None => (
+                host_name.unwrap_or_default(),
+                host_email.unwrap_or_default(),
+                crate::email::supported_language(host_language),
+            ),
+        };
+
     let details = crate::email::BookingDetails {
         utc_times: crate::booking_time::ics_times(&start_at, &end_at),
         event_title,
@@ -301,15 +315,15 @@ pub(super) async fn writeback_details(
         guest_name,
         guest_email,
         guest_timezone,
-        host_name: host_name.unwrap_or_default(),
-        host_email: host_email.unwrap_or_default(),
+        host_name,
+        host_email,
         uid: booking_uid.to_string(),
         notes,
         location: location.filter(|l| !l.is_empty()),
         reminder_minutes,
         additional_attendees,
         guest_language,
-        host_language: crate::email::supported_language(host_language),
+        host_language,
         host_timezone: stored_tz.name().to_string(),
         ..Default::default()
     };

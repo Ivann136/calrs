@@ -1225,6 +1225,18 @@ async fn cancel_orphaned_booking(
         host_language,
         ..details.clone()
     };
+    // The guest's CANCEL must carry the invite's ORGANIZER, or calendar
+    // clients that match on UID + ORGANIZER ignore it. For a collective
+    // booking that is the stored organizer (#161), not whichever member's
+    // calendar lost the event.
+    let details = match crate::web::booking_host_identity(pool, &details.uid).await {
+        Some((host_name, host_email, _)) => crate::email::CancellationDetails {
+            host_name,
+            host_email,
+            ..details
+        },
+        None => details,
+    };
 
     if let Err(e) = crate::email::send_guest_cancellation(&smtp_config, &details).await {
         tracing::warn!(

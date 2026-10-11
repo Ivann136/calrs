@@ -524,8 +524,26 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                                 guest_email
                             );
                             io::stdout().flush().unwrap();
-                            match crate::email::send_guest_cancellation(&smtp_config, &details)
-                                .await
+                            // The guest's CANCEL carries the invite's ORGANIZER
+                            // (the assigned member, or a collective booking's
+                            // stored organizer, #161), or calendar clients that
+                            // match on UID + ORGANIZER ignore it.
+                            let guest_details =
+                                match crate::web::booking_host_identity(pool, &details.uid).await {
+                                    Some((host_name, host_email, _)) => {
+                                        crate::email::CancellationDetails {
+                                            host_name,
+                                            host_email,
+                                            ..details.clone()
+                                        }
+                                    }
+                                    None => details.clone(),
+                                };
+                            match crate::email::send_guest_cancellation(
+                                &smtp_config,
+                                &guest_details,
+                            )
+                            .await
                             {
                                 Ok(_) => println!("{}", "sent".green()),
                                 Err(e) => println!("{} {}", "failed:".red(), e),
