@@ -585,9 +585,9 @@ When adding a new migration:
 
 ### Localization (Fluent)
 
-calrs ships with translations for English, French, Spanish, Polish, German, Italian, Estonian and Brazilian Portuguese. Source files live under `i18n/{lang}/main.ftl` and are embedded in the binary via `include_str!` (no runtime files). The loader, language detection, and minijinja `t()` global are in `src/i18n.rs`. Templates use `{{ t("message-id", arg=value) }}` and the active language is injected into the rendering context as `lang` by the calling handler.
+calrs ships with translations for English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch. Source files live under `i18n/{lang}/main.ftl` and are embedded in the binary via `include_str!` (no runtime files). The loader, language detection, and minijinja `t()` global are in `src/i18n.rs`. Templates use `{{ t("message-id", arg=value) }}` and the active language is injected into the rendering context as `lang` by the calling handler.
 
-Both the guest side and the host side (dashboard, settings, forms, admin panel, auth pages) render through Fluent, including the bare error responses the booking flow returns without page chrome. **All eight locales are complete at 1043 keys**, held there by a test; the per-key English fallback still exists but nothing currently uses it.
+Both the guest side and the host side (dashboard, settings, forms, admin panel, auth pages) render through Fluent, including the bare error responses the booking flow returns without page chrome. **All nine locales are complete at 1051 keys**, held there by a test; the per-key English fallback still exists but nothing currently uses it.
 
 Three helpers stay English on purpose: the CSRF rejection, the 500 page, and the OIDC failure. They live in helpers called from ~240 sites with no `lang` in scope, and they are diagnostics rather than flow messages.
 
@@ -613,9 +613,9 @@ All locales address the reader informally, matching what the earliest translatio
 1. Land it on the `i18n` branch first, not `main`. This keeps half-translated UI off `main` and gives contributors a window before the next merge.
 2. Add the new key to `i18n/en/main.ftl` (the source of truth), then to every other locale. The runtime still falls back to English per missing key, but the coverage test does not let you rely on it.
 3. If the change touches a template that wasn't translated yet, convert its hard-coded strings to `{{ t("...") }}` calls in the same commit, and add render-site context entries (`lang => crate::i18n::detect_from_headers(&headers)` for guest pages, `lang => auth_user.lang` for authenticated dashboard pages).
-4. Run `cargo test i18n::` before pushing: it checks coverage across all eight locales and the plural categories each language needs.
+4. Run `cargo test i18n::` before pushing: it checks coverage across all nine locales and the plural categories each language needs.
 
-**Adding a key now costs eight translations, not one.** The coverage test fails until every locale has a value. That is deliberate: a half-translated page is worse than an English one because nobody notices it is wrong. If you cannot supply all eight, land the key on `i18n` and leave it there until someone can.
+**Adding a key now costs nine translations, not one.** The coverage test fails until every locale has a value. That is deliberate: a half-translated page is worse than an English one because nobody notices it is wrong. If you cannot supply all nine, land the key on `i18n` and leave it there until someone can.
 
 **When you add a new locale**, in this order:
 1. Create `i18n/{code}/main.ftl` and translate every key. **Not empty**: the moment the locale is registered, `every_locale_covers_every_english_key` demands all of them, so an empty file fails with over a thousand errors.

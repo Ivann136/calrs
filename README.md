@@ -198,7 +198,7 @@ Each team member's CalDAV calendars are checked for conflicts. The availability 
 
 ### Localization
 
-- **Multi-language UI**: the whole application, guest side and host side, in English, French, Spanish, Polish, German, Italian, Estonian and Brazilian Portuguese. Strings are managed via [Fluent](https://projectfluent.org/) and embedded in the binary at compile time, so no runtime files to ship
+- **Multi-language UI**: the whole application, guest side and host side, in English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch. Strings are managed via [Fluent](https://projectfluent.org/) and embedded in the binary at compile time, so no runtime files to ship
 - **Automatic language detection**: guests get their browser's language (RFC 7231 `Accept-Language` with q-weights). Authenticated users can override the choice in **Profile & Settings**
 - **Community-driven translations**: contributed by pull request, no separate platform to sign up for. See [Contributing a translation](#contributing-a-translation)
 
@@ -638,9 +638,9 @@ calrs/
 
 ## Localization
 
-calrs ships with eight complete translations: English, French, Spanish, Polish, German, Italian, Estonian and Brazilian Portuguese. Strings live in [Fluent](https://projectfluent.org/) `.ftl` files under `i18n/` and are embedded in the binary at compile time, so there are no runtime translation files to deploy.
+calrs ships with nine complete translations: English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch. Strings live in [Fluent](https://projectfluent.org/) `.ftl` files under `i18n/` and are embedded in the binary at compile time, so there are no runtime translation files to deploy.
 
-Every locale carries all 1043 message ids. A test holds them there, so a release cannot ship a half-translated language.
+Every locale carries all 1051 message ids. A test holds them there, so a release cannot ship a half-translated language.
 
 ### Translation quality
 
@@ -649,7 +649,7 @@ Every locale carries all 1043 message ids. A test holds them there, so a release
 | English | Source language |
 | French | Human-translated and reviewed |
 | Brazilian Portuguese | Contributed by a native speaker |
-| Spanish, Polish, German, Italian, Estonian | Complete, but machine-seeded. Native-speaker review very welcome |
+| Spanish, Polish, German, Italian, Estonian, Dutch | Complete, but machine-seeded. Native-speaker review very welcome |
 
 Complete is not the same as good. The machine-seeded locales are grammatical and internally consistent, and they have been checked for the things automated translation usually gets wrong: the register stays informal throughout, Polish carries the plural categories its grammar needs rather than English's two, and sentences that interpolate a value avoid agreeing with it. What they have not had is a native speaker reading them in context, on the actual pages. If one of those is your language, the section below is for you.
 
@@ -687,7 +687,7 @@ Four steps, and the order matters. Doing them out of order fails the build in a 
 3. **Declare its plural categories.** Add the locale to the `required` table in `plural_messages_carry_the_locale_categories` in `src/i18n.rs`. Most languages need `one, other`; Polish needs `one, few, many`. The [CLDR plural rules chart](https://www.unicode.org/cldr/charts/47/supplemental/language_plural_rules.html) is the reference.
 4. Run `cargo test i18n::`
 
-Step 1 comes before step 2 for a reason: the coverage test demands every key the moment a locale appears in `SUPPORTED_LANGS`, so registering an empty file fails with 1043 errors at once.
+Step 1 comes before step 2 for a reason: the coverage test demands every key the moment a locale appears in `SUPPORTED_LANGS`, so registering an empty file fails with 1051 errors at once.
 
 That is the whole change on the calrs side. The language then appears in the **Profile & Settings** dropdown and is matched against `Accept-Language` automatically.
 
@@ -706,8 +706,8 @@ The test suite checks structure, not meaning. It will catch a missing key, a bro
 - Translation source lives in `i18n/{lang}/main.ftl`, one file per language, kebab-case message ids
 - Loader and language detection: `src/i18n.rs`. Templates use `{{ t("message-id", arg=value) }}`; the active language reaches the template as `lang`
 - New translatable strings land on the `i18n` branch first, then merge into `main`. The flow is one-directional: never merge `main` into `i18n`
-- Adding a key costs eight translations, not one. The coverage test fails until every locale has a value, which is deliberate: a half-translated page is worse than an English one, because nobody notices it is wrong
-- Run `cargo test i18n::` before pushing. It checks key coverage across all eight locales, that every template still loads, and that plural messages carry the categories each language needs
+- Adding a key costs nine translations, not one. The coverage test fails until every locale has a value, which is deliberate: a half-translated page is worse than an English one, because nobody notices it is wrong
+- Run `cargo test i18n::` before pushing. It checks key coverage across all nine locales, that every template still loads, and that plural messages carry the categories each language needs
 
 ## License
 

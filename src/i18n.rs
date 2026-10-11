@@ -29,6 +29,7 @@ const SUPPORTED_LANGS: &[(&str, &str, &str)] = &[
         "Português (Brasil)",
         include_str!("../i18n/pt/main.ftl"),
     ),
+    ("nl", "Nederlands", include_str!("../i18n/nl/main.ftl")),
 ];
 
 const DEFAULT_LANG: &str = "en";
@@ -772,6 +773,7 @@ mod tests {
             ("it", &["one", "other"]),
             ("pt", &["one", "other"]),
             ("et", &["one", "other"]),
+            ("nl", &["one", "other"]),
         ];
         let plural_keys: Vec<&str> = SUPPORTED_LANGS
             .iter()
