@@ -1489,7 +1489,7 @@ embed-snippet-attr-comment = Voeg deze attributen toe aan een klikbaar element o
 
 # Leftovers in partly translated pages (host reschedule, impersonation banner, slots, team settings)
 host-resched-when = { $date } om { $start } – { $end }
-base-impersonating = Je kijkt mee als { $name }
+base-impersonating = Je handelt als { $name }
 slots-rescheduling-banner = Verzetten: { $title } (nu { $date } om { $time })
 slots-invite-required-title = Voor boeken is een uitnodigingslink nodig
 team-settings-slug-url = Gebruikt in de team-URL: { $url }
